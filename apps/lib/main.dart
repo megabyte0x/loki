@@ -110,6 +110,17 @@ class _WalletState extends State<_Wallet> {
   final verifyUntil = <String, DateTime>{};
   bool scanning = false, enteringLink = false;
   String pairingLink = '';
+  // An invite link that opened the app: taken from the native side once unlocked, then shown
+  // in Join for review. Never persisted; a lock or leaving Join drops it.
+  bool inviteWaiting = true;
+  String? joinInvite, joinPrefill;
+  static const _formPages = {
+    _Page.create,
+    _Page.join,
+    _Page.setup,
+    _Page.send,
+    _Page.recovery,
+  };
   _Page page = _Page.vaults;
   _Page formBack = _Page.vaults;
   ({Json vault, String attempt})? review;
@@ -125,10 +136,16 @@ class _WalletState extends State<_Wallet> {
 
   Future<void> watchNativePrompt(MacWalletApi mac) async {
     var receivedEvent = false;
-    mac.onNativePromptChanged((active) {
-      receivedEvent = true;
-      if (mounted) setState(() => nativePrompt = active);
-    });
+    mac.onNativePromptChanged(
+      (active) {
+        receivedEvent = true;
+        if (mounted) setState(() => nativePrompt = active);
+      },
+      onInvite: () {
+        inviteWaiting = true;
+        unawaited(poll());
+      },
+    );
     var active = false;
     try {
       active = await mac.nativePromptActive();
@@ -160,6 +177,7 @@ class _WalletState extends State<_Wallet> {
     recovery = {};
     balance = null;
     vaultId = selection = dataError = scanError = coordinator = null;
+    joinInvite = joinPrefill = null;
     verifyUntil.clear();
     nextScan = DateTime.fromMillisecondsSinceEpoch(0);
   }
@@ -225,6 +243,18 @@ class _WalletState extends State<_Wallet> {
           page = _Page.overview;
         }
       });
+      if (inviteWaiting && !_formPages.contains(page)) {
+        inviteWaiting = false;
+        joinInvite = await api.pendingInvite() ?? joinInvite;
+        if (!mounted || locking || epoch != generation) return;
+      }
+      if (joinInvite != null &&
+          !_formPages.contains(page) &&
+          !busy &&
+          !hideContent) {
+        unawaited(go(_Page.join, invite: joinInvite));
+        return;
+      }
       final active = vault?['active'] == true;
       final id = vaultId;
       final view = page;
@@ -352,7 +382,12 @@ class _WalletState extends State<_Wallet> {
     }
   }
 
-  Future<void> go(_Page next, {String? id, String? attempt}) async {
+  Future<void> go(
+    _Page next, {
+    String? id,
+    String? attempt,
+    String? invite,
+  }) async {
     if (!mounted ||
         locking ||
         leavingNativePrompt ||
@@ -389,6 +424,8 @@ class _WalletState extends State<_Wallet> {
       }
       if (next == _Page.history && page != _Page.history) verifyUntil.clear();
       if (next == _Page.create || next == _Page.join) formBack = page;
+      if (invite != null) joinInvite = null;
+      joinPrefill = invite;
       page = next;
       selection = attempt;
     });
@@ -1120,7 +1157,9 @@ class _WalletState extends State<_Wallet> {
         join: () => go(_Page.join),
       ),
       _Page.create || _Page.join => VaultForm(
+        key: ValueKey((page, joinPrefill)),
         join: page == _Page.join,
+        initialInvite: joinPrefill,
         busy: busy,
         cancel: () => go(formBack),
         submit: (form) => submitVaultForm(page == _Page.join, form),
@@ -1128,6 +1167,7 @@ class _WalletState extends State<_Wallet> {
       _Page.setup when target != null => VaultSetup(
         vault: target,
         status: ceremony,
+        coordinator: coordinator,
         busy: busy,
         compare: () => act(() async {
           await api.request('agree', {

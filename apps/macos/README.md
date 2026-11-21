@@ -36,7 +36,11 @@ The workspace footer shows the active signer's pinned origin as **Paired coordin
 
 ### Vaults across Macs
 
-The coordinator origin is separate from the creator's peer endpoint. The creator places `--peer 1=...` in new invites; without it, those invites name the creator's loopback port and are unusable from a different Mac. Use a reachable TLS reverse proxy to forward the peer routes (`/api/enroll`, `/api/roster`, `/api/agreed`, `/api/session`) to the creator's fixed local port. `--advertise-url` is the member's own registration address; it does **not** set the invite URL. Pass flags as separate arguments, with canonical HTTPS origins, no trailing slash, path, query or credentials:
+New vaults use relay invites. Each invite carries the creator's identity, and every member reaches the creator through **its own** configured frostd relay. Neither the creator's HTTP port nor the relay or endpoint named in the invite is contacted, so the creator needs no reverse proxy or `--peer` flag, and a loopback creator endpoint in the invite is expected. LokiSigner refuses a relay invite with a missing or malformed creator identity, or when this signer has no usable relay, instead of falling back to HTTP. The creator must be unlocked while members join and set up; locking ends its setup work and unlocking resumes it.
+
+In **Set up vault**, **Copy invite** copies `https://<paired coordinator>/#invite=<code>` (the code alone if no HTTPS origin is pinned). Send each member their own link privately. A joiner pastes the link or the bare code in **Join vault**. The query form `/?invite=…` is refused, as in the web wallet. The review shows the vault name, policy and slot from the invite; they are unverified until the signer enrolls. Joining approves no payment, and the roster comparison stays a separate step that every member completes over a trusted channel.
+
+Invites created before relay invites (with no creator identity) still join the creator over HTTP. The creator places `--peer 1=...` in those invites; without it, they name the creator's loopback port and are unusable from a different Mac. Use a reachable TLS reverse proxy to forward the peer routes (`/api/enroll`, `/api/roster`, `/api/agreed`, `/api/session`) to the creator's fixed local port. `--advertise-url` is the member's own registration address; it does **not** set the invite URL. Pass flags as separate arguments, with canonical HTTPS origins, no trailing slash, path, query or credentials:
 
 ```sh
 # On the creator (quit an existing LokiSigner instance before relaunching):
@@ -48,7 +52,20 @@ open "$app" --args --port 3602 \
   --advertise-url https://joiner-peer.example --peer 1=https://creator-peer.example
 ```
 
-The joiner must trust the exact creator origin from its own `--peer` flag or its already-paired coordinator; a pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags. Keep the member listener on loopback and do not expose unrelated member routes in the reverse proxy.
+For such a legacy invite, the joiner must trust the exact creator origin from its own `--peer` flag or its already-paired coordinator; a pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags. Keep the member listener on loopback and do not expose unrelated member routes in the reverse proxy.
+
+### Opening invite links in the app (operator setup)
+
+Pasting the link into **Join vault** always works. Opening `https://<coordinator>/#invite=…` directly in LokiSigner additionally needs a verified association between the coordinator's domain and a signed build; this repository does not ship one, and self-hosted coordinators without it keep using paste. There is deliberately no custom URL scheme for invites, because any app could claim it. To associate a domain you operate:
+
+1. Add `com.apple.developer.associated-domains` with `applinks:<coordinator host>` to the entitlements of your provisioned build, and enable Associated Domains for the App ID. Do not add a domain you do not control.
+2. Serve `https://<coordinator host>/.well-known/apple-app-site-association` as `application/json` without redirects:
+
+   ```json
+   {"applinks": {"details": [{"appIDs": ["<TEAM_ID>.<bundle id>"], "components": [{"/": "/", "#": "invite=*"}]}]}}
+   ```
+
+LokiSigner accepts an opened link only when its host, port and scheme equal this profile's paired coordinator, with no query, path or extra fragment fields. It keeps at most one such invite in memory, never logs or saves it, and does not raise its window. After you unlock, the invite opens in **Join vault** for review once you leave any form you were filling in. Locking, cancelling unlock, pairing or restoring drops it, and leaving that review discards it. A link never pairs a signer, changes its relay, joins without your confirmation or approves a payment.
 
 ## Ad-hoc build and window capture
 

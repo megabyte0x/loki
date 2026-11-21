@@ -955,6 +955,13 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         return false
     }
 
+    /// The pinned coordinator origin and slot, read from local files without any request.
+    var pairedTarget: (coordinator: String, slot: Int)? {
+        let saved = profile()
+        guard let origin = saved["coordinator"] as? String, let slot = (saved["slot"] as? NSNumber)?.intValue else { return nil }
+        return (origin, slot)
+    }
+
     func walletProfile() -> [String: Any] {
         var value = profile()
         value["running"] = walletReady

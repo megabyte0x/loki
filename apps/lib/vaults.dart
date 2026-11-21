@@ -6,6 +6,35 @@ import 'package:material_ui/material_ui.dart';
 import 'design.dart';
 import 'wallet_api.dart';
 
+/// The code from a raw code or an `https://…/#invite=<code>` link; null for the query form,
+/// which the web wallet no longer accepts.
+String? inviteCode(String text) {
+  if (!text.contains('://')) return text;
+  try {
+    final uri = Uri.parse(text);
+    if (uri.queryParameters.containsKey('invite')) return null;
+    return Uri.splitQueryString(uri.fragment)['invite'] ?? '';
+  } on FormatException {
+    return '';
+  } on ArgumentError {
+    return '';
+  }
+}
+
+/// A share link on the pinned wallet origin; the code alone when no HTTPS origin is pinned.
+String inviteLink(String? coordinator, String code) {
+  final origin = coordinator == null ? null : Uri.tryParse(coordinator);
+  if (origin == null ||
+      origin.scheme != 'https' ||
+      origin.host.isEmpty ||
+      origin.hasQuery ||
+      origin.hasFragment ||
+      (origin.path.isNotEmpty && origin.path != '/')) {
+    return code;
+  }
+  return '${origin.origin}/#invite=$code';
+}
+
 String vaultName(Json vault) => vault['name'] as String? ?? 'Vault';
 String policy(Json vault) =>
     '${vault['threshold']} of ${vault['members']} approvals';
@@ -189,8 +218,10 @@ class VaultForm extends StatefulWidget {
     required this.busy,
     required this.cancel,
     required this.submit,
+    this.initialInvite,
   });
   final bool join, busy;
+  final String? initialInvite;
   final VoidCallback cancel;
   final ValueChanged<Json> submit;
   @override
@@ -204,39 +235,65 @@ class _VaultFormState extends State<VaultForm> {
   ({
     String code,
     String name,
-    String coordinator,
     int slot,
     int members,
     int threshold,
+    String? legacyCreator,
   })?
   invite;
+  String? inviteError;
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.initialInvite case final code?) readInvite(code);
+  }
 
   // An invitation preview is unverified; the signer still validates and enrolls it.
   void readInvite(String input) {
     invite = null;
-    final text = input.trim();
+    inviteError = null;
+    final code = inviteCode(input.trim());
+    if (code == null) {
+      inviteError = 'This kind of invite link is no longer accepted. Ask the vault creator for a new invite.';
+      return;
+    }
+    if (!RegExp(r'^[A-Za-z0-9_-]{1,4096}$').hasMatch(code)) return;
     try {
-      final code = Uri.tryParse(text)?.queryParameters['invite'] ?? text;
-      if (code.isEmpty || code.length > 4096) return;
       final fields = jsonDecode(
         utf8.decode(base64Url.decode(base64Url.normalize(code))),
       );
       if (fields
           case {
+            'vault': final String vault,
             'name': final String name,
-            'creator_base_url': final String coordinator,
+            'token': final String token,
+            'creator_base_url': final String creator,
             'slot': final int slot,
             'members': final int members,
             'threshold': final int threshold,
           }
-          when name.trim().isNotEmpty && coordinator.isNotEmpty) {
+          when RegExp(r'^[0-9a-fA-F]{64}$').hasMatch(vault) &&
+              name.trim().isNotEmpty &&
+              utf8.encode(name).length <= 80 &&
+              token.isNotEmpty &&
+              members >= 2 &&
+              members <= 16 &&
+              threshold >= 2 &&
+              threshold <= members &&
+              slot >= 2 &&
+              slot <= members) {
+        // A relay invite carries the creator's identity; the signer reaches it over its own
+        // relay, so the endpoint and relay named in the invite are not destinations.
+        final relay = fields['creator'] != null || fields['frostd_url'] != null;
+        if (relay && fields['creator'] is! Map) return;
         invite = (
           code: code,
           name: name,
-          coordinator: coordinator,
           slot: slot,
           members: members,
           threshold: threshold,
+          legacyCreator: relay ? null : creator,
         );
       }
     } on FormatException {
@@ -304,6 +361,7 @@ class _VaultFormState extends State<VaultForm> {
                   TextFormField(
                     autofocus: true,
                     readOnly: widget.busy,
+                    initialValue: widget.initialInvite,
                     obscureText: true,
                     autocorrect: false,
                     enableSuggestions: false,
@@ -314,7 +372,7 @@ class _VaultFormState extends State<VaultForm> {
                     validator: (text) => text?.trim().isEmpty != false
                         ? 'Paste an invitation.'
                         : invite == null
-                        ? 'This invite could not be read. Check the link or ask your organizer for a new invite.'
+                        ? inviteError ?? 'This invite could not be read. Check the link or ask your organizer for a new invite.'
                         : null,
                   )
                 else ...[
@@ -364,17 +422,29 @@ class _VaultFormState extends State<VaultForm> {
                   ValueRow('Your member slot', 'Member ${details.slot}'),
                   const ValueRow('Network', 'Testnet'),
                   const Divider(),
-                  LokiLabel(
-                    'Creator endpoint in the invite',
-                    color: context.colors.muted,
-                  ),
-                  SelectableText(details.coordinator, style: lokiMono(11)),
+                  if (details.legacyCreator case final creator?) ...[
+                    LokiLabel(
+                      'Creator endpoint in the invite',
+                      color: context.colors.muted,
+                    ),
+                    SelectableText(creator, style: lokiMono(11)),
+                    Text(
+                      'This older invite joins the creator directly. LokiSigner accepts it only from your paired coordinator or an allowed peer.',
+                      style: lokiSans(11, color: context.colors.muted),
+                    ),
+                  ] else ...[
+                    const ValueRow('Route', 'This signer’s relay'),
+                    Text(
+                      'LokiSigner joins through the relay configured for this signer and checks the creator’s identity from the invite. It contacts no address named in the invite.',
+                      style: lokiSans(11, color: context.colors.muted),
+                    ),
+                  ],
                 ],
               ),
             ),
           Notice(
             joining
-                ? 'Only use an invite from your vault organizer. After you join, compare roster codes with every member over a trusted channel before creating keys.'
+                ? 'Only use an invite from your vault organizer. Joining approves no payment. After you join, compare roster codes with every member over a trusted channel before creating keys.'
                 : 'You’ll get a separate invite for each other member. Share them privately and compare roster codes together before creating keys.',
           ),
           if (widget.busy) const LinearProgressIndicator(minHeight: 2),
@@ -423,8 +493,10 @@ class VaultSetup extends StatelessWidget {
     required this.busy,
     required this.compare,
     required this.startOver,
+    this.coordinator,
   });
   final Json vault, status;
+  final String? coordinator;
   final bool busy;
   final VoidCallback compare, startOver;
 
@@ -503,7 +575,7 @@ class VaultSetup extends StatelessWidget {
           Notice(
             invites.isEmpty
                 ? 'Waiting for the other members. Leave LokiSigner open to follow setup.'
-                : 'Give each member their own invite code over a trusted channel. They can paste it in Join vault.',
+                : 'Give each member their own invite link over a trusted channel. They can paste it in Join vault.',
           ),
           for (final invite in invites) ...[
             const SizedBox(height: 8),
@@ -516,7 +588,11 @@ class VaultSetup extends StatelessWidget {
                   if (invite['joined'] == true)
                     const StatusPill('Joined')
                   else if (invite['code'] case final String code)
-                    CopyButton('Copy invite', code, 'Invite copied'),
+                    CopyButton(
+                      'Copy invite',
+                      inviteLink(coordinator, code),
+                      'Invite copied',
+                    ),
                 ],
               ),
             ),

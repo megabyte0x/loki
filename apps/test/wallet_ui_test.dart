@@ -215,7 +215,7 @@ void main() {
     });
     expect(find.text('Set up vault'), findsOneWidget);
     await tap(tester, find.text('Copy invite'));
-    expect(copied, 'test-invite');
+    expect(copied, '${api.coordinator}/#invite=test-invite');
     expect(find.text('Invite copied'), findsOneWidget);
     expect(find.byType(SnackBar), findsNothing);
 
@@ -253,6 +253,13 @@ void main() {
     await tester.enterText(
       find.byType(TextField),
       'https://example.test/?invite=$code',
+    );
+    await tap(tester, find.text('Join vault'));
+    expect(find.text('Ops vault'), findsNothing);
+    expect(find.textContaining('no longer accepted'), findsOneWidget);
+    await tester.enterText(
+      find.byType(TextField),
+      'https://example.test/#invite=$code',
     );
     await tester.pump();
     expect(find.text('Ops vault'), findsOneWidget);
