@@ -769,6 +769,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private weak var walletWindow: NSWindow?
     private var promptPage: SignerPromptPage?
     var promptChanged: ((Bool) -> Void)?
+    /// Called once an unlocked session ends for any reason: explicit, unattended or native lock.
+    var sessionEnded: (() -> Void)?
     var walletNotice: String?
     private(set) var canRecoverWalletKey = false
     var nativePromptActive: Bool { promptPage != nil }
@@ -1177,6 +1179,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     }
 
     private func stopped(_ failure: SignerStartFailure, link: String?) {
+        if ready { sessionEnded?() }
         ready = false
         didLock()
         if embedded {

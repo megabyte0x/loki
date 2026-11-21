@@ -40,19 +40,18 @@ New vaults use relay invites. Each invite carries the creator's identity, and ev
 
 In **Set up vault**, **Copy invite** copies `https://<paired coordinator>/#invite=<code>` (the code alone if no HTTPS origin is pinned). Send each member their own link privately. A joiner pastes the link or the bare code in **Join vault**. The query form `/?invite=…` is refused, as in the web wallet. The review shows the vault name, policy and slot from the invite; they are unverified until the signer enrolls. Joining approves no payment, and the roster comparison stays a separate step that every member completes over a trusted channel.
 
-Invites created before relay invites (with no creator identity) still join the creator over HTTP. The creator places `--peer 1=...` in those invites; without it, they name the creator's loopback port and are unusable from a different Mac. Use a reachable TLS reverse proxy to forward the peer routes (`/api/enroll`, `/api/roster`, `/api/agreed`, `/api/session`) to the creator's fixed local port. `--advertise-url` is the member's own registration address; it does **not** set the invite URL. Pass flags as separate arguments, with canonical HTTPS origins, no trailing slash, path, query or credentials:
+An older invite without a creator identity, or a joiner on a LokiSigner build without relay invites, reaches the creator over HTTPS instead. The creator then serves only the four ceremony routes (`/api/enroll`, `/api/roster`, `/api/agreed`, `/api/session`) on a second loopback listener, `--peer-port`. Put a TLS reverse proxy for its public origin in front of that port and nothing else. Never forward `--port`: it is the private member API. `--peer-port` and `--advertise-url` must be given together, and the advertised origin is also the creator endpoint written into its invites. Pass flags as separate arguments, with canonical HTTPS origins, no trailing slash, path, query or credentials:
 
 ```sh
-# On the creator (quit an existing LokiSigner instance before relaunching):
-open "$app" --args --port 3601 \
-  --advertise-url https://creator-peer.example --peer 1=https://creator-peer.example
+# On the creator (quit an existing LokiSigner instance before relaunching).
+# The TLS proxy for https://creator-peer.example forwards to 127.0.0.1:3611 only.
+open "$app" --args --peer-port 3611 --advertise-url https://creator-peer.example
 
-# On a joiner (use its own advertised endpoint if it has one):
-open "$app" --args --port 3602 \
-  --advertise-url https://joiner-peer.example --peer 1=https://creator-peer.example
+# On a joiner holding an older invite from that creator:
+open "$app" --args --peer 1=https://creator-peer.example
 ```
 
-For such a legacy invite, the joiner must trust the exact creator origin from its own `--peer` flag or its already-paired coordinator; a pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags. Keep the member listener on loopback and do not expose unrelated member routes in the reverse proxy.
+The joiner must trust the exact creator origin from its own `--peer` flag or its already-paired coordinator; a pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags. Relay invites need none of these flags.
 
 ### Opening invite links in the app (operator setup)
 

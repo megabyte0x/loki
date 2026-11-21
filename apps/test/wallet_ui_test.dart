@@ -261,6 +261,13 @@ void main() {
       find.byType(TextField),
       'https://example.test/#invite=$code',
     );
+    await tap(tester, find.text('Join vault'));
+    expect(find.text('Ops vault'), findsNothing);
+    expect(find.textContaining('only reads invite links'), findsOneWidget);
+    await tester.enterText(
+      find.byType(TextField),
+      '${api.coordinator}/#invite=$code',
+    );
     await tester.pump();
     expect(find.text('Ops vault'), findsOneWidget);
     expect(find.text('Member 3'), findsOneWidget);

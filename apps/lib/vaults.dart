@@ -6,18 +6,44 @@ import 'package:material_ui/material_ui.dart';
 import 'design.dart';
 import 'wallet_api.dart';
 
-/// The code from a raw code or an `https://…/#invite=<code>` link; null for the query form,
-/// which the web wallet no longer accepts.
-String? inviteCode(String text) {
-  if (!text.contains('://')) return text;
+const _retiredLink =
+    'This kind of invite link is no longer accepted. Ask the vault creator for a new invite.';
+const _otherLink =
+    'LokiSigner only reads invite links from your paired coordinator. Paste the invite code instead.';
+
+/// The invite code from pasted text, or why LokiSigner refuses it. A bare code passes through.
+/// A full link must be exactly `<paired coordinator>/#invite=<code>`, the same rule as a link
+/// opened in the app: HTTPS, no credentials, path or query, and no other fragment fields.
+({String? code, String? error}) inviteCode(String text, String? coordinator) {
+  if (!text.contains(':') && !text.contains('/')) {
+    return (code: text, error: null);
+  }
+  final Uri uri;
   try {
-    final uri = Uri.parse(text);
-    if (uri.queryParameters.containsKey('invite')) return null;
-    return Uri.splitQueryString(uri.fragment)['invite'] ?? '';
+    uri = Uri.parse(text);
   } on FormatException {
-    return '';
+    return (code: null, error: null);
+  }
+  if (uri.hasQuery &&
+      uri.query.split('&').any((p) => p.split('=').first == 'invite')) {
+    return (code: null, error: _retiredLink);
+  }
+  final fragment = uri.hasFragment ? uri.fragment : '';
+  if (coordinator == null ||
+      uri.scheme != 'https' ||
+      uri.userInfo.isNotEmpty ||
+      'https://${uri.authority}'.toLowerCase() != coordinator.toLowerCase() ||
+      uri.hasQuery ||
+      (uri.path.isNotEmpty && uri.path != '/') ||
+      !fragment.startsWith('invite=')) {
+    return (code: null, error: _otherLink);
+  }
+  try {
+    return (code: Uri.decodeComponent(fragment.substring(7)), error: null);
   } on ArgumentError {
-    return '';
+    return (code: null, error: null);
+  } on FormatException {
+    return (code: null, error: null);
   }
 }
 
@@ -219,9 +245,10 @@ class VaultForm extends StatefulWidget {
     required this.cancel,
     required this.submit,
     this.initialInvite,
+    this.coordinator,
   });
   final bool join, busy;
-  final String? initialInvite;
+  final String? initialInvite, coordinator;
   final VoidCallback cancel;
   final ValueChanged<Json> submit;
   @override
@@ -252,12 +279,9 @@ class _VaultFormState extends State<VaultForm> {
   // An invitation preview is unverified; the signer still validates and enrolls it.
   void readInvite(String input) {
     invite = null;
-    inviteError = null;
-    final code = inviteCode(input.trim());
-    if (code == null) {
-      inviteError = 'This kind of invite link is no longer accepted. Ask the vault creator for a new invite.';
-      return;
-    }
+    final (:code, :error) = inviteCode(input.trim(), widget.coordinator);
+    inviteError = error;
+    if (code == null) return;
     if (!RegExp(r'^[A-Za-z0-9_-]{1,4096}$').hasMatch(code)) return;
     try {
       final fields = jsonDecode(
@@ -280,7 +304,7 @@ class _VaultFormState extends State<VaultForm> {
               members >= 2 &&
               members <= 16 &&
               threshold >= 2 &&
-              threshold <= members &&
+              threshold < members &&
               slot >= 2 &&
               slot <= members) {
         // A relay invite carries the creator's identity; the signer reaches it over its own

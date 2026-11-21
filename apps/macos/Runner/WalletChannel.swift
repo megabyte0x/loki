@@ -30,6 +30,9 @@ final class WalletChannel {
         signer.promptChanged = { [weak channel] active in
             channel?.invokeMethod("nativePromptChanged", arguments: active)
         }
+        // Any end of an unlocked session drops a claim held for it. A link that arrives later,
+        // while locked, stays for the next explicit unlock.
+        signer.sessionEnded = { [weak self] in self?.claim = nil }
         channel.setMethodCallHandler { [weak self] call, result in
             DispatchQueue.main.async {
                 guard let self else { result(FlutterMethodNotImplemented); return }
@@ -87,7 +90,7 @@ final class WalletChannel {
         var flags: [String] = []
         var rest = arguments.makeIterator()
         while let option = rest.next() {
-            let supported = ["--data", "--port", "--peer", "--advertise-url"]
+            let supported = ["--data", "--port", "--peer", "--peer-port", "--advertise-url"]
             if supported.contains(where: { option.hasPrefix($0 + "=") }) { return nil }
             if !supported.contains(option) { continue }
             guard let value = rest.next(), !value.isEmpty, !value.hasPrefix("--") else { return nil }

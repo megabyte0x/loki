@@ -114,6 +114,8 @@ class _WalletState extends State<_Wallet> {
   // in Join for review. Never persisted; a lock or leaving Join drops it.
   bool inviteWaiting = true;
   String? joinInvite, joinPrefill;
+  // Remounts the create/join form; never derived from the invite, which is a bearer secret.
+  int formSerial = 0;
   static const _formPages = {
     _Page.create,
     _Page.join,
@@ -178,6 +180,8 @@ class _WalletState extends State<_Wallet> {
     balance = null;
     vaultId = selection = dataError = scanError = coordinator = null;
     joinInvite = joinPrefill = null;
+    pairingLink = '';
+    enteringLink = false;
     verifyUntil.clear();
     nextScan = DateTime.fromMillisecondsSinceEpoch(0);
   }
@@ -245,8 +249,10 @@ class _WalletState extends State<_Wallet> {
       });
       if (inviteWaiting && !_formPages.contains(page)) {
         inviteWaiting = false;
-        joinInvite = await api.pendingInvite() ?? joinInvite;
+        final taken = await api.pendingInvite();
+        // A claim taken for a session that has since changed is dropped, not kept.
         if (!mounted || locking || epoch != generation) return;
+        if (taken != null) joinInvite = taken;
       }
       if (joinInvite != null &&
           !_formPages.contains(page) &&
@@ -426,6 +432,7 @@ class _WalletState extends State<_Wallet> {
       if (next == _Page.create || next == _Page.join) formBack = page;
       if (invite != null) joinInvite = null;
       joinPrefill = invite;
+      if (next == _Page.create || next == _Page.join) formSerial++;
       page = next;
       selection = attempt;
     });
@@ -1043,6 +1050,7 @@ class _WalletState extends State<_Wallet> {
                     : enteringLink
                     ? () => setState(() {
                         enteringLink = false;
+                        pairingLink = '';
                         actionError = null;
                       })
                     : () => act(api.restore),
@@ -1053,7 +1061,15 @@ class _WalletState extends State<_Wallet> {
                 busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
                     : enteringLink
-                    ? () => act(() => api.pair(pairingLink.trim()))
+                    ? () {
+                        // The link is one-use: don't keep it once it has been submitted.
+                        final link = pairingLink.trim();
+                        setState(() {
+                          pairingLink = '';
+                          enteringLink = false;
+                        });
+                        act(() => api.pair(link));
+                      }
                     : () => setState(() {
                         enteringLink = true;
                         actionError = null;
@@ -1157,9 +1173,10 @@ class _WalletState extends State<_Wallet> {
         join: () => go(_Page.join),
       ),
       _Page.create || _Page.join => VaultForm(
-        key: ValueKey((page, joinPrefill)),
+        key: ValueKey(formSerial),
         join: page == _Page.join,
         initialInvite: joinPrefill,
+        coordinator: coordinator,
         busy: busy,
         cancel: () => go(formBack),
         submit: (form) => submitVaultForm(page == _Page.join, form),
