@@ -300,17 +300,46 @@ pub fn decode_page(encoded: &[u8]) -> WireResult<Page> {
     Ok(page)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NamespaceAction {
+    ReserveSetup = 0,
+    RetireSetup = 1,
+    ReservePayment = 2,
+    PromotePayment = 3,
+    RetirePayment = 4,
+}
+
 pub fn encode_setup_control(creation: &[u8], expires: u64, retire: bool) -> WireResult<Vec<u8>> {
+    let action = if retire {
+        NamespaceAction::RetireSetup
+    } else {
+        NamespaceAction::ReserveSetup
+    };
+    encode_namespace_control(creation, expires, action)
+}
+pub fn encode_namespace_control(
+    creation: &[u8],
+    expires: u64,
+    action: NamespaceAction,
+) -> WireResult<Vec<u8>> {
     decode_creation(creation)?;
     positive_counter(expires)?;
     encode_metadata(vec![
         uint(1),
         Value::Bytes(creation.to_vec()),
         uint(expires),
-        uint(u64::from(retire)),
+        uint(action as u64),
     ])
 }
 pub fn decode_setup_control(encoded: &[u8]) -> WireResult<(Vec<u8>, u64, bool)> {
+    let (creation, expires, action) = decode_namespace_control(encoded)?;
+    match action {
+        NamespaceAction::ReserveSetup => Ok((creation, expires, false)),
+        NamespaceAction::RetireSetup => Ok((creation, expires, true)),
+        _ => Err(WireError::Schema),
+    }
+}
+pub fn decode_namespace_control(encoded: &[u8]) -> WireResult<(Vec<u8>, u64, NamespaceAction)> {
     let value = decode_metadata(encoded)?;
     let f = array(&value, 4)?;
     version(&f[0])?;
@@ -319,10 +348,13 @@ pub fn decode_setup_control(encoded: &[u8]) -> WireResult<(Vec<u8>, u64, bool)> 
     };
     decode_creation(creation)?;
     let expires = positive_counter(number(&f[2])?)?;
-    let retire = match number(&f[3])? {
-        0 => false,
-        1 => true,
+    let action = match number(&f[3])? {
+        0 => NamespaceAction::ReserveSetup,
+        1 => NamespaceAction::RetireSetup,
+        2 => NamespaceAction::ReservePayment,
+        3 => NamespaceAction::PromotePayment,
+        4 => NamespaceAction::RetirePayment,
         _ => return Err(WireError::Schema),
     };
-    Ok((creation.clone(), expires, retire))
+    Ok((creation.clone(), expires, action))
 }

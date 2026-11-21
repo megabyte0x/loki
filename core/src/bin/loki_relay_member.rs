@@ -2,12 +2,12 @@
 //! Secret bytes stay in sealed files and are never written to stdout or stderr.
 
 use loki_poc::relay_member::{
-    load, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
+    load_with_signing_identity, ConfigStore, CourierImport, LoadedMember, MemberError, ProvisionTarget,
 };
 use loki_poc::{
     payment_manifest::{self, decode_proposal_for_network, encode_proposal_for_network},
-    setup_transport::session_envelope,
-    signing_session::Mailbox,
+    setup_transport::{Identity, PublicIdentity},
+    signing_session::{Mailbox, MessageKind, OpenedMessage, SessionContext},
 };
 use loki_relay_client::{
     committed_readiness, open_descriptor, outbox_intent_digest, poll_once, prepare_outbox,
@@ -178,8 +178,7 @@ fn run() -> Result<(), Exit> {
                 &pass,
                 &roster,
                 &take("--payload-file")?,
-                Some(parse_id(request)?),
-                None,
+                parse_id(request)?,
             )
         }
         "send-signing" => {
@@ -188,18 +187,18 @@ fn run() -> Result<(), Exit> {
                 "--passphrase-file",
                 "--roster",
                 "--payload-file",
+                "--work-dir",
                 "--attempt",
             ])?;
             let (root, pass, roster) = common()?;
             let attempt = parse_id(take("--attempt")?.to_str().ok_or(Exit::Usage)?)?;
-            send(
-                &root,
-                &pass,
-                &roster,
-                &take("--payload-file")?,
-                None,
-                Some(attempt),
-            )
+            let mut session = open_session(&root, &pass, &roster)?;
+            let work = checked_work(&session, &root, &take("--work-dir")?, attempt)?;
+            let payload = read_exact(&take("--payload-file")?, MAX_PAYLOAD, false)?;
+            let request = *blake3::hash(&payload).as_bytes();
+            let saved = save_signing(&mut session, &work, &payload, request)?;
+            println!("request_id={}", hex_id(&request));
+            print_logical(&session.db, &saved)
         }
         "send-proposal" => {
             expect(&[
@@ -285,12 +284,13 @@ fn run() -> Result<(), Exit> {
 
 struct Session {
     member: LoadedMember,
+    signing_identity: Identity,
     configs: ConfigStore,
     db: ClientStore,
 }
 
 fn open_session(root: &Path, pass: &Path, roster: &Path) -> Result<Session, Exit> {
-    let member = load(root, pass, roster).map_err(Exit::Member)?;
+    let (member, signing_identity) = load_with_signing_identity(root, pass, roster).map_err(Exit::Member)?;
     let configs = ConfigStore::open(root, pass).map_err(Exit::Member)?;
     // Transport state stays a direct child of the certified member root.
     let db = ClientStore::open(
@@ -301,6 +301,7 @@ fn open_session(root: &Path, pass: &Path, roster: &Path) -> Result<Session, Exit
     .map_err(Exit::Client)?;
     Ok(Session {
         member,
+        signing_identity,
         configs,
         db,
     })
@@ -397,30 +398,13 @@ fn send(
     pass: &Path,
     roster: &Path,
     payload_file: &Path,
-    request_id: Option<Id32>,
-    signing_attempt: Option<Id32>,
-) -> Result<(), Exit> {
-    let mut payload = read_exact(payload_file, MAX_PAYLOAD, false)?;
-    if signing_attempt.is_some() {
-        session_envelope(&payload).map_err(|_| Exit::Member(MemberError::Bounds))?;
-    }
-    let request_id = request_id.unwrap_or_else(|| *blake3::hash(&payload).as_bytes());
-    let mut session = open_session(root, pass, roster)?;
-    let sent = commit_payload(&mut session, &payload, request_id, signing_attempt);
-    payload.zeroize();
-    sent
-}
-
-fn commit_payload(
-    session: &mut Session,
-    payload: &[u8],
     request_id: Id32,
-    signing_attempt: Option<Id32>,
 ) -> Result<(), Exit> {
-    let saved = save_payload(session, payload, request_id, signing_attempt)?;
+    let payload = read_exact(payload_file, MAX_PAYLOAD, false)?;
+    let mut session = open_session(root, pass, roster)?;
+    let saved = save_payload(&mut session, &payload, request_id, None)?;
     println!("request_id={}", hex_id(&request_id));
-    print_logical(&session.db, &saved)?;
-    Ok(())
+    print_logical(&session.db, &saved)
 }
 
 /// Commit one outbox message (or find the one already saved for `request_id`).
@@ -486,41 +470,60 @@ fn save_payload(
 fn send_proposal(root: &Path, pass: &Path, roster: &Path, proposal: &Path) -> Result<(), Exit> {
     let manifest = read_exact(proposal, payment_manifest::MAX_MANIFEST, false)?;
     let mut session = open_session(root, pass, roster)?;
-    let (payment, attempt, saved) = save_proposal(&mut session, &manifest)?;
-    println!("request_id={}", hex_id(&attempt));
+    let (context, scope, saved) = save_proposal(&mut session, root, &manifest)?;
+    println!("request_id={}", hex_id(&scope));
     print_logical(&session.db, &saved)?;
-    println!("proposal={} attempt={}", hex_id(&payment), hex_id(&attempt));
+    println!("proposal={} attempt={} scope={}", hex_id(&context.payment), hex_id(&context.attempt.0), hex_id(&scope));
     Ok(())
 }
 
-/// Check a payment manifest against this member and commit it as a proposal.
-/// Returns the payment, the attempt and the saved message.
-fn save_proposal(
-    session: &mut Session,
-    manifest: &[u8],
-) -> Result<(Id32, Id32, RecoveryLogical), Exit> {
+fn checked_proposal(member: &LoadedMember, manifest: &[u8]) -> Result<(SessionContext, u16), Exit> {
     let (context, intent) =
-        payment_manifest::parse_for_network(manifest, session.member.network)
+        payment_manifest::parse_for_network(manifest, member.network)
             .map_err(|_| Exit::Member(MemberError::Markers))?;
     payment_manifest::validate_roster(
-        session.member.roster.vault,
-        session.member.threshold,
-        session.member.roster.members.iter().map(|member| member.id),
+        member.roster.vault,
+        member.threshold,
+        member.roster.members.iter().map(|member| member.id),
         &context,
         &intent,
     )
     .map_err(|_| Exit::Member(MemberError::Roster))?;
-    if payment_manifest::proposer_id(&intent.proposer)
-        .map_err(|_| Exit::Member(MemberError::Identity))?
-        != session.member.identity.public().id
-    {
+    let proposer = payment_manifest::proposer_id(&intent.proposer)
+        .map_err(|_| Exit::Member(MemberError::Identity))?;
+    Ok((context, proposer))
+}
+
+fn proposal_scope(context: &SessionContext, proposer: u16) -> Id32 {
+    blake3::Hasher::new_derive_key("Loki owned relay payment work v1")
+        .update(&context.vault)
+        .update(&proposer.to_be_bytes())
+        .update(&context.payment)
+        .update(&context.attempt.0)
+        .finalize().into()
+}
+
+/// Check a local proposal, pin its work manifest and commit it to the outbox.
+fn save_proposal(
+    session: &mut Session,
+    root: &Path,
+    manifest: &[u8],
+) -> Result<(SessionContext, Id32, RecoveryLogical), Exit> {
+    let (context, proposer) = checked_proposal(&session.member, manifest)?;
+    if proposer != session.member.identity.public().id {
         return Err(Exit::Member(MemberError::Identity));
     }
     let payload =
         Zeroizing::new(encode_proposal_for_network(manifest, session.member.network)
             .map_err(|_| Exit::Member(MemberError::Markers))?);
-    let saved = save_payload(session, &payload, context.attempt.0, Some(context.attempt.0))?;
-    Ok((context.payment, context.attempt.0, saved))
+    let scope = proposal_scope(&context, proposer);
+    let payments = payments_path(root, &root.join("payments"))?;
+    create_private_dir(&payments)?;
+    let work = payments.join(hex_id(&scope));
+    create_private_dir(&work)?;
+    create_private_file(&work.join("payment.json"), manifest)?;
+    let saved = save_payload(session, &payload, scope, Some(context.attempt.0))?;
+    Ok((context, scope, saved))
 }
 
 fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) -> Result<(), Exit> {
@@ -531,21 +534,26 @@ fn import_proposals(root: &Path, pass: &Path, roster: &Path, payments: &Path) ->
     Ok(())
 }
 
-/// Write each received, valid payment proposal to `<root>/payments/<attempt>/payment.json`
-/// once. Returns how many were new and how many were rejected.
+fn payments_path(root: &Path, payments: &Path) -> Result<PathBuf, Exit> {
+    let owner = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
+    let parent = payments.parent().filter(|path| !path.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if payments.file_name().and_then(|name| name.to_str()) != Some("payments")
+        || fs::canonicalize(parent).ok().as_deref() != Some(owner.as_path())
+    {
+        return Err(Exit::Member(MemberError::Permissions));
+    }
+    Ok(owner.join("payments"))
+}
+
+/// Write each authenticated proposal to `<root>/payments/<scope>/payment.json` once.
+/// Leave legacy attempt-only directories untouched; proposals are reopened from the inbox.
 fn import_saved_proposals(
     session: &Session,
     root: &Path,
     payments: &Path,
     print: bool,
 ) -> Result<(usize, usize), Exit> {
-    let owner = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
-    let expected = owner.join("payments");
-    if payments != expected
-        && fs::canonicalize(payments).ok().as_deref() != Some(expected.as_path())
-    {
-        return Err(Exit::Member(MemberError::Permissions));
-    }
+    let expected = payments_path(root, payments)?;
     create_private_dir(&expected)?;
     let mut imported = 0;
     let mut rejected = 0;
@@ -575,29 +583,16 @@ fn import_saved_proposals(
                     return Ok(());
                 }
             };
-            let Ok((context, intent)) = payment_manifest::parse_for_network(manifest, session.member.network) else {
+            let Ok((context, proposer)) = checked_proposal(&session.member, manifest) else {
                 rejected += 1;
                 return Ok(());
             };
-            if payment_manifest::validate_roster(
-                session.member.roster.vault,
-                session.member.threshold,
-                session.member.roster.members.iter().map(|member| member.id),
-                &context,
-                &intent,
-            )
-            .is_err()
-            {
+            if body.session != Some(context.attempt.0) || body.key.sender != proposer {
                 rejected += 1;
                 return Ok(());
             }
-            if body.session != Some(context.attempt.0)
-                || Some(body.key.sender) != payment_manifest::proposer_id(&intent.proposer).ok()
-            {
-                rejected += 1;
-                return Ok(());
-            }
-            let directory = expected.join(hex_id(&context.attempt.0));
+            let scope = proposal_scope(&context, proposer);
+            let directory = expected.join(hex_id(&scope));
             create_private_dir(&directory)?;
             let path = directory.join("payment.json");
             match create_private_file(&path, manifest) {
@@ -611,9 +606,10 @@ fn import_saved_proposals(
             }
             if print {
                 println!(
-                    "proposal={} attempt={}",
+                    "proposal={} attempt={} scope={}",
                     hex_id(&context.payment),
-                    hex_id(&context.attempt.0)
+                    hex_id(&context.attempt.0),
+                    hex_id(&scope)
                 );
             }
             Ok(())
@@ -634,6 +630,10 @@ fn create_private_dir(path: &Path) -> Result<(), Exit> {
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
         Err(_) => return Err(Exit::Member(MemberError::Io)),
     }
+    check_private_dir(path)
+}
+
+fn check_private_dir(path: &Path) -> Result<(), Exit> {
     let metadata = fs::symlink_metadata(path).map_err(|_| Exit::Member(MemberError::Io))?;
     if !metadata.is_dir() {
         return Err(Exit::Member(MemberError::Permissions));
@@ -745,44 +745,71 @@ fn export_signing(
     work: &Path,
     attempt: Id32,
 ) -> Result<(), Exit> {
-    let work = checked_work(root, work)?;
     let session = open_session(root, pass, roster)?;
-    let count = export_saved_signing(&session, &work, attempt)?;
+    let work = checked_work(&session, root, work, attempt)?;
+    let count = export_saved_signing(&session, &work)?;
     println!("exported_signing={count}");
     Ok(())
 }
 
-/// Check that `work` is a private directory inside the member root.
-fn checked_work(root: &Path, work: &Path) -> Result<PathBuf, Exit> {
-    let member_root = fs::canonicalize(root).map_err(|_| Exit::Member(MemberError::Io))?;
-    let work = fs::canonicalize(work).map_err(|_| Exit::Member(MemberError::Io))?;
-    if !work.starts_with(&member_root) || work == member_root {
-        return Err(Exit::Member(MemberError::Permissions));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if fs::metadata(&work)
-            .map_err(|_| Exit::Member(MemberError::Io))?
-            .permissions()
-            .mode()
-            & 0o077
-            != 0
-        {
-            return Err(Exit::Member(MemberError::Permissions));
-        }
-    }
-    Ok(work)
+struct PaymentWork {
+    path: PathBuf,
+    context: SessionContext,
+    scope: Id32,
 }
 
-/// Append every received signing wire of `attempt` to `<work>/mailbox`; returns how many.
-fn export_saved_signing(session: &Session, work: &Path, attempt: Id32) -> Result<usize, Exit> {
-    let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|_| Exit::Member(MemberError::Io))?;
+fn checked_work(session: &Session, root: &Path, work: &Path, attempt: Id32) -> Result<PaymentWork, Exit> {
+    let payments = payments_path(root, work.parent().ok_or(Exit::Usage)?)?;
+    check_private_dir(&payments)?;
+    let name = work.file_name().and_then(|name| name.to_str()).ok_or(Exit::Usage)?;
+    let path = payments.join(name);
+    check_private_dir(&path)?;
+    let manifest = read_exact(&path.join("payment.json"), payment_manifest::MAX_MANIFEST, true)?;
+    let (context, proposer) = checked_proposal(&session.member, &manifest)?;
+    let scope = proposal_scope(&context, proposer);
+    if name != hex_id(&scope) || context.attempt.0 != attempt {
+        return Err(Exit::Member(MemberError::Permissions));
+    }
+    Ok(PaymentWork { path, context, scope })
+}
+
+fn signing_peer(member: &loki_relay_protocol::types::MemberPublic) -> PublicIdentity {
+    PublicIdentity { id: member.id, signing: member.signing, encryption: member.encryption }
+}
+
+fn payment_wire(message: &OpenedMessage) -> bool {
+    match message.kind() {
+        MessageKind::Commitment | MessageKind::Share => true,
+        MessageKind::Package => message.sender() == message.context().signers[0],
+        _ => false,
+    }
+}
+
+fn save_signing(session: &mut Session, work: &PaymentWork, wire: &[u8], request: Id32) -> Result<RecoveryLogical, Exit> {
+    let valid = session.member.roster.members.iter().any(|member| {
+        session.signing_identity.open_sent_session(&signing_peer(member), &work.context, wire)
+            .is_ok_and(|message| payment_wire(&message))
+    });
+    if !valid {
+        return Err(Exit::Member(MemberError::Identity));
+    }
+    save_payload(session, wire, request, Some(work.context.attempt.0))
+}
+
+/// Append only exact-context messages sealed by their outer author to this member.
+fn export_saved_signing(session: &Session, work: &PaymentWork) -> Result<usize, Exit> {
+    let mail = work.path.join("mailbox");
+    let mailbox = Mailbox::new(&mail).map_err(|_| Exit::Member(MemberError::Io))?;
+    // The signing CLI may have created this inside the already private work directory.
+    if !fs::symlink_metadata(&mail).is_ok_and(|meta| meta.is_dir()) {
+        return Err(Exit::Member(MemberError::Permissions));
+    }
     let mut count = 0;
     visit_pages(
         |after| session.db.recover_incoming_originals(after, PAGE),
         |row| {
-            if row.session != Some(attempt) || row.kind != 1 {
+            // The old outer attempt tag is a search hint, never an authorization or work key.
+            if row.session != Some(work.context.attempt.0) || row.kind != 1 {
                 return Ok(());
             }
             let Ok(opened) =
@@ -792,14 +819,15 @@ fn export_saved_signing(session: &Session, work: &Path, attempt: Id32) -> Result
             else {
                 return Ok(());
             };
-            let Payload::Test(wire) = &opened.message().body().payload else {
+            let body = opened.message().body();
+            let Payload::Test(wire) = &body.payload else {
                 return Ok(());
             };
-            match decode_proposal_for_network(wire, session.member.network) {
-                Ok(Some(_)) | Err(_) => return Ok(()),
-                Ok(None) => {}
-            }
-            if session_envelope(wire).is_err() {
+            let Some(sender) = session.member.roster.members.iter().find(|m| m.id == body.key.sender) else {
+                return Ok(());
+            };
+            if !session.signing_identity.open_session(&signing_peer(sender), &work.context, wire)
+                .is_ok_and(|message| payment_wire(&message)) {
                 return Ok(());
             }
             mailbox
@@ -817,11 +845,11 @@ fn export_saved_signing(session: &Session, work: &Path, attempt: Id32) -> Result
 /// `export-signing` for each attempt and `status` did as separate processes.
 ///
 /// The plan is a JSON file `{"proposals":[<payment.json>…], "signing":[{"attempt",
-/// "wire"}…], "export":[{"attempt","work"}…], "import":bool}`. Every message is
+/// "work","wire"}…], "export":[{"attempt","work"}…], "import":bool}`. Every message is
 /// committed before any request, then one poll uploads and receives. The report on
 /// stdout is JSON: for each proposal and signing message its id and whether it is
 /// stored on every member's relays, the imported and rejected proposal counts, and
-/// the exported wire count per attempt.
+/// the exported wire count. Report keys are the scoped work directory names.
 fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<(), Exit> {
     let raw = read_exact(plan, 1024 * 1024, false)?;
     let plan: serde_json::Value =
@@ -843,14 +871,8 @@ fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<
         .iter()
         .map(|item| item.as_str().map(PathBuf::from).ok_or(Exit::Usage))
         .collect::<Result<Vec<_>, _>>()?;
-    let signing = list("signing")?
-        .iter()
-        .map(|item| Ok((parse_id(&text(item, "attempt")?)?, PathBuf::from(text(item, "wire")?))))
-        .collect::<Result<Vec<_>, Exit>>()?;
-    let exports = list("export")?
-        .iter()
-        .map(|item| Ok((parse_id(&text(item, "attempt")?)?, checked_work(root, Path::new(&text(item, "work")?))?)))
-        .collect::<Result<Vec<_>, Exit>>()?;
+    let signing = list("signing")?;
+    let exports = list("export")?;
     let import = match plan.get("import") {
         None => false,
         Some(serde_json::Value::Bool(value)) => *value,
@@ -860,19 +882,20 @@ fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<
     let mut sent_proposals = Vec::new();
     for path in &proposals {
         let manifest = read_exact(path, payment_manifest::MAX_MANIFEST, false)?;
-        let (_, attempt, saved) = save_proposal(&mut session, &manifest)?;
-        sent_proposals.push((attempt, saved));
+        let (_, scope, saved) = save_proposal(&mut session, root, &manifest)?;
+        sent_proposals.push((scope, saved));
     }
+    let plan_work = |session: &Session, item: &serde_json::Value| {
+        checked_work(session, root, Path::new(&text(item, "work")?), parse_id(&text(item, "attempt")?)?)
+    };
+    let exports = exports.iter().map(|item| plan_work(&session, item)).collect::<Result<Vec<_>, _>>()?;
     let mut sent_signing = Vec::new();
-    for (attempt, path) in &signing {
-        let mut payload = read_exact(path, MAX_PAYLOAD, false)?;
-        let checked = session_envelope(&payload).map_err(|_| Exit::Member(MemberError::Bounds));
-        let saved = checked.and_then(|_| {
-            let request = *blake3::hash(&payload).as_bytes();
-            save_payload(&mut session, &payload, request, Some(*attempt))
-        });
-        payload.zeroize();
-        sent_signing.push((*attempt, saved?));
+    for item in &signing {
+        let work = plan_work(&session, item)?;
+        let payload = read_exact(Path::new(&text(item, "wire")?), MAX_PAYLOAD, false)?;
+        let request = *blake3::hash(&payload).as_bytes();
+        let saved = save_signing(&mut session, &work, &payload, request)?;
+        sent_signing.push((work.scope, saved));
     }
     let (config, self_route) = routed(&session)?;
     let now = now_ms()?;
@@ -893,9 +916,9 @@ fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<
         (0, 0)
     };
     let mut exported = serde_json::Map::new();
-    for (attempt, work) in &exports {
-        let count = export_saved_signing(&session, work, *attempt)?;
-        exported.insert(hex_id(attempt), count.into());
+    for work in &exports {
+        let count = export_saved_signing(&session, work)?;
+        exported.insert(hex_id(&work.scope), count.into());
     }
     let stored = |session: &mut Session, logical: &RecoveryLogical| -> Result<bool, Exit> {
         match session.db.delivery_report(
@@ -911,17 +934,17 @@ fn payment_sync(root: &Path, pass: &Path, roster: &Path, plan: &Path) -> Result<
         }
     };
     let mut proposal_report = serde_json::Map::new();
-    for (attempt, logical) in &sent_proposals {
+    for (scope, logical) in &sent_proposals {
         proposal_report.insert(
-            hex_id(attempt),
+            hex_id(scope),
             serde_json::json!({"message": hex_id(&logical.key.message), "stored": stored(&mut session, logical)?}),
         );
     }
     let mut signing_report = serde_json::Map::new();
-    for (attempt, logical) in &sent_signing {
+    for (scope, logical) in &sent_signing {
         let row = serde_json::json!({"message": hex_id(&logical.key.message), "stored": stored(&mut session, logical)?});
         let entry = signing_report
-            .entry(hex_id(attempt))
+            .entry(hex_id(scope))
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
         if let serde_json::Value::Array(items) = entry {
             items.push(row);

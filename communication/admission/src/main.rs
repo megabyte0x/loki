@@ -10,7 +10,10 @@ use std::{
     io::Read,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use zeroize::Zeroizing;
@@ -210,10 +213,12 @@ fn dispatch() -> Result<()> {
             .await
             .map_err(|_| Error::Unavailable)?;
         let provision = Arc::new(tokio::sync::Notify::new());
-        let app = router_with_provisioning(store.clone(), provision.clone());
-        let worker = async move {
+        let ready = Arc::new(AtomicBool::new(true));
+        let app = router_with_provisioning(store.clone(), provision.clone(), ready.clone());
+        tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut retry = Duration::from_secs(1);
             loop {
                 // A new mailbox command wakes the provisioner at once; the 1 s tick
                 // remains the fallback for retries and cleanup.
@@ -221,16 +226,38 @@ fn dispatch() -> Result<()> {
                     _ = interval.tick() => {}
                     _ = provision.notified() => {}
                 }
-                let now = now()?;
-                store.lock().map_err(|_| Error::Unavailable)?.cleanup(now)?;
-                provisioner.drive_once(&store, now).await?;
+                let pass = async {
+                    let db = store.clone();
+                    tokio::task::spawn_blocking(move || {
+                        db.lock().map_err(|_| Error::Storage)?.cleanup(now()?)
+                    })
+                    .await
+                    .map_err(|_| Error::Storage)??;
+                    provisioner.drive_once(&store, now()?).await?;
+                    Ok(())
+                };
+                match pass.await {
+                    Ok(()) => retry = Duration::from_secs(1),
+                    Err(Error::StorageBusy) => {
+                        eprintln!(
+                            "admission_worker_storage_busy: retrying in {}s",
+                            retry.as_secs()
+                        );
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(Duration::from_secs(30));
+                    }
+                    Err(error) => {
+                        ready.store(false, Ordering::Relaxed);
+                        eprintln!("admission_worker_stopped_{}", error.code());
+                        break;
+                    }
+                }
             }
-            #[allow(unreachable_code)]
-            Ok::<(), Error>(())
-        };
-        let server = axum::serve(listener, app).with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
         });
-        tokio::select! {result=server=>result.map_err(|_|Error::Unavailable),result=worker=>result}
+        loki_http_ingress::serve(listener, app, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await;
+        Ok(())
     })
 }

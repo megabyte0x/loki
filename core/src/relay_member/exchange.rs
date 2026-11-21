@@ -97,6 +97,7 @@ impl CourierImport {
         let wire = bounded_read(path, MAX_WIRE_LEN, true)?;
         let descriptor = open_descriptor(&member.identity, &member.roster, &wire)
             .map_err(|_| MemberError::Identity)?;
+        super::config::check_peer_destinations(member, &descriptor)?;
         let body = descriptor.body();
         if body.owner == member.identity.public().id
             || path.file_name().and_then(|s| s.to_str())

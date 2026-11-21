@@ -20,7 +20,8 @@
 # Env:
 #   ORIGIN      the exact browser origin allowed to call frostd (REQUIRED, no trailing slash)
 #   FRONT       public hostname Caddy serves + gets an ACME cert for (default: localhost)
-#   UPSTREAM    where frostd actually listens         (default: 127.0.0.1:2744)
+#   UPSTREAM    loopback IP:port, unix//path, or verified https://host[:port]
+#               (default: 127.0.0.1:2744)
 #   LISTEN      https port Caddy binds                 (default: 443 for a real host, else 8443)
 # Requires: caddy on PATH. For a public host, FRONT must resolve to this box and 80/443 be open.
 set -euo pipefail
@@ -28,6 +29,14 @@ set -euo pipefail
 origin=${ORIGIN:?set ORIGIN to the wallet page origin, e.g. https://wallet.example}
 front=${FRONT:-localhost}
 upstream=${UPSTREAM:-127.0.0.1:2744}
+# Accept one literal Caddy address, not DNS for plaintext or Caddyfile placeholders.
+loopback='^(http://)?(127\.0\.0\.1|\[::1\]):[0-9]{1,5}$'
+socket='^unix//[a-zA-Z0-9_./-]+$'
+https='^https://([a-zA-Z0-9.-]+|\[[a-fA-F0-9:]+\])(:[0-9]{1,5})?$'
+if ! [[ $upstream =~ $loopback || $upstream =~ $socket || $upstream =~ $https ]]; then
+  echo 'UPSTREAM must be a literal loopback IP:port, unix//path, or https://host[:port] (certificate verified)' >&2
+  exit 2
+fi
 if [[ $front == localhost ]]; then listen=${LISTEN:-8443}; else listen=${LISTEN:-443}; fi
 command -v caddy >/dev/null || { echo "caddy not found on PATH" >&2; exit 1; }
 

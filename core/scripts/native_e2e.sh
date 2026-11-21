@@ -50,7 +50,7 @@ frostd_url=http://127.0.0.1:2744
 app=${APP:-$core/signer-app/out/LokiSigner.app}
 
 say "preflight ($network)"
-for tool in curl jq nc cargo npm pbcopy pbpaste open; do
+for tool in curl jq nc cargo npm openssl pbcopy pbpaste open; do
   command -v "$tool" >/dev/null || fail "$tool is required (see the runbook's prerequisites)"
 done
 command -v frostd >/dev/null || fail 'frostd is not on PATH: cargo install --git https://github.com/ZcashFoundation/frost-zcash-demo frostd --locked'
@@ -88,12 +88,14 @@ say "services: frostd, two nonce-witness relays, coordinator"
 if nc -z 127.0.0.1 2744 2>/dev/null; then echo "frostd: reusing the one on :2744"; else bg frostd frostd --no-tls-very-insecure -p 2744; fi
 relay="$repo/communication/target/debug/loki-relay-server"
 [[ -x $relay ]] || cargo build --manifest-path "$repo/communication/Cargo.toml" --locked --bin loki-relay-server
+relay_pids=()
 for n in 1 2; do
   head -c 32 /dev/urandom >"$root/relay-$n.secret"; chmod 600 "$root/relay-$n.secret"
   "$relay" init --root "$root/relay-$n" --listen "127.0.0.1:$((39300+n))" --provision-capability-file "$root/relay-$n.secret" \
     --total-bytes 268435456 --mailbox-bytes 67108864 --mailbox-count 1024 >/dev/null
   cp "$root/relay-$n.secret" "$root/relay-$n/provision.secret"
   bg "relay-$n" "$relay" serve --root "$root/relay-$n" --listen "127.0.0.1:$((39300+n))"
+  relay_pids+=("$!")
 done
 listening() { nc -z 127.0.0.1 "$1" 2>/dev/null; }
 wait_for 30 'witness relays did not start' listening 39302
@@ -103,8 +105,18 @@ echo "provisioning nonce witnesses (the first run compiles the tool for a few mi
     --relay-root "$root/relay-1" --relay-root "$root/relay-2" --out "$witnesses" --development-http ) >"$root/provision.log" 2>&1 \
   || fail "provisioning the nonce witnesses failed; see $root/provision.log"
 echo "nonce witnesses: $witnesses"
+kill "${relay_pids[@]}"
+for pid in "${relay_pids[@]}"; do wait "$pid"; done
+awk -v a="${relay_pids[0]}" -v b="${relay_pids[1]}" '$0 != a && $0 != b' "$root/pids" >"$root/pids.next"
+mv "$root/pids.next" "$root/pids"
 [[ -d $repo/web/wallet/node_modules ]] || ( cd "$repo/web/wallet" && { npm ci || npm ci --legacy-peer-deps; } )
-( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 \
+grants='{}'
+for n in 1 2 3; do
+  onboarding[n]=$(openssl rand -hex 32)
+  digest=$(printf '%s' "${onboarding[n]}" | openssl dgst -sha256 -r)
+  grants=$(jq --arg digest "${digest%% *}" --argjson slot "$n" '.[$digest] = $slot' <<<"$grants")
+done
+( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 LOKI_ONBOARDING_GRANTS="$grants" \
     exec nohup npx next dev --hostname 127.0.0.1 --port "$web_port" ) >"$root/coordinator.log" 2>&1 &
 echo $! >>"$root/pids"
 wait_for 180 "coordinator did not start; see $root/coordinator.log" curl -sf -m 5 "$coord/api/members" -o /dev/null
@@ -122,12 +134,16 @@ registered() { curl -sf -m 5 "$coord/api/members" | jq -e --argjson s "$1" 'any(
 for n in 1 2 3; do
   port=$((base_port+n))
   say "pair member $n (slot $n, local API :$port)"
-  link=$(curl -sf -m 10 -X POST -H 'Content-Type: application/json' -d "{\"slot\":$n}" "$coord/api/members/pairing" | jq -er .url) \
+  link=$(printf '{"slot":%d,"onboarding_grant":"%s"}' "$n" "${onboarding[n]}" |
+    curl -qsf -m 10 -H 'Content-Type: application/json' --data-binary @- "$coord/api/members/pairing" | jq -er .url) \
     || fail "the coordinator issued no pairing link for slot $n"
+  unset 'onboarding[n]'
   printf '' | pbcopy
-  open -n "$app" --args pair "$link" --development-http --data "$root/m$n" --port "$port" \
+  printf '%s\n' "$link" | "$app/Contents/MacOS/LokiSigner" native --pairing-stdin --development-http --data "$root/m$n" --port "$port" \
     --network "$network" --lightwalletd-url "$lwd" --frostd-url "$frostd_url" \
-    --nonce-witnesses "$witnesses" --allow-loopback-peers
+    --nonce-witnesses "$witnesses" --allow-loopback-peers >"$root/m$n.log" 2>&1 &
+  echo $! >>"$root/pids"
+  unset link
   act "a LokiSigner window asks \"Pair this device with slot $n?\" (coordinator $coord). Within 2 minutes:
    1. type a new passphrase for member $n and click Pair            [Touch ID may be asked]
    2. write down the 24 recovery words, click \"I saved these words\"
@@ -165,6 +181,18 @@ dkg_done() {
   done
 }
 wait_for 600 'the vault did not become active' dkg_done
+for n in 1 2; do
+  mailbox=$(jq -er --argjson i "$((n-1))" '.[$i].mailbox | map((. / 16 | floor), (. % 16)) |
+    map(. as $nibble | "0123456789abcdef"[$nibble:$nibble + 1]) | join("")' "$witnesses")
+  for i in 1 2 3; do
+    # These three local apps just confirmed their roster, using these same profile keys.
+    key=$(api "$i" GET /api/registration | jq -er --argjson slot "$i" 'select(.slot == $slot) | .signing_pubkey')
+    "$relay" enroll-nonce --root "$root/relay-$n" --mailbox "$mailbox" --vault "$vault" \
+      --slot "$i" --signing-key "$key" --quota-bytes 1048576 || fail "witness $n enrollment for member $i"
+  done
+  bg "relay-$n" "$relay" serve --root "$root/relay-$n" --listen "127.0.0.1:$((39300+n))"
+  wait_for 30 "witness $n did not restart after enrollment" listening "$((39300+n))"
+done
 address=$(api 1 GET "/api/address?vault=$vault" | jq -er .address)
 for n in 2 3; do [[ $(api "$n" GET "/api/address?vault=$vault" | jq -r .address) == "$address" ]] || fail "member $n shows another address"; done
 echo "vault $vault is active"

@@ -14,18 +14,22 @@ test('chain history becomes the wallet History list', () => {
   ]);
 });
 
-// A payment's status on the browser signer: confirmed only once the chain shows its input note spent.
-test('payment status is confirmed only when the chain shows the input note spent', () => {
+test('payment status uses the reviewed transaction and keeps personal approval separate', () => {
   const terms = { proposer: 1, recipient: 'utest1x', amount_zat: 30000, fee_zat: 10000 };
   const waiting = chainPaymentSession({ terms, signers: [1, 3], spent: null });
   assert.equal(waiting.phase, 'signing');
   assert.equal(waiting.txid, null);
   assert.equal(waiting.approval_requested, false, 'the Approve button stays for an unsigned request');
   assert.deepEqual(waiting.intent, { proposer: 1, signers: [1, 3], recipient: 'utest1x', amount_zat: 30000, fee_zat: 10000, open_approval: true });
-  const mined = chainPaymentSession({ terms, signers: [1, 3], spent: { txid: 'd2'.repeat(32), height: 4639094 } });
+  const txid = 'd2'.repeat(32);
+  const spent = { txid, height: 4639094 };
+  assert.equal(chainPaymentSession({ terms, signers: [1, 3], spent }).phase, 'spent_unverified');
+  assert.equal(chainPaymentSession({ terms, signers: [1, 3], spent, txid: 'a1'.repeat(32) }).phase, 'replaced');
+  const mined = chainPaymentSession({ terms, signers: [1, 3], spent, txid, slot: 3, approved: false });
   assert.equal(mined.phase, 'confirmed');
   assert.equal(mined.txid, 'd2'.repeat(32));
   assert.equal(mined.signatures_received, true);
-  assert.deepEqual(mined.approvals, [1, 3], 'the signing group approved');
+  assert.equal(mined.approval_requested, false, 'mining does not prove the local member approved');
+  assert.deepEqual(mined.approvals, [], 'the signing list is not approval evidence');
   assert.equal(chainPaymentSession({ terms, signers: [], ended: 'cancelled', spent: null }).phase, 'cancelled');
 });

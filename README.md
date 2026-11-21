@@ -72,6 +72,22 @@ The signer must be served from its own origin and the relays need CORS for it, s
 [`communication/deploy/`](communication/deploy/) for deploy scripts and
 [`core/signer-app/README.md`](core/signer-app/README.md) to build the macOS signer.
 
+### Regtest account-link recovery
+
+Follow these steps if `loki_seed_wallet check` reports an identity key or `bind` reports
+that the existing profile account key is the identity. Get a fresh challenge for the
+affected vault, then run `loki_seed_wallet prove` with the intended regtest wallet's
+seed-words file. Before running `bind` with that proof:
+
+- Move the affected member's `secrets/account-link.sealed` to an owner-only backup location
+  if present. Leave the member identity and vault files in place.
+- Keep `<data-root>/profile/account.sealed` unless `bind` explicitly reports that the
+  **profile account key** is the identity. If it does, move that file to an owner-only backup
+  location and retry `bind`. Do not move a valid pin to resolve a different-account error.
+
+Run `loki_seed_wallet check` to confirm the new link. The profile pin is shared across vaults;
+repeat the rebind with a fresh challenge for each affected vault, using the same wallet.
+
 ## Architecture
 
 Every party dials out, secrets stay on member devices, and the shared services only ever

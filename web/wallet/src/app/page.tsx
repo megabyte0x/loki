@@ -22,13 +22,11 @@ import {
   PairingSlotTaken,
   pendingApprovals,
   exportRecoveryBackup,
-  removeBrowserSigner,
+  manageBrowserCustody,
   restoreSigner,
   setupBrowserRecovery,
   signerKind,
   recoveryBackup,
-  recoveryRestore,
-  recoverySetup,
   recoveryStatus,
   type CustodyMethod,
   type PairingLink,
@@ -36,11 +34,12 @@ import {
   type Slot,
   type RecoveryStatus,
 } from "@/lib/api";
-import { comparesInLokiSigner, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel, verifyPhrase } from "@/lib/wallet-ui";
+import { comparesInLokiSigner, emptyHistoryText, invitePreview, nativeRosterRefusal, pairingSecondsLeft, paymentLabel, rememberedVaultSlot, rememberVaultSlot, storageLabel } from "@/lib/wallet-ui";
 import { toggleTheme, useIsDark } from "@/lib/theme";
 import { useCeremonyStatus, usePayments, useStatus } from "@/lib/hooks";
 import type {
   CeremonyStatus,
+  ChainProvenance,
   InviteSlot,
   Payment,
   PaymentReview,
@@ -63,7 +62,8 @@ const short = (s: string, head = 8, tail = 6) =>
 function extractInvite(raw: string): string {
   const s = raw.trim();
   try {
-    return new URL(s).searchParams.get("invite") ?? s;
+    const url = new URL(s);
+    return url.searchParams.has("invite") ? "" : new URLSearchParams(url.hash.slice(1)).get("invite") ?? s;
   } catch {
     return s;
   }
@@ -71,7 +71,7 @@ function extractInvite(raw: string): string {
 
 /** A shareable invite link for a join code — opens the app straight into Join. */
 function inviteLink(code: string): string {
-  return typeof window === "undefined" ? code : `${window.location.origin}/?invite=${code}`;
+  return typeof window === "undefined" ? code : `${window.location.origin}/#invite=${encodeURIComponent(code)}`;
 }
 
 // ─── navigation state ────────────────────────────────────────────────────────
@@ -96,14 +96,16 @@ export default function App() {
   const [pendingInvite, setPendingInvite] = useState<string | null>(null);
   const { data: status, error: statusError, refresh: refreshStatus } = useStatus(authed === true);
 
-  // Invite deep-link: opening /?invite=<code> (or a full link) drops you straight into Join once
-  // you're signed in — no codes to paste, no "pick a member". Held across the login gate.
+  // Fragments stay out of the initial request. Keep the claim only in memory across sign-in.
   useEffect(() => {
-    const code = new URLSearchParams(window.location.search).get("invite");
-    if (code) {
-      setPendingInvite(code);
-      window.history.replaceState(null, "", window.location.pathname);
-    }
+    const url = new URL(window.location.href);
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    const code = fragment.get("invite");
+    if (code === null) return;
+    fragment.delete("invite");
+    url.hash = fragment.toString();
+    window.history.replaceState(window.history.state, "", url);
+    if (code) setPendingInvite(code);
   }, []);
 
   useEffect(() => {
@@ -115,6 +117,11 @@ export default function App() {
 
   const checkSession = useCallback(async () => {
     setAuthed(null); setSessionError(null);
+    // A reload keeps the slot but not the grant. Reconnect without waiting for the browser signer.
+    if (lastLokiSignerSlot() !== undefined && signerKind() === "browser") {
+      setAuthed(false);
+      return;
+    }
     const lokiSigner = hasLokiSignerSession();
     try {
       const s = await api<StatusResponse>("status");
@@ -168,7 +175,7 @@ export default function App() {
   ) : <Splash sub="Connecting…" />}</FullScreen>;
   if (!authed) return <Login notice={sessionError} onLoggedIn={() => { setAuthed(true); refreshStatus(); }} />;
 
-  const network = status?.network ?? "testnet";
+  const network = status?.network;
   const profile = status?.profile;
 
   return (
@@ -189,9 +196,11 @@ export default function App() {
               <span className="max-w-40 truncate" title={profile.name}>{profile.name}</span>
             </span>
           )}
-          <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
-            {network}
-          </span>
+          {network && (
+            <span className="eyebrow shrink-0 rounded-full border px-3 py-1" style={{ borderColor: "var(--border)" }}>
+              {network}
+            </span>
+          )}
           <ThemeToggle />
           <button onClick={signOut} className="min-h-11 shrink-0 px-1 text-muted transition hover:text-danger">
             Log out
@@ -856,8 +865,7 @@ function Home({
   );
 }
 
-// The in-browser signer's recovery words and removal. Both run on the signer page: it shows
-// the words once and checks three of them, and it asks before deleting anything.
+// Recovery setup stays on the embedded signer; removal requires the separate signer tab.
 function BrowserSignerRecovery() {
   const [hasWords, setHasWords] = useState<boolean | null>(null);
   const [busy, setBusy] = useState(false);
@@ -878,7 +886,7 @@ function BrowserSignerRecovery() {
           : "Set up 24 recovery words. You need them, and each vault's backup file, to restore this signer in another browser."}
       </p>
       {hasWords === false && <Btn disabled={busy} onClick={() => run(async () => { await setupBrowserRecovery(); setHasWords(true); })}>Set up recovery words</Btn>}
-      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { await removeBrowserSigner(); window.location.reload(); })}>Remove signer from this browser</Btn>
+      <Btn variant="ghost" disabled={busy} onClick={() => run(async () => { if (await manageBrowserCustody()) window.location.reload(); })}>Manage browser signer</Btn>
       <ErrMsg msg={err} />
     </section>
   );
@@ -989,16 +997,16 @@ function JoinVault({
   onJoined: (vault: string) => void;
 }) {
   const [invite, setInvite] = useState(initialInvite ?? "");
-  const preview = invitePreview(extractInvite(invite));
+  const code = extractInvite(invite);
+  const preview = invitePreview(code);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
   const submit = async () => {
+    if (!code) return;
     setBusy(true); setErr(null);
     try {
-      // Accept a full invite link or a raw code — pull the code out of a pasted URL.
-      const res = await api<{ vault: string }>("join", { invite: extractInvite(invite) });
-      const preview = invitePreview(extractInvite(invite));
+      const res = await api<{ vault: string }>("join", { invite: code });
       if (preview?.vault === res.vault) rememberVaultSlot(profileId, res.vault, preview.slot);
       onJoined(res.vault);
     } catch (e) { setErr((e as Error).message); }
@@ -1034,7 +1042,7 @@ function JoinVault({
         </> : <p className="text-sm text-muted">{invite ? "Preview unavailable for this invite. Ask the creator for the vault name and approval requirement before joining." : "Paste an invite to see its vault name and approval requirement."}</p>}
       </GlassCard>
       <div className="mt-4">
-        <Btn onClick={submit} disabled={!invite || busy}>
+        <Btn onClick={submit} disabled={!code || busy}>
           {busy ? "Joining…" : "Join →"}
         </Btn>
       </div>
@@ -1118,8 +1126,7 @@ function CeremonyView({
         {cs.phase === "waiting_for_members" && (
           <WaitingForMembers invites={cs.invites ?? []} />
         )}
-        {/* Only LokiSigner's roster channel reports `roster_dialog`; any other member, including
-            a headless one paired with this tab, compares the code shown here. */}
+        {/* Only LokiSigner's native window reports `roster_dialog`. */}
         {cs.phase === "compare_roster" && comparesInLokiSigner(cs) && (
           <NativeCompareRoster
             creator={cs.invites !== undefined}
@@ -1134,6 +1141,7 @@ function CeremonyView({
         )}
         {cs.phase === "compare_roster" && !comparesInLokiSigner(cs) && (
           <CompareRoster
+            key={cs.roster_code ?? ""}
             creator={cs.invites !== undefined}
             vault={vault}
             fingerprint={cs.fingerprint}
@@ -1286,10 +1294,8 @@ function CompareRoster({
 }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // Explicit out-of-band gate: the member must affirm they compared the code on a side channel
-  // before "Confirm" is enabled, so the check can't degrade into trusting the shown value.
+  // The parent keys this form by roster code so a status refresh cannot carry approval over.
   const [checked, setChecked] = useState(false);
-  const phrase = verifyPhrase(fingerprint);
 
   const [confirmedHere, setConfirmedHere] = useState(confirmed);
   useEffect(() => {
@@ -1307,23 +1313,28 @@ function CompareRoster({
   };
 
   const allConfirmed = members > 0 && confirmations >= members;
+  const headless = signerKind() === "native";
 
   return (
     <div>
-      <p className="text-sm text-muted mb-4">
-        Security check: on a call or in person, make sure this code is{" "}
-        <span className="text-foreground">identical</span> for every member. Read the words aloud and
-        match the emoji. Matching codes prove you&apos;re all in the same vault and no one was swapped
-        in — don&apos;t trust the code on this screen alone.
-      </p>
-      {phrase && (
-        <GlassCard className="mb-4 text-center">
-          <h3 className="eyebrow mb-2">Compare this code</h3>
-          <p className="text-2xl mb-2" aria-label={`emoji ${phrase.emoji.join(" ")}`}>{phrase.emoji.join(" ")}</p>
-          <p className="font-mono text-lg font-semibold tracking-wide text-amber break-words">{phrase.words.join(" · ")}</p>
-          {rosterCode && <p className="font-mono text-xl font-semibold tracking-wide">{rosterCode}</p>}
-          <p className="mt-3 font-mono text-xs break-all text-muted">{fingerprint}</p>
-        </GlassCard>
+      {rosterCode && headless ? (
+        <p className="text-sm text-muted mb-4">
+          Request confirmation to show the code in your signer&apos;s terminal. Compare all 24 digits
+          with the other members on their trusted screens or terminals, then answer in your terminal.
+        </p>
+      ) : rosterCode ? (
+        <>
+          <p className="text-sm text-muted mb-4">
+            Security check: compare all 24 digits with every member on a call or in person.
+            Confirm only if everyone sees <span className="text-foreground">exactly the same code</span>.
+          </p>
+          <GlassCard className="mb-4 text-center">
+            <h3 className="eyebrow mb-2">Compare this code</h3>
+            <p className="font-mono text-base font-semibold tracking-wide text-amber sm:text-xl">{rosterCode}</p>
+          </GlassCard>
+        </>
+      ) : (
+        <p role="status" className="mb-4 text-sm text-muted">The signer has not provided a roster code. You can’t confirm members without it.</p>
       )}
       {creator && (
         <p className="pill text-muted mb-4">
@@ -1331,15 +1342,15 @@ function CompareRoster({
           {confirmations} of {members} confirmed
         </p>
       )}
-      {!confirmedHere && !allConfirmed && (
+      {rosterCode && !confirmedHere && !allConfirmed && (
         <>
-          <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
+          {!headless && <label className="glass mb-3 flex items-start gap-3 rounded-2xl p-4 text-left text-sm text-foreground cursor-pointer">
             <input type="checkbox" className="mt-0.5 h-4 w-4 shrink-0 accent-amber" checked={checked}
               onChange={(e) => setChecked(e.target.checked)} />
-            <span>I compared this code with the other members out of band and it matches.</span>
-          </label>
-          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || !rosterCode || !checked}>
-            {busy ? "Confirming…" : "Confirm members"}
+            <span>I compared all 24 digits with the other members and they match.</span>
+          </label>}
+          <Btn variant="amber" onClick={agree} disabled={busy || !fingerprint || (!headless && !checked)}>
+            {headless ? (busy ? "Check your signer’s terminal…" : "Request local confirmation") : (busy ? "Confirming…" : "Confirm members")}
           </Btn>
         </>
       )}
@@ -1553,6 +1564,12 @@ function BackupPhase({
 
 // ─── vault overview ───────────────────────────────────────────────────────────
 
+function ProviderProvenance({ chain_trust }: ChainProvenance) {
+  return chain_trust === "provider_reported" && (
+    <p className="mb-3 text-xs text-muted">Reported by your chain provider · not independently verified</p>
+  );
+}
+
 function VaultOverview({
   vault,
   onSend,
@@ -1567,13 +1584,18 @@ function VaultOverview({
   onBack: () => void;
 }) {
   const [address, setAddress] = useState<string | null>(null);
-  const [balance, setBalance] = useState<{ balance_zat: number } | null>(null);
+  type Balance = ChainProvenance & { balance_zat: number };
+  const [balance, setBalance] = useState<Balance | null>(null);
   const [copied, setCopied] = useState(false);
   const [copyFailed, setCopyFailed] = useState(false);
+  const [verifyingAddress, setVerifyingAddress] = useState(false);
+  const [verifyError, setVerifyError] = useState<string | null>(null);
   const [loadVersion, setLoadVersion] = useState(0);
   const [loadErr, setLoadErr] = useState<string | null>(null);
-  const [balanceErr, setBalanceErr] = useState(false);
-  const [funding, setFunding] = useState(false);
+  const [balanceErr, setBalanceErr] = useState<string | null>(null);
+  const [retrying, setRetrying] = useState(false);
+  const needsTouchID = balanceErr === "Touch ID is required to open this vault.";
+  const [funding, setFunding] = useState<"idle" | "requesting" | "unconfirmed">("idle");
   const [pending, setPending] = useState<PendingApproval[] | null>(null);
   const [pendingError, setPendingError] = useState<string | null>(null);
   const [pendingVersion, setPendingVersion] = useState(0);
@@ -1604,9 +1626,9 @@ function VaultOverview({
       .catch((e) => active && setLoadErr((e as Error).message));
     // Poll the balance so a deposit (or a still-scanning signer) shows up without a reload.
     const loadBalance = () =>
-      api<{ balance_zat: number }>("balance", { vault: vault.vault })
-        .then((r) => { if (active) { setBalance(r); setBalanceErr(false); } })
-        .catch(() => active && setBalanceErr(true));
+      api<Balance>("balance", { vault: vault.vault })
+        .then((r) => { if (active) { setBalance(r); setBalanceErr(null); } })
+        .catch((e) => active && setBalanceErr((e as Error).message));
     loadBalance();
     const timer = setInterval(loadBalance, 5000);
     return () => {
@@ -1614,6 +1636,18 @@ function VaultOverview({
       clearInterval(timer);
     };
   }, [vault.vault, loadVersion]);
+
+  const retryDetails = async () => {
+    if (needsTouchID) {
+      setRetrying(true);
+      try {
+        setBalance(await api<Balance>("balance", { vault: vault.vault, retry_touch_id: true }));
+        setBalanceErr(null);
+      } catch (e) { setBalanceErr((e as Error).message); }
+      finally { setRetrying(false); }
+    }
+    setLoadVersion((v) => v + 1);
+  };
 
   const copy = async () => {
     if (!address) return;
@@ -1625,15 +1659,25 @@ function VaultOverview({
     } catch { setCopyFailed(true); }
   };
 
+  const verifyAddress = async () => {
+    setVerifyingAddress(true);
+    setVerifyError(null);
+    try { await api("verify-address", { vault: vault.vault }); }
+    catch (e) { setVerifyError((e as Error).message); }
+    finally { setVerifyingAddress(false); }
+  };
+
   const requestFunds = async () => {
-    if (!address) return;
-    setFunding(true); setLoadErr(null);
+    if (!address || funding !== "idle") return;
+    setFunding("requesting"); setLoadErr(null);
     try {
-      await fund(address);
-      const r = await api<{ balance_zat: number }>("balance", { vault: vault.vault });
-      setBalance(r);
-    } catch (e) { setLoadErr((e as Error).message); }
-    finally { setFunding(false); }
+      const { mined } = await fund(address);
+      setFunding(mined ? "idle" : "unconfirmed");
+      if (mined) setLoadVersion((v) => v + 1);
+    } catch (e) {
+      setLoadErr((e as Error).message);
+      setFunding("idle");
+    }
   };
 
   return (
@@ -1644,19 +1688,20 @@ function VaultOverview({
         <span className="pill shrink-0 font-mono text-muted">{vault.threshold}/{vault.members}</span>
       </div>
       <p className="eyebrow mb-2">Balance</p>
-      <div className="mb-6 font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
+      <div className="mb-2 font-mono text-3xl font-semibold [overflow-wrap:anywhere] sm:text-4xl">
         {balance ? zatToTaz(balance.balance_zat) : "—"}
         <span className="ml-2 text-xl text-muted">TAZ</span>
       </div>
+      {balance && <ProviderProvenance chain_trust={balance.chain_trust} />}
 
       {!balance && !balanceErr && (
         <p role="status" className="glass mb-4 rounded-2xl p-4 text-sm text-muted">Loading balance…</p>
       )}
       {balanceErr && (
-        <div className="mb-4"><ErrMsg msg={balance ? "Balance could not refresh. The amount shown may be out of date. Retrying automatically." : "Balance is unavailable. Retrying automatically."} /></div>
+        <div className="mb-4"><ErrMsg msg={needsTouchID ? balanceErr : balance ? "Balance could not refresh. The amount shown may be out of date. Retrying automatically." : "Balance is unavailable. Retrying automatically."} /></div>
       )}
       {loadErr && <div className="mb-4"><ErrMsg msg={loadErr} /></div>}
-      {(loadErr || balanceErr) && <Btn variant="ghost" className="mb-4" onClick={() => setLoadVersion((v) => v + 1)}>Retry wallet details</Btn>}
+      {(loadErr || balanceErr || retrying) && <Btn variant="ghost" className="mb-4" disabled={retrying} onClick={retryDetails}>{retrying ? "Waiting for LokiSigner…" : needsTouchID ? "Retry Touch ID" : "Retry wallet details"}</Btn>}
 
       <div className="mb-5">
         <div className="mb-2 flex items-center gap-2">
@@ -1702,7 +1747,7 @@ function VaultOverview({
 
       <GlassCard className="mb-4">
         <Row label="Policy" value={`${vault.threshold} of ${vault.members}`} mono />
-        <Row label="Vault ID" value={short(vault.vault)} mono />
+        <Row label="Vault ID" value={<FullValue value={vault.vault} label="vault ID" />} />
         {address && (
           <Row
             label="Address"
@@ -1712,11 +1757,21 @@ function VaultOverview({
           />
         )}
         {!address && !loadErr && <p role="status" className="mt-3 text-sm text-muted">Loading receive address…</p>}
-        {signerKind() === "native" && (
+        {signerKind() === "native" ? (
           <p className="mt-3 text-sm leading-relaxed text-muted">
             Open <strong>Vault addresses…</strong> in LokiSigner. Give senders the address copied from LokiSigner,
-            or compare both addresses before sharing the one shown here.
+            or compare the full vault ID and address in both places before sharing the one shown here.
           </p>
+        ) : (
+          <>
+            <p className="mt-3 text-sm leading-relaxed text-muted">
+              Copy from the signer&apos;s own tab, or compare the full vault ID and address before sharing the address shown here.
+            </p>
+            <Btn variant="ghost" className="mt-3 text-sm" disabled={verifyingAddress} onClick={verifyAddress}>
+              {verifyingAddress ? "Waiting for the signer…" : "Verify on signer"}
+            </Btn>
+            <ErrMsg msg={verifyError} />
+          </>
         )}
       </GlassCard>
 
@@ -1733,13 +1788,19 @@ function VaultOverview({
           {address.startsWith("uregtest1") && (
             <button
               onClick={requestFunds}
-              disabled={funding}
+              disabled={funding !== "idle"}
               className="btn-glass rounded-full px-4 py-3 text-sm text-amber disabled:opacity-60"
             >
-              {funding ? "Funding…" : "Request test funds"}
+              {funding === "requesting" ? "Funding…" : funding === "unconfirmed" ? "Funding accepted" : "Request test funds"}
             </button>
           )}
         </div>
+      )}
+      {funding === "unconfirmed" && (
+        <p role="status" className="mb-4 text-sm text-muted">
+          The faucet accepted the transfer, but automatic mining could not be verified. Check the regtest node and
+          watch your balance instead of requesting funds again.
+        </p>
       )}
 
       {/* Testnet has no in-app faucet: send the member to an external one with the address. */}
@@ -1788,17 +1849,11 @@ function BrowserBackupCard({ vault }: { vault: string }) {
 
 // ─── recovery ───────────────────────────────────────────────────────────────
 
-/**
- * Per-vault recovery status. LokiSigner only exposes the encrypted backup; a headless
- * member keeps the original HTTP setup and restore controls.
- */
+/** The member app exposes status and encrypted backups, not the recovery words. */
 function RecoveryCard({ vault }: { vault: string }) {
   const [status, setStatus] = useState<RecoveryStatus | null>(null);
-  const [words, setWords] = useState<string | null>(null);
-  const [mode, setMode] = useState<"idle" | "restoring">("idle");
-  const [entry, setEntry] = useState("");
+  const [exportFingerprint, setExportFingerprint] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -1813,35 +1868,16 @@ function RecoveryCard({ vault }: { vault: string }) {
 
   const inApp = status?.recovery_in_app === true;
   const download = async () => {
-    setBusy(true); setErr(null);
+    setBusy(true); setErr(null); setExportFingerprint(null);
     try {
-      const { vault: id, backup } = await recoveryBackup(vault);
+      const { vault: id, backup, fingerprint } = await recoveryBackup(vault);
       const url = URL.createObjectURL(new Blob([JSON.stringify({ vault: id, backup })], { type: "application/json" }));
       const link = document.createElement("a");
       link.href = url;
       link.download = `loki-recovery-${vault}.json`;
       link.click();
+      setExportFingerprint(fingerprint ?? null);
       setTimeout(() => URL.revokeObjectURL(url), 0);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  const setup = async () => {
-    setBusy(true); setErr(null);
-    try {
-      const { words } = await recoverySetup();
-      setWords(words);
-      refresh();
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  const restore = async () => {
-    setBusy(true); setErr(null); setMsg(null);
-    try {
-      await recoveryRestore(vault, entry.trim());
-      setMsg("Access restored — your share is rebuilt.");
-      setMode("idle"); setEntry(""); refresh();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
@@ -1849,7 +1885,7 @@ function RecoveryCard({ vault }: { vault: string }) {
   return (
     <GlassCard>
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
-        <h3 data-screen-heading={!inApp && (words || mode === "restoring") ? true : undefined} className="eyebrow">{inApp ? "Recovery" : words ? "Save your recovery phrase" : mode === "restoring" ? "Restore your share" : "Recovery"}</h3>
+        <h3 className="eyebrow">Recovery</h3>
         <span className="text-xs text-muted">
           {checking ? "Checking recovery…" : statusError ? "Status unavailable" : status?.recovery_identity ? (status.recovery_backup ? "backed up" : "no vault backup yet") : "not set up"}
         </span>
@@ -1857,66 +1893,36 @@ function RecoveryCard({ vault }: { vault: string }) {
 
       {statusError && <div className="mb-3"><ErrMsg msg={`Could not check recovery: ${statusError}`} /><Btn variant="ghost" onClick={refresh}>Retry recovery status</Btn></div>}
       {checking && <p role="status" className="mb-3 text-sm text-muted">Loading recovery status…</p>}
-      {inApp ? (
+      {status && (
         <div>
-          <p className="mb-2 text-xs text-muted">Use LokiSigner for recovery words and for restoring vaults. Never enter your words on this page.</p>
-          <p className="mb-3 text-xs text-muted">Save the encrypted backup somewhere other than this Mac. If you lose this Mac without the file, the words alone cannot restore this vault.</p>
+          {inApp ? (
+            <>
+              <p className="mb-2 text-xs text-muted">Use LokiSigner for recovery words and for restoring vaults. Never enter your words on this page.</p>
+              <p className="mb-3 text-xs text-muted">Save the encrypted backup somewhere other than this Mac. If you lose this Mac without the file, the words alone cannot restore this vault.</p>
+            </>
+          ) : (
+            <>
+              <p className="mb-2 text-xs text-muted">Stop the member app before managing recovery. In the signer&apos;s private terminal, run <code>loki_member_app recovery-setup --data &lt;dir&gt;</code> to set up and confirm your words, or use <code>loki_member_app recovery-restore</code> with your backup and its fingerprint. Never enter your words on this page.</p>
+              <p className="mb-3 text-xs text-muted">Save the encrypted backup off-device and separately record its SHA-256 fingerprint from the original signer. The words alone cannot restore this vault.</p>
+            </>
+          )}
           <Btn variant="ghost" disabled={busy || checking || !!statusError || !status?.recovery_backup} onClick={download}>
             {busy ? "Downloading…" : "Download encrypted backup"}
           </Btn>
-        </div>
-      ) : !status ? null : words ? (
-        <div>
-          <p className="mb-2 text-xs text-amber">
-            Write these 24 words down and keep them offline. They are shown once. Restoring your
-            share also requires signing in to this account and a stored backup for this vault.
-          </p>
-          <div className="mb-3 grid grid-cols-2 gap-x-3 gap-y-2 rounded-xl border border-[var(--border)] bg-[var(--surface-2)] p-3 font-mono text-xs sm:grid-cols-3">
-            {words.split(/\s+/).map((w, i) => (
-              <span key={i}><span className="text-muted">{i + 1}.</span> {w}</span>
-            ))}
-          </div>
-          <Btn variant="mint" onClick={() => setWords(null)}>I&apos;ve saved them</Btn>
-        </div>
-      ) : mode === "restoring" ? (
-        <div>
-          <label htmlFor="restore-words" className="mb-2 block text-xs text-muted">Enter your 24 recovery words to rebuild your share.</label>
-          <textarea
-            id="restore-words"
-            value={entry}
-            onChange={(e) => setEntry(e.target.value)}
-            rows={3}
-            placeholder="word1 word2 … word24"
-            className="glass mb-3 w-full rounded-2xl p-3 font-mono outline-none"
-          />
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Btn variant="mint" onClick={restore} disabled={busy || !entry.trim()}>
-              {busy ? "Restoring…" : "Restore"}
-            </Btn>
-            <Btn variant="ghost" onClick={() => { setMode("idle"); setErr(null); }}>Cancel</Btn>
-          </div>
-        </div>
-      ) : (
-        <div className="grid gap-3 sm:grid-cols-2">
-          {status && !statusError && !status.recovery_identity && (
-            <Btn variant="mint" onClick={setup} disabled={busy || checking}>
-              {busy ? "Setting up…" : "Set up recovery"}
-            </Btn>
-          )}
-          <Btn variant="ghost" disabled={checking || !!statusError || !status?.recovery_backup} onClick={() => { setMode("restoring"); setMsg(null); }}>
-            Restore access
-          </Btn>
+          {exportFingerprint && <p role="status" className="mt-3 text-xs text-muted">
+            Save this SHA-256 fingerprint separately for restore:<br />
+            <code className="select-all break-all text-foreground">{exportFingerprint}</code>
+          </p>}
         </div>
       )}
-
-      {!inApp && !words && mode === "idle" && status && !statusError && !checking && !status.recovery_backup && <p className="mt-3 text-xs text-muted">No stored backup is available for this vault. A phrase alone cannot restore it here.</p>}
-      {!inApp && msg && <p role="status" className="mt-3 rounded-xl bg-mint/5 p-3 text-sm text-mint">{msg}</p>}
       <ErrMsg msg={err} />
     </GlassCard>
   );
 }
 
 // ─── send ─────────────────────────────────────────────────────────────────────
+
+type DraftQuote = { attempt: string; fee_zat: string; change_zat: string };
 
 function Send({
   vault,
@@ -1930,29 +1936,37 @@ function Send({
   const [recipient, setRecipient] = useState("");
   const [amountTaz, setAmountTaz] = useState("");
   const [memo, setMemo] = useState("");
-  const [draft, setDraft] = useState<{ attempt: string; fee_zat: string; change_zat: string } | null>(null);
+  const [draft, setDraft] = useState<(DraftQuote & { terms: Readonly<{ vault: string; recipient: string; amount_zat: string; memo: string }> }) | null>(null);
+  const termsVersion = useRef(0);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  const invalidateDraft = () => {
+    termsVersion.current++;
+    setDraft(null);
+    setErr(null);
+  };
+
   const prepareDraft = async () => {
+    const version = termsVersion.current;
     setBusy(true); setErr(null);
     try {
       const taz = parseFloat(amountTaz);
       if (!Number.isFinite(taz) || taz <= 0) throw new Error("Enter a valid amount in TAZ.");
       const amount_zat = String(Math.round(taz * 1e8));
-      const res = await api<{ attempt: string; fee_zat: string; change_zat: string }>(
-        "payment-draft", { vault: vault.vault, recipient, amount_zat, memo }
-      );
-      setDraft(res);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
+      const terms = { vault: vault.vault, recipient, amount_zat, memo };
+      const quote = await api<DraftQuote>("payment-draft", terms);
+      if (version === termsVersion.current) setDraft({ ...quote, terms });
+    } catch (e) {
+      if (version === termsVersion.current) setErr((e as Error).message);
+    } finally { setBusy(false); }
   };
 
   const publish = async () => {
     if (!draft) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-publish", { vault: vault.vault, attempt: draft.attempt });
+      await api("payment-publish", { vault: draft.terms.vault, attempt: draft.attempt });
       onDraft(draft.attempt);
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
@@ -1968,7 +1982,7 @@ function Send({
           <input
             placeholder="Recipient address"
             value={recipient}
-            onChange={(e) => { setRecipient(e.target.value); setDraft(null); }}
+            onChange={(e) => { setRecipient(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -1980,7 +1994,7 @@ function Send({
             step="0.00000001"
             min="0"
             value={amountTaz}
-            onChange={(e) => { setAmountTaz(e.target.value); setDraft(null); }}
+            onChange={(e) => { setAmountTaz(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 font-mono outline-none"
           />
         </label>
@@ -1989,7 +2003,7 @@ function Send({
           <input
             placeholder="Memo (optional)"
             value={memo}
-            onChange={(e) => { setMemo(e.target.value); setDraft(null); }}
+            onChange={(e) => { setMemo(e.target.value); invalidateDraft(); }}
             className="glass mt-1.5 w-full rounded-full px-5 py-3 outline-none"
           />
         </label>
@@ -1998,10 +2012,11 @@ function Send({
       {draft && (
         <GlassCard className="mb-4">
           <h3 className="eyebrow mb-3">Transaction summary</h3>
-          <Row label="Recipient" value={short(recipient, 14, 10)} mono />
-          <Row label="Amount" value={`${amountTaz} TAZ`} mono />
+          <Row label="Recipient" value={short(draft.terms.recipient, 14, 10)} mono />
+          <Row label="Amount" value={`${zatToTaz(draft.terms.amount_zat)} TAZ`} mono />
           <Row label="Fee" value={`${zatToTaz(draft.fee_zat)} TAZ`} mono />
           <Row label="Change" value={`${zatToTaz(draft.change_zat)} TAZ`} mono />
+          {draft.terms.memo && <Row label="Memo" value={<span className="whitespace-pre-wrap">{draft.terms.memo}</span>} />}
         </GlassCard>
       )}
 
@@ -2027,12 +2042,12 @@ function Send({
 function SignerList({ signers, threshold, approvals = [], ready = false, complete = false }: { signers: number[]; threshold: number; approvals?: number[]; ready?: boolean; complete?: boolean }) {
   // Until the first approvals fix the signing group, any member may approve.
   const open = signers.length === 0;
-  const shown = open ? approvals : signers;
-  const count = open ? approvals.length : approvals.filter((id) => signers.includes(id)).length;
+  const recorded = new Set(approvals);
+  const shown = new Set([...signers, ...recorded]);
   return <div className="my-3">
-    <p className="text-xs text-muted">{ready ? "Signed · every member gets the transaction" : complete ? "Your signer finished · awaiting the signed transaction" : `${count} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
+    <p className="text-xs text-muted">{ready ? "Signed · every member gets the transaction" : complete ? "Your signer finished · awaiting the signed transaction" : `${recorded.size} of ${threshold} approvals recorded here${open ? " · any member can approve" : ""}`}</p>
     <div className="mt-2 flex flex-wrap gap-2">
-      {shown.map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{approvals.includes(slot) ? " · approved" : " · waiting"}</span>)}
+      {[...shown].map((slot) => <span key={slot} className="pill"><MemberAvatar slot={slot} size={24} /> Member {slot}{recorded.has(slot) ? " · approved" : " · proposed"}</span>)}
     </div>
   </div>;
 }
@@ -2053,7 +2068,6 @@ function ReviewApprove({
   onBack: () => void;
 }) {
   const [review, setReview] = useState<PaymentReview | null>(null);
-  const [approved, setApproved] = useState(false);
   const [session, setSession] = useState<PaymentSession | null>(null);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [ownSlot, setOwnSlot] = useState<number | null>(null);
@@ -2061,12 +2075,12 @@ function ReviewApprove({
   const [err, setErr] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const triesRef = useRef(0);
+  const approved = session?.approval_requested === true;
 
   const fetchSession = useCallback(async () => {
     try {
       const value = await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`);
       setSession(value);
-      if (value.approval_requested) setApproved(true);
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
   }, [vault.vault, attempt]);
@@ -2112,13 +2126,28 @@ function ReviewApprove({
     setBusy(true); setErr(null);
     try {
       await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token, intent_hash: review.intent_hash });
-      setApproved(true);
-      void fetchSession();
+      await fetchSession();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
 
   const isProposer = proposedHere ?? (session && ownSlot !== null ? session.intent.proposer === ownSlot : null);
+
+  if (session && ["confirmed", "replaced", "spent_unverified"].includes(session.phase)) {
+    return (
+      <GlassCard className="text-center">
+        <h2 className="mb-2 text-2xl font-semibold">{paymentLabel(session.phase, false, false)}</h2>
+        <p className="mb-4 text-sm text-muted">
+          {session.phase === "confirmed" ? "The reported mined transaction matches this payment attempt." :
+            session.phase === "replaced" ? "A different transaction was reported to have spent this payment’s input." :
+              "This payment’s input was reported spent, but the spend hasn’t been matched to this payment."}
+        </p>
+        <ProviderProvenance chain_trust={session.chain_trust} />
+        {session.approval_requested && <p className="mb-4 text-sm text-mint">You approved this payment.</p>}
+        <Btn variant="ghost" onClick={onBack}>Back to History</Btn>
+      </GlassCard>
+    );
+  }
 
   if (approved && session?.phase === "failed") {
     return (
@@ -2269,9 +2298,6 @@ function History({
 }) {
   const { data, error, refresh } = usePayments(vault.vault, true);
   const [sendingHere, setSendingHere] = useState<string | null>(null);
-  const [verifying, setVerifying] = useState<string | null>(null);
-  const [txids, setTxids] = useState<Record<string, string>>({});
-  const [verified, setVerified] = useState<Record<string, boolean>>({});
   const [err, setErr] = useState<string | null>(null);
 
   // Sends the signed transaction through this member's own lightwalletd, or sends it again.
@@ -2284,39 +2310,31 @@ function History({
     finally { setSendingHere(null); }
   };
 
+  const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid);
+  const verifying = pending?.attempt;
+  const verifyingTxid = pending?.txid;
   useEffect(() => {
-    if (!verifying) return;
-    const attempt = verifying;
-    const txid = txids[attempt];
-    if (!txid) return;
+    if (!verifying || !verifyingTxid) return;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
     let tries = 0;
     const tick = async () => {
       try {
-        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt, txid });
-        if (!cancelled && res.phase === "confirmed") {
-          setVerified((p) => ({ ...p, [attempt]: true }));
-          setVerifying(null);
+        const res = await api<{ phase: string }>("payment-verify", { vault: vault.vault, attempt: verifying, txid: verifyingTxid });
+        if (!cancelled && res.phase !== "broadcast") {
+          refresh();
           return;
         }
       } catch {}
       tries += 1;
       // Cap at ~1min: the tx is broadcast and its id is shown; stop hammering the host if it's
       // slow to confirm (common on testnet) rather than polling forever and leaking timers.
-      if (cancelled || tries >= 40) { setVerifying(null); return; }
+      if (cancelled || tries >= 40) return;
       timer = setTimeout(tick, 1500);
     };
     timer = setTimeout(tick, 1500);
     return () => { cancelled = true; if (timer) clearTimeout(timer); };
-  }, [verifying, txids, vault.vault]);
-
-  useEffect(() => {
-    const pending = data?.payments.find((p) => p.phase === "broadcast" && p.txid && !txids[p.attempt]);
-    if (!pending?.txid || verifying) return;
-    setTxids((ids) => ({ ...ids, [pending.attempt]: pending.txid! }));
-    setVerifying(pending.attempt);
-  }, [data, txids, verifying]);
+  }, [verifying, verifyingTxid, vault.vault, refresh]);
 
   const payments = data?.payments ?? [];
 
@@ -2324,6 +2342,7 @@ function History({
     <div>
       <BackLink onClick={onBack} />
       <h2 className="mb-4 text-2xl font-semibold">History</h2>
+      <ProviderProvenance chain_trust={data?.chain_trust} />
 
       {error && <div className="mb-4"><ErrMsg msg={error} /><Btn variant="ghost" onClick={refresh}>Retry history</Btn></div>}
 
@@ -2334,16 +2353,17 @@ function History({
       ) : payments.length === 0 ? (
         <GlassCard className="py-10 text-center text-sm text-muted">
           <p className="mb-2 font-display text-lg font-semibold text-foreground">No payments yet</p>
-          <p>Payments sent and received by this vault will appear here.</p>
+          <p>{emptyHistoryText(hasLokiSignerSession())}</p>
         </GlassCard>
       ) : (
         <div className="space-y-3">
           {payments.map((p) => {
-            const confirmed = !!verified[p.attempt] || p.phase === "confirmed";
+            const confirmed = p.phase === "confirmed";
             const replaced = p.phase === "replaced";
-            const txid = !replaced ? p.txid ?? txids[p.attempt] ?? null : null;
+            const unverified = p.phase === "spent_unverified";
+            const txid = p.txid;
             const sending = !!p.sending || sendingHere === p.attempt;
-            const settled = confirmed || replaced || ["cancelled", "expired"].includes(p.phase);
+            const settled = confirmed || replaced || unverified || ["cancelled", "expired"].includes(p.phase);
             return (
             <GlassCard key={p.attempt}>
               <div className="mb-2 flex flex-col items-start gap-3 sm:flex-row sm:justify-between">
@@ -2356,13 +2376,16 @@ function History({
                     Replaces payment {short(p.replaces.attempt, 6, 4)} with the same note{p.replaces.cancel ? "; the note goes back to the vault" : ""}.
                   </p>}
                 </div>
-                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[confirmed ? "confirmed" : p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
-                  {paymentLabel(confirmed ? "confirmed" : p.phase, false, sending && !settled)}
+                <span className={`rounded-full px-2.5 py-0.5 text-xs font-medium shrink-0 ${PHASE_PILL[p.phase] ?? "border border-[var(--border)] bg-[var(--surface-2)] text-muted"}`}>
+                  {paymentLabel(p.phase, false, sending && !settled)}
                 </span>
               </div>
               {p.signers && !txid && !settled && <SignerList signers={p.signers} threshold={vault.threshold} approvals={p.approvals} complete={p.phase === "approved"} />}
               {replaced && <p className="text-xs text-muted">
-                Another transaction spent this payment’s note in a mined block{p.replaced_by ? ` (${short(p.replaced_by, 8, 6)})` : ""}, so this one can never be mined. Its reservation is released.
+                Another transaction was reported to have spent this payment’s note{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}.
+              </p>}
+              {unverified && <p className="text-xs text-muted">
+                This payment’s note was reported spent{p.spent_by ? ` (${short(p.spent_by, 8, 6)})` : ""}, but the spend hasn’t been matched to this attempt.
               </p>}
               {txid && !confirmed && p.phase === "signed" && <p className="text-xs text-muted">
                 Signed by {vault.threshold} members. This device holds the final transaction{p.can_send ? " and can send it" : ""}.
@@ -2378,11 +2401,11 @@ function History({
                 >
                   Review / approve
                 </button>}
-                {p.can_discard && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
+                {(p.can_discard || p.can_dismiss) && <button className="btn-glass flex-1 rounded-full px-4 py-2 text-sm" onClick={async () => {
                   setErr(null);
                   try { await api("payment-discard", { vault: vault.vault, attempt: p.attempt }); refresh(); }
                   catch (e) { setErr((e as Error).message); }
-                }}>{p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
+                }}>{p.can_dismiss ? "Dismiss on this device" : p.error || p.phase === "failed" ? "Discard failed payment" : "Cancel payment"}</button>}
                 {(p.can_send || sending) && !settled && (
                   <button
                     onClick={() => send(p.attempt)}
@@ -2408,7 +2431,7 @@ function History({
               {p.can_replace && <ReplacePanel vault={vault} payment={p} onStarted={onReview} />}
               {txid && confirmed && (
                 <p className="mt-1.5 text-center text-[11px] text-muted">
-                  Confirmed on-chain by your wallet{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
+                  Reported mined{p.mined_height ? ` at block ${p.mined_height.toLocaleString()}` : ""}.{" "}
                   <a href={`https://testnet.zecblock.com/tx/${txid}`} target="_blank" rel="noreferrer" className="text-mint underline">View on ZecBlock ↗</a>. Tap the id to copy.
                 </p>
               )}

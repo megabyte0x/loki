@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "./api";
-import type { CeremonyStatus, Payment, StatusResponse } from "./types";
+import type { CeremonyStatus, ChainProvenance, Payment, StatusResponse } from "./types";
 
 /** Poll every 1.5s while `active` is true. Returns latest value + manual refresh. */
 function usePoll<T>(
@@ -14,14 +14,21 @@ function usePoll<T>(
   const [error, setError] = useState<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetcherRef = useRef(fetcher);
+  const requested = useRef(0);
+  const applied = useRef(0);
   fetcherRef.current = fetcher;
 
   const run = useCallback(async () => {
+    const request = ++requested.current;
     try {
       const d = await fetcherRef.current();
+      if (request < applied.current) return;
+      applied.current = request;
       setData(d);
       setError(null);
     } catch (e) {
+      if (request < applied.current) return;
+      applied.current = request;
       setError((e as Error).message);
     }
   }, []);
@@ -57,8 +64,8 @@ export function useCeremonyStatus(vault: string, active: boolean) {
 }
 
 export function usePayments(vault: string, active: boolean) {
-  return usePoll<{ payments: Payment[] }>(
-    () => api<{ payments: Payment[] }>(`payments?vault=${encodeURIComponent(vault)}`),
+  return usePoll<ChainProvenance & { payments: Payment[] }>(
+    () => api(`payments?vault=${encodeURIComponent(vault)}`),
     active,
   );
 }

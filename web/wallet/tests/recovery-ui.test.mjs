@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
-import { exportRecoveryBackup, removeBrowserSigner, restoreSigner, setupBrowserRecovery } from '../src/lib/api.ts';
+import { exportRecoveryBackup, manageBrowserCustody, restoreSigner, setupBrowserRecovery } from '../src/lib/api.ts';
 
 test('browser recovery calls go only to the browser signer, never to a paired native member', async () => {
   const sess = new Map();
@@ -15,7 +15,7 @@ test('browser recovery calls go only to the browser signer, never to a paired na
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url) => { fetched.push(url); throw new Error('no network expected'); };
   const calls = [setupBrowserRecovery, () => exportRecoveryBackup('a'.repeat(64)),
-    () => restoreSigner({ name: 'A', method: 'passphrase' }), removeBrowserSigner];
+    () => restoreSigner({ name: 'A', method: 'passphrase' }), manageBrowserCustody];
   try {
     // Browser kind: each call is dispatched to the signer (the Node mock serves none of them;
     // the signer origin does; locked, it asks to unlock first), and nothing is fetched here.
@@ -52,8 +52,10 @@ test('the wallet Recovery card distinguishes LokiSigner from a paired headless m
 
   const status = { recovery_identity: true, recovery_backup: true };
   const headless = render(status);
-  assert.match(headless, /Restore access/);
-  assert.doesNotMatch(headless, /Download encrypted backup|Use LokiSigner/);
+  assert.match(headless, /loki_member_app recovery-setup/);
+  assert.match(headless, /loki_member_app recovery-restore/);
+  assert.match(headless, /Download encrypted backup/);
+  assert.doesNotMatch(headless, /Use LokiSigner|Restore access|<textarea|<input/);
   const lokiSigner = render({ ...status, recovery_in_app: true });
   assert.match(lokiSigner, /Download encrypted backup/);
   assert.match(lokiSigner, /Use LokiSigner/);

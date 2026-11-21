@@ -34,6 +34,9 @@ extern "C" {
     fn se_open_ephemeral(out_handle: *mut u64) -> isize;
     fn se_open_persistent(tag: *const u8, tag_len: isize, create_if_missing: i32, state_path: *const c_char, out_handle: *mut u64) -> isize;
     fn se_open_payment(tag: *const u8, tag_len: isize, state_path: *const c_char, reason: *const c_char, out_handle: *mut u64) -> isize;
+    fn se_create_staged(tag: *const u8, tag_len: isize, state_path: *const c_char, out_handle: *mut u64) -> isize;
+    fn se_confirm_staged_biometry(handle: u64, state_path: *const c_char) -> isize;
+    fn se_discard_staged(tag: *const u8, tag_len: isize) -> isize;
     fn se_wrap(handle: u64, dek: *const u8, dek_len: isize, out: *mut u8, out_cap: isize) -> isize;
     fn se_unwrap(handle: u64, ct: *const u8, ct_len: isize, out: *mut u8, out_cap: isize) -> isize;
     fn se_sign(handle: u64, msg: *const u8, msg_len: isize, out: *mut u8, out_cap: isize) -> isize;
@@ -54,6 +57,7 @@ pub enum KeyFailure {
     BiometryNotEnrolled,
     BiometryDisconnected,
     BiometryNotPaired,
+    RestoreEnrollmentChanged,
     Other,
 }
 
@@ -72,6 +76,7 @@ const FAILURES: &[(isize, KeyFailure, &str)] = &[
     (-16, KeyFailure::BiometryNotEnrolled, "No fingerprint is enrolled for Touch ID. Add one in System Settings, then try again."),
     (-18, KeyFailure::BiometryDisconnected, "Your Touch ID accessory is disconnected. Reconnect it and try again."),
     (-19, KeyFailure::BiometryNotPaired, "No Touch ID accessory is paired. Pair it with this Mac and try again."),
+    (-21, KeyFailure::RestoreEnrollmentChanged, "Touch ID enrollment changed during restore. Try restoring again."),
     (-4, KeyFailure::Other, "LokiSigner could not access its Secure Enclave key."),
 ];
 
@@ -129,8 +134,31 @@ impl AppleSecureElement {
         Self::persistent(tag, state, true, None)
     }
 
-    /// Authorize this existing vault key for one payment. Dropping the handle invalidates
-    /// the context; it is never eligible for device login or returned to an app-wide cache.
+    /// Create under a restore-only tag that the caller has already journaled for rollback.
+    pub fn create_staged(tag: &[u8], state: &Path) -> Result<Self, KeyFailure> {
+        let state = CString::new(state.as_os_str().as_bytes()).map_err(|_| KeyFailure::Other)?;
+        let mut handle = 0;
+        let rc = unsafe { se_create_staged(tag.as_ptr(), tag.len() as isize, state.as_ptr(), &mut handle) };
+        if rc == 0 { Ok(Self { handle }) } else { Err(KeyFailure::from_code(rc)) }
+    }
+
+    /// Compare with the enrollment sampled at staging. After a successful private
+    /// operation, pass its state path to record the verified enrollment before publication.
+    pub fn confirm_staged_biometry(&self, state: Option<&Path>) -> Result<(), KeyFailure> {
+        let state = state.map(|path| CString::new(path.as_os_str().as_bytes())).transpose().map_err(|_| KeyFailure::Other)?;
+        let ptr = state.as_ref().map_or(std::ptr::null(), |path| path.as_ptr());
+        let rc = unsafe { se_confirm_staged_biometry(self.handle, ptr) };
+        if rc == 0 { Ok(()) } else { Err(KeyFailure::from_code(rc)) }
+    }
+
+    pub fn discard_staged(tag: &[u8]) -> Result<(), KeyFailure> {
+        let rc = unsafe { se_discard_staged(tag.as_ptr(), tag.len() as isize) };
+        if rc == 0 { Ok(()) } else { Err(KeyFailure::from_code(rc)) }
+    }
+
+    /// Authorize this existing vault key for one payment or one viewing-key open.
+    /// Dropping the handle invalidates the context; it is never eligible for device login
+    /// or returned to an app-wide cache.
     pub fn open_payment(tag: &[u8], state: Option<&Path>, reason: &str) -> Result<Self, KeyFailure> {
         let reason = CString::new(reason).map_err(|_| KeyFailure::Other)?;
         Self::persistent(tag, state, false, Some(&reason))
@@ -234,6 +262,7 @@ mod tests {
     fn enclave_failures_have_fixed_member_messages() {
         assert_eq!(KeyFailure::from_code(-6), KeyFailure::Missing);
         assert_eq!(KeyFailure::from_code(-17), KeyFailure::Invalidated);
+        assert!(!KeyFailure::from_code(-11).is_gone(), "cancellation must not allow set-aside");
         for (code, expected) in [
             (-6, KEY_GONE),
             (-17, KEY_GONE),

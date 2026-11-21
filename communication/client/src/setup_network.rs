@@ -1,3 +1,4 @@
+use crate::retry::now_ms;
 use crate::setup_store::{add_object, key_bytes};
 use crate::{
     AuthenticatedSetupRecord, ClientError, ClientResult, OwnerInbox, RelayHttp, Secret32,
@@ -12,6 +13,8 @@ use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use std::collections::{BTreeMap, BTreeSet};
 use zeroize::Zeroizing;
 const ACK_DOMAIN: &[u8] = b"Loki_Setup_Received_v1\0";
+const PENDING_ROOT_LIMIT: u64 = 64;
+const PENDING_ROOT_TTL_MS: u64 = 10 * 60 * 1000;
 pub struct SetupRoutes {
     pub own: Vec<OwnerInbox>,
     pub peers: Vec<SetupInboxDescriptor>,
@@ -329,43 +332,8 @@ impl SetupTransport<'_> {
         for objects in retry {
             held.extend(objects);
         }
-        // Chunked records name further objects; fetch those per relay the same way.
-        let deadline = phase_deadline();
-        let required = join_all(
-            plans
-                .iter()
-                .zip(&first)
-                .map(|(plan, listed)| {
-                    let mut wanted = BTreeSet::new();
-                    if let Ok(listed) = listed {
-                        for entry in listed.page.entries() {
-                            if let Some(object) = held.get(entry.hash()) {
-                                if let Ok(requirements) = self.inspect(object) {
-                                    wanted.extend(
-                                        requirements
-                                            .into_iter()
-                                            .map(|(hash, _)| hash)
-                                            .filter(|hash| !held.contains_key(hash)),
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    let wanted: Vec<_> = wanted.into_iter().collect();
-                    async move {
-                        tokio::time::timeout_at(deadline, fetch_objects(net, plan.own, wanted))
-                            .await
-                            .unwrap_or_default()
-                    }
-                })
-                .collect(),
-        )
-        .await;
-        for objects in required {
-            for (hash, object) in objects {
-                held.entry(hash).or_insert(object);
-            }
-        }
+        // Only receipt-verified listings schedule downloads. Setup senders publish each
+        // chunk as its own entry; an unsigned manifest never expands the network work.
         // Apply, in relay order: receipts, then the page exactly as a sequential drive would.
         for (plan, listed) in plans.iter().zip(first) {
             let listed = match listed {
@@ -402,6 +370,7 @@ impl SetupTransport<'_> {
             let mut cached = BTreeMap::new();
             let mut acknowledgements = Vec::new();
             let mut rejected = Vec::new();
+            let mut pending = Vec::new();
             let mut incomplete = false;
             for entry in page.entries() {
                 let object = match held.get(entry.hash()) {
@@ -424,39 +393,10 @@ impl SetupTransport<'_> {
                         continue;
                     }
                 }
-                let requirements = match self.inspect(&object) {
-                    Ok(r) => r,
-                    Err(ClientError::MissingObjects(m)) if m.is_empty() => continue,
-                    Err(_) => {
-                        rejected.push(object.hash);
-                        continue;
-                    }
-                };
-                for (hash, _) in requirements {
-                    if cached.contains_key(&hash) {
-                        continue;
-                    }
-                    match held.get(&hash) {
-                        Some(o) => {
-                            cached.insert(hash, o.clone());
-                        }
-                        None => {
-                            *retries += 1;
-                            incomplete = true;
-                            break;
-                        }
-                    }
-                }
-                if incomplete {
-                    break;
-                }
-                match store.commit_incoming(self, &object, &cached) {
-                    Ok(_) | Err(ClientError::SetupAgreementPending) => {}
-                    Err(ClientError::Conflict) => return Err(ClientError::Conflict),
-                    Err(error @ (ClientError::Storage | ClientError::Capacity)) => {
-                        return Err(error)
-                    }
-                    Err(_) => rejected.push(object.hash),
+                match self.consume_root(store, &object, &held)? {
+                    RootDisposition::Settled => {}
+                    RootDisposition::Pending => pending.push(object.hash),
+                    RootDisposition::Rejected => rejected.push(object.hash),
                 }
             }
             if incomplete {
@@ -469,6 +409,7 @@ impl SetupTransport<'_> {
                     &cached,
                     &acknowledgements,
                     &rejected,
+                    &pending,
                 )?;
                 store.connection.execute(
                     "DELETE FROM retries WHERE pin=?1",
@@ -476,7 +417,50 @@ impl SetupTransport<'_> {
                 )?;
             }
         }
+        // A later listing (including another relay's) can complete a saved root.
+        for object in store.pending_roots()? {
+            let disposition = self.consume_root(store, &object, &BTreeMap::new())?;
+            if !matches!(disposition, RootDisposition::Pending) {
+                let tx = store.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                if matches!(disposition, RootDisposition::Rejected) {
+                    tx.execute("INSERT OR IGNORE INTO rejected VALUES(?1)", [object.hash])?;
+                }
+                tx.execute("DELETE FROM pending_roots WHERE hash=?1", [object.hash])?;
+                tx.commit()?;
+            }
+        }
         Ok(())
+    }
+
+    fn consume_root(
+        &self,
+        store: &mut SetupStore,
+        root: &Object,
+        held: &BTreeMap<Id32, Object>,
+    ) -> ClientResult<RootDisposition> {
+        let requirements = match self.inspect(root) {
+            Ok(requirements) => requirements,
+            Err(ClientError::MissingObjects(hashes)) if hashes.is_empty() => {
+                return Ok(RootDisposition::Settled); // Standalone chunk entry.
+            }
+            Err(_) => return Ok(RootDisposition::Rejected),
+        };
+        let mut chunks = BTreeMap::new();
+        for (hash, _) in requirements {
+            let object = if let Some(object) = held.get(&hash) {
+                object.clone()
+            } else if let Some(object) = store.object(&hash)? {
+                object
+            } else {
+                return Ok(RootDisposition::Pending);
+            };
+            chunks.insert(hash, object);
+        }
+        match store.commit_incoming(self, root, &chunks) {
+            Ok(_) | Err(ClientError::SetupAgreementPending) => Ok(RootDisposition::Settled),
+            Err(error @ (ClientError::Storage | ClientError::Capacity | ClientError::Conflict)) => Err(error),
+            Err(_) => Ok(RootDisposition::Rejected),
+        }
     }
     async fn upload_and_list(
         &self,
@@ -602,6 +586,11 @@ struct Listed {
 struct RelayFailure {
     receipts: Vec<(usize, crate::VerifiedReceipt)>,
 }
+enum RootDisposition {
+    Settled,
+    Pending,
+    Rejected,
+}
 async fn fetch_objects(net: &SetupNet, own: &OwnerInbox, wanted: Vec<Id32>) -> Vec<(Id32, Object)> {
     let mut out = Vec::new();
     for hashes in wanted.chunks(IN_FLIGHT) {
@@ -645,13 +634,6 @@ pub async fn join_all<F: std::future::Future>(futures: Vec<F>) -> Vec<F::Output>
     })
     .await;
     output.into_iter().flatten().collect()
-}
-fn now_ms() -> ClientResult<u64> {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| ClientError::Storage)?
-        .as_millis();
-    u64::try_from(ms).map_err(|_| ClientError::Capacity)
 }
 impl SetupStore {
     /// Whether a drive now would upload anything: a saved record or acknowledgement
@@ -813,6 +795,7 @@ impl SetupStore {
         objects: &BTreeMap<Id32, Object>,
         acks: &[VerifiedAck],
         rejected: &[Id32],
+        pending: &[Id32],
     ) -> ClientResult<()> {
         self.active()?;
         if self.cursor(route)? != after || next < after || next > i64::MAX as u64 {
@@ -845,9 +828,27 @@ impl SetupStore {
                 [hash.as_slice()],
             )?;
         }
+        let now = now_ms()?;
+        tx.execute("DELETE FROM pending_roots WHERE expires_ms<=?1", [now])?;
+        for hash in pending {
+            tx.execute(
+                "INSERT OR IGNORE INTO pending_roots SELECT ?1,?2 WHERE (SELECT count(*) FROM pending_roots)<?3",
+                params![hash, now + PENDING_ROOT_TTL_MS, PENDING_ROOT_LIMIT],
+            )?;
+        }
         tx.execute("INSERT INTO cursors VALUES(?1,?2,?3) ON CONFLICT(pin) DO UPDATE SET sequence=excluded.sequence",params![route.pin.key.as_slice(),route.mailbox.as_slice(),next])?;
         tx.commit()?;
         Ok(())
+    }
+    fn pending_roots(&self) -> ClientResult<Vec<Object>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT o.hash,o.wire FROM pending_roots p JOIN objects o ON o.hash=p.hash WHERE p.expires_ms>?1 ORDER BY p.rowid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![now_ms()?, PENDING_ROOT_LIMIT], |r| {
+            let hash: Vec<u8> = r.get(0)?;
+            Ok(Object { hash: hash.try_into().map_err(|_| rusqlite::Error::InvalidQuery)?, wire: r.get(1)? })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
     }
     pub fn progress(
         &self,

@@ -13,6 +13,7 @@
 
 use std::path::Path;
 
+use icu_properties::{props::{BidiClass, QuotationMark}, CodePointMapData, CodePointSetData};
 use orchard::keys::FullViewingKey;
 use reddsa_frost::frost::redpallas as frost;
 use serde_json::Value;
@@ -28,7 +29,6 @@ use crate::{
         store::{FileKind, SignerStore},
         Network,
     },
-    state::MemberDir,
     vault, zip2005,
 };
 
@@ -102,13 +102,24 @@ pub(super) fn open_signer_with_reason(
     let threshold = public.min_signers().ok_or("share has no threshold")?;
     let members = u16::try_from(public.verifying_shares().len()).map_err(|_| "member count")?;
     let fvk = group_viewing_key(&public, &vs)?;
-    let nonces = NonceStore::open_at_epoch(&sdir.join("nonces"), epoch).map_err(|e| e.to_string())?;
+    let nonces = NonceStore::open_at_epoch(&sdir.join("nonces"), epoch, store.vault(), slot)
+        .map_err(|e| e.to_string())?;
     LocalSigner::from_restored(
         slot, threshold, members, store.vault(), vault.to_owned(), store.network(), se,
         &key, public_bytes, fvk, epoch, nonces, approval, None,
     )
     .map_err(|e| e.to_string())
 }
+
+#[derive(Clone, Copy)]
+pub(super) enum VaultOpen {
+    Read,
+    Retry,
+    Payment,
+}
+
+const NEEDS_TOUCH_ID: &str = "Touch ID is required to open this vault.";
+const CANCELLED_TOUCH_ID: &str = "Touch ID was cancelled.";
 
 /// The vault's group viewing key, from the opened signer (one store open per process, then
 /// cached in memory), checked against the public metadata in `vault.sealed` (`sealed`).
@@ -120,18 +131,33 @@ pub(super) fn viewing_key(
     vault: &str,
     slot: u16,
     sealed: &Value,
+    mode: VaultOpen,
     open: impl FnOnce() -> Result<SignerViewingKey, String>,
 ) -> Result<FullViewingKey, String> {
     let mut cache = st.viewing_keys.lock().map_err(|e| e.to_string())?;
-    if let Some(fvk) = cache.get(vault) {
+    if let Some(Some(fvk)) = cache.get(vault) {
         return Ok(fvk.clone());
     }
-    if is_legacy(sealed) {
-        migrate(st, data, pass, vault, slot, sealed)?;
+    if matches!(mode, VaultOpen::Read) && cache.contains_key(vault) {
+        return Err(NEEDS_TOUCH_ID.into());
     }
-    let key = open()?;
+    let key = (|| {
+        if is_legacy(sealed) {
+            migrate(st, data, pass, vault, slot, sealed)?;
+        }
+        open()
+    })().map_err(|error| {
+        // Keep the cancellation under the same lock as the open so queued reads can't reprompt.
+        if !matches!(mode, VaultOpen::Payment) && st.config.native && st.config.secure_element == "apple"
+            && error.rsplit(": ").next() == Some(CANCELLED_TOUCH_ID)
+        {
+            cache.insert(vault.to_owned(), None);
+            return NEEDS_TOUCH_ID.into();
+        }
+        error
+    })?;
     key.checked_address(sealed, VaultNetwork::parse(sealed["network"].as_str().unwrap_or(""))?)?;
-    cache.insert(vault.to_owned(), key.fvk.clone());
+    cache.insert(vault.to_owned(), Some(key.fvk.clone()));
     Ok(key.fvk)
 }
 
@@ -143,10 +169,25 @@ fn opened_viewing_key(
     slot: u16,
     sealed: &Value,
 ) -> Result<FullViewingKey, String> {
-    let (key, _) = SignerViewingKey::open(st, data, pass, vault, slot)?;
+    let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
+    let (key, _) = SignerViewingKey::from_signer(&signer)?;
     let network = VaultNetwork::parse(sealed["network"].as_str().unwrap_or(""))?;
     key.checked_address(sealed, network)?;
     Ok(key.fvk)
+}
+
+pub(super) fn vault_touch_id_reason(st: &AppState, action: &str, vault: &str, name: Option<&str>) -> Option<String> {
+    if !st.config.native || st.config.secure_element != "apple" { return None; }
+    let label = super::vault_label(name.unwrap_or_default());
+    let quotes = CodePointSetData::new::<QuotationMark>();
+    let bidi = CodePointMapData::<BidiClass>::new();
+    Some(if label == super::HIDDEN_VAULT_NAME || label.trim().is_empty() || label.chars().any(|c| {
+        quotes.contains(c) || matches!(bidi.get(c), BidiClass::RightToLeft | BidiClass::ArabicLetter | BidiClass::ArabicNumber)
+    }) {
+        format!("{action} vault {}", &vault[..8])
+    } else {
+        format!("{action} vault “{label}”")
+    })
 }
 
 /// Store-derived values, kept together so the native window can recheck a fresh seal on cache hits.
@@ -158,10 +199,10 @@ pub(super) struct SignerViewingKey {
 
 impl SignerViewingKey {
     pub(super) fn open(
-        st: &AppState, data: &Path, pass: &str, vault: &str, slot: u16,
+        st: &AppState, data: &Path, pass: &str, vault: &str, slot: u16, reason: Option<&str>,
     ) -> Result<(Self, VaultNetwork), String> {
-        // Never signs: no payment is approved through this signer.
-        let signer = open_signer(st, data, pass, vault, slot, Box::new(|_| false))?;
+        // Never signs or enters a cache: only the viewing key outlives this open.
+        let signer = open_signer_with_reason(st, data, pass, vault, slot, Box::new(|_| false), reason)?;
         Self::from_signer(&signer)
     }
 
@@ -202,7 +243,7 @@ pub(super) fn is_legacy(sealed: &Value) -> bool {
 ///    address, so signing works without `vault.sealed`'s copy;
 /// 3. only then rewrites `vault.sealed` (atomically) without `key_package` and `vault_secret`,
 ///    deletes the software KEK the store no longer uses (apple), and deletes the passphrase-only
-///    `backup.sealed` once the recovery backup sealed to the 24 words exists.
+///    `backup.sealed` only after publishing a verified replacement to confirmed words.
 ///
 /// Recovery is untouched: `recovery.backup` and the words open exactly as before. Limits: the
 /// old files are unlinked, not securely erased, so a copy taken before migration (or a disk
@@ -268,7 +309,7 @@ pub(super) fn migrate(
     object.remove("vault_secret");
     let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&stripped).map_err(|e| e.to_string())?);
     // `write_sealed` never replaces a file: seal to a temporary name, then rename over.
-    let vdir = MemberDir::open(&data.join("vaults"), vault);
+    let vdir = super::ceremony::dir(data, vault)?;
     let temp = format!(".vault.sealed.{}.migrate", uuid::Uuid::new_v4());
     vdir.write_sealed(&temp, &bytes, pass).map_err(|e| e.to_string())?;
     std::fs::rename(vdir.path().join(&temp), vdir.path().join("vault.sealed"))
@@ -280,8 +321,10 @@ pub(super) fn migrate(
     if old.is_some() {
         std::fs::remove_file(&software_kek).map_err(|e| format!("remove software KEK: {e}"))?;
     }
-    if super::recovery::backup_file(&sdir).exists() {
-        super::recovery::drop_passphrase_backup(&sdir)?;
+    // The migrated vault is usable even if an old backup is corrupt. Keep that backup
+    // and report the conversion error, rather than treating presence as verification.
+    if let Err(e) = super::recovery::seal_vault_backup(data, &sdir, &id, pass) {
+        eprintln!("recovery backup not converted for vault {vault}: {e}");
     }
     Ok(())
 }
@@ -311,6 +354,55 @@ fn reseal(store: &SignerStore, from: &impl SecureElement, to: &impl SecureElemen
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_apple() -> AppState {
+        let config = super::super::native_config_from_args(&["--data".into(), "unused".into(), "--port".into(), "0".into()]).unwrap();
+        AppState::new(config)
+    }
+
+    #[test]
+    fn cancelled_vault_open_requires_explicit_retry_and_then_caches() {
+        #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
+        assert_eq!(CANCELLED_TOUCH_ID, crate::signer::secure_element_apple::KeyFailure::Cancelled.message());
+
+        let st = native_apple();
+        let vault = "3d".repeat(32);
+        let other_vault = "f2".repeat(32);
+        let (_, public) = frost::keys::generate_with_dealer(
+            3, 2, frost::keys::IdentifierList::Default, rand_core::OsRng,
+        ).unwrap();
+        let fvk = group_viewing_key(&public, &[23; 32]).unwrap();
+        let address = vault::unified_address(&fvk, VaultNetwork::Regtest.network_type());
+        let key = SignerViewingKey { fvk, public_package: hex::encode(public.serialize().unwrap()) };
+        let sealed = serde_json::json!({
+            "network": "regtest", "public_package": key.public_package, "group_address": address,
+        });
+        let needs_touch_id = Some("Touch ID is required to open this vault.");
+        assert_eq!(viewing_key(&st, &st.config.data, "unused", &vault, 1, &sealed, VaultOpen::Read,
+            || Err(CANCELLED_TOUCH_ID.into())).err().as_deref(), needs_touch_id);
+        assert_eq!(viewing_key(&st, &st.config.data, "unused", &vault, 1, &sealed, VaultOpen::Read,
+            || panic!("a queued read must not open again")).err().as_deref(), needs_touch_id);
+        assert_eq!(viewing_key(&st, &st.config.data, "unused", &other_vault, 1, &sealed, VaultOpen::Read,
+            || Err("another vault was not suppressed".into())).err().as_deref(), Some("another vault was not suppressed"));
+        let fvk = viewing_key(&st, &st.config.data, "unused", &vault, 1, &sealed, VaultOpen::Retry,
+            || Ok(key.clone())).unwrap();
+        let cached = viewing_key(&st, &st.config.data, "unused", &vault, 1, &sealed, VaultOpen::Read,
+            || panic!("a warm read must not open again")).unwrap();
+        assert_eq!(cached.to_bytes(), fvk.to_bytes());
+    }
+
+    #[test]
+    fn touch_id_reason_only_quotes_safely_delimited_names() {
+        let st = native_apple();
+        let vault = format!("{}{}", "a09df1c4", "0".repeat(56));
+        for name in [None, Some("Reserve” is verified"), Some("'Reserve'"), Some("«Reserve»"),
+            Some("Reserve שלום"), Some("Reserve سجل"), Some("Reserve ١٢"), Some("Hidden\nname")]
+        {
+            assert_eq!(vault_touch_id_reason(&st, "open", &vault, name).as_deref(), Some("open vault a09df1c4"));
+        }
+        assert_eq!(vault_touch_id_reason(&st, "open", &vault, Some("Élodie Reserve")).as_deref(),
+            Some("open vault “Élodie Reserve”"));
+    }
 
     #[test]
     fn reseal_moves_every_store_file_to_the_new_element_and_resumes() {

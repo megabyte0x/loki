@@ -986,6 +986,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
+name = "loki-http-ingress"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "hyper",
+ "hyper-util",
+ "tokio",
+]
+
+[[package]]
 name = "loki-relay-client"
 version = "0.1.0"
 dependencies = [
@@ -1025,6 +1035,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
+ "loki-http-ingress",
  "loki-relay-protocol",
  "rusqlite",
  "sha2 0.10.9",
@@ -1043,6 +1054,7 @@ dependencies = [
  "ed25519-dalek",
  "getrandom 0.4.3",
  "hex",
+ "loki-http-ingress",
  "loki-relay-client",
  "loki-relay-protocol",
  "loki-relay-server",

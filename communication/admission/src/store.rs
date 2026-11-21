@@ -6,7 +6,7 @@ use loki_relay_client::OperatorSet;
 use loki_relay_protocol::{
     admission::{self, AdmissionCommand as Command, AdmissionRequest},
     canonical::{self, Value},
-    http,
+    http::{self, NamespaceAction},
     types::{Id32, MemberPublic},
 };
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
@@ -28,6 +28,7 @@ pub struct ProvisionIntent {
     quota: u64,
     expires: u64,
     retire: bool,
+    pub(crate) action: Option<NamespaceAction>,
 }
 impl ProvisionIntent {
     pub fn ceremony(&self) -> &Id32 {
@@ -63,23 +64,40 @@ const TERMINAL_NOTICES: &str = include_str!("terminal_notices.sql");
 /// Databases made before vaults grew past 4 members (user_version 0 and 1) bound member
 /// counts and slots at 4. Each pair is (narrow, wide) and appears in exactly one table.
 const WIDENED: [(&str, &str); 3] = [
-    ("CHECK(member_count IN(3,4))", "CHECK(member_count BETWEEN 3 AND 16)"),
-    ("CHECK(slot BETWEEN 2 AND 4)", "CHECK(slot BETWEEN 2 AND 16)"),
-    ("CHECK(slot BETWEEN 1 AND 4)", "CHECK(slot BETWEEN 1 AND 16)"),
+    (
+        "CHECK(member_count IN(3,4))",
+        "CHECK(member_count BETWEEN 3 AND 16)",
+    ),
+    (
+        "CHECK(slot BETWEEN 2 AND 4)",
+        "CHECK(slot BETWEEN 2 AND 16)",
+    ),
+    (
+        "CHECK(slot BETWEEN 1 AND 4)",
+        "CHECK(slot BETWEEN 1 AND 16)",
+    ),
 ];
-const SCHEMA_VERSION: u64 = 2;
+const SCHEMA_VERSION: u64 = 3;
+// State 0 is legacy: the relay may already hold permanent data for these mailboxes.
+const RESERVATIONS: &str = "
+ALTER TABLE mailboxes ADD COLUMN payment_state INTEGER NOT NULL DEFAULT 0 CHECK(payment_state BETWEEN 0 AND 2);
+ALTER TABLE operations ADD COLUMN slot INTEGER NOT NULL DEFAULT 0 CHECK(slot BETWEEN 0 AND 16);
+CREATE INDEX operations_ceremony_slot ON operations(ceremony,slot);
+CREATE INDEX mailboxes_payment_relay ON mailboxes(relay,payment_state) WHERE purpose=2 AND retired=0;
+";
 
 fn narrow_schema() -> String {
     WIDENED
         .iter()
-        .fold(SCHEMA.to_owned(), |schema, (narrow, wide)| schema.replace(wide, narrow))
+        .fold(SCHEMA.to_owned(), |schema, (narrow, wide)| {
+            schema.replace(wide, narrow)
+        })
 }
 
 /// Widen the version-1 CHECK constraints in place. Every saved row already satisfies the
 /// wider bound, so only the schema text changes (SQLite's documented `writable_schema`
 /// procedure for constraint changes); integrity is checked before committing.
-fn widen_checks(connection: &mut Connection) -> Result<()> {
-    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+fn widen_checks(tx: &Transaction<'_>) -> Result<()> {
     let version: i64 = tx.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
     tx.execute_batch("PRAGMA writable_schema=ON;")?;
     for (narrow, wide) in WIDENED {
@@ -92,14 +110,13 @@ fn widen_checks(connection: &mut Connection) -> Result<()> {
         }
     }
     tx.execute_batch(&format!(
-        "PRAGMA schema_version={}; PRAGMA writable_schema=OFF; PRAGMA user_version={SCHEMA_VERSION};",
+        "PRAGMA schema_version={}; PRAGMA writable_schema=RESET;",
         version + 1
     ))?;
     let integrity: String = tx.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(Error::Storage);
     }
-    tx.commit()?;
     Ok(())
 }
 pub struct AdmissionStore {
@@ -140,7 +157,7 @@ fn error_from_code(code: &str) -> Result<Error> {
 }
 fn schema_catalog(connection: &Connection) -> Result<Vec<(String, String)>> {
     let mut q = connection.prepare(
-        "SELECT name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name",
+        "SELECT name,sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY name",
     )?;
     let rows = q.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
     rows.collect::<std::result::Result<_, _>>()
@@ -236,15 +253,29 @@ impl AdmissionStore {
                 use std::os::unix::fs::OpenOptionsExt;
                 options.mode(0o600);
             }
-            options.open(&path)?.sync_all()?;
+            match options.open(&path) {
+                Ok(file) => file.sync_all()?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+                Err(error) => return Err(error.into()),
+            }
         }
         let mut connection = Connection::open(&path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA trusted_schema=OFF;")?;
-        if fresh {
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let version: u64 = tx.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        let initialize = version == 0
+            && tx.query_row(
+                "SELECT NOT EXISTS (SELECT 1 FROM sqlite_schema)
+                 AND (SELECT application_id FROM pragma_application_id)=0
+                 AND (SELECT schema_version FROM pragma_schema_version)=0",
+                [],
+                |row| row.get::<_, bool>(0),
+            )?;
+        if initialize {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(TERMINAL_NOTICES)?;
+            tx.execute_batch(RESERVATIONS)?;
             tx.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};"))?;
             tx.execute(
                 "INSERT INTO metadata VALUES(1,?1,?2)",
@@ -253,51 +284,58 @@ impl AdmissionStore {
                     operators.admission_key().as_slice()
                 ],
             )?;
-            tx.commit()?;
-            fs::File::open(root)?.sync_all()?;
-        }
-        let catalog = Connection::open_in_memory()?;
-        catalog.execute_batch(&narrow_schema())?;
-        let legacy_catalog = schema_catalog(&catalog)?;
-        catalog.execute_batch(TERMINAL_NOTICES)?;
-        let narrow_catalog = schema_catalog(&catalog)?;
-        let current = Connection::open_in_memory()?;
-        current.execute_batch(SCHEMA)?;
-        current.execute_batch(TERMINAL_NOTICES)?;
-        let current_catalog = schema_catalog(&current)?;
-        let found = schema_catalog(&connection)?;
-        let version: u64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        let found_version = if found == legacy_catalog {
-            0
-        } else if found == narrow_catalog {
-            1
-        } else if found == current_catalog {
-            SCHEMA_VERSION
         } else {
-            return Err(Error::Storage);
-        };
-        if version != found_version {
-            return Err(Error::Storage);
-        }
-        let metadata: (Vec<u8>, Vec<u8>) = connection.query_row(
-            "SELECT config,signer FROM metadata WHERE singleton=1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        if metadata.0 != operators.digest() || metadata.1 != operators.admission_key() {
-            return Err(Error::Storage);
-        }
-        if version == 0 {
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute_batch(TERMINAL_NOTICES)?;
-            tx.execute_batch("PRAGMA user_version=1;")?;
-            tx.commit()?;
-        }
-        if version < SCHEMA_VERSION {
-            widen_checks(&mut connection)?;
-            if schema_catalog(&connection)? != current_catalog {
+            let catalog = Connection::open_in_memory()?;
+            catalog.execute_batch(&narrow_schema())?;
+            let legacy_catalog = schema_catalog(&catalog)?;
+            catalog.execute_batch(TERMINAL_NOTICES)?;
+            let narrow_catalog = schema_catalog(&catalog)?;
+            let current = Connection::open_in_memory()?;
+            current.execute_batch(SCHEMA)?;
+            current.execute_batch(TERMINAL_NOTICES)?;
+            let wide_catalog = schema_catalog(&current)?;
+            current.execute_batch(RESERVATIONS)?;
+            let current_catalog = schema_catalog(&current)?;
+            let found = schema_catalog(&tx)?;
+            let found_version = if found == legacy_catalog {
+                0
+            } else if found == narrow_catalog {
+                1
+            } else if found == wide_catalog {
+                2
+            } else if found == current_catalog {
+                SCHEMA_VERSION
+            } else {
+                return Err(Error::Storage);
+            };
+            if version != found_version {
                 return Err(Error::Storage);
             }
+            let metadata: (Vec<u8>, Vec<u8>) = tx.query_row(
+                "SELECT config,signer FROM metadata WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            if metadata.0 != operators.digest() || metadata.1 != operators.admission_key() {
+                return Err(Error::Storage);
+            }
+            if version == 0 {
+                tx.execute_batch(TERMINAL_NOTICES)?;
+            }
+            if version < 2 {
+                widen_checks(&tx)?;
+            }
+            if version < SCHEMA_VERSION {
+                tx.execute_batch(RESERVATIONS)?;
+                tx.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};"))?;
+                if schema_catalog(&tx)? != current_catalog {
+                    return Err(Error::Storage);
+                }
+            }
+        }
+        tx.commit()?;
+        if initialize {
+            fs::File::open(root)?.sync_all()?;
         }
         Ok(Self {
             connection,
@@ -321,7 +359,7 @@ impl AdmissionStore {
         credential: Option<&[u8]>,
         now: u64,
     ) -> Result<Vec<u8>> {
-        let reply = self.execute(package, credential, now)?;
+        let reply = self.execute(package, credential, || Ok(now))?;
         match reply.error {
             Some(error) => Err(error),
             None => Ok(reply.bytes),
@@ -331,9 +369,9 @@ impl AdmissionStore {
         &mut self,
         package: &[u8],
         credential: Option<&[u8]>,
-        now: u64,
+        clock: impl FnOnce() -> Result<u64>,
     ) -> Result<Reply> {
-        if now > i64::MAX as u64 || credential.map(|c| c.len() > 4096).unwrap_or(false) {
+        if credential.is_some_and(|c| c.len() > 4096) {
             return Err(Error::Malformed);
         }
         let request = parse_package(package)?;
@@ -363,6 +401,11 @@ impl AdmissionStore {
                 error: error.as_deref().map(error_from_code).transpose()?,
             });
         }
+        let now = clock()?;
+        if now > i64::MAX as u64 {
+            return Err(Error::Malformed);
+        }
+        let changes = tx.total_changes();
         let result = apply_command(
             &tx,
             &request,
@@ -375,33 +418,46 @@ impl AdmissionStore {
             self.ceremony_seconds,
             self.storage_bytes,
         );
-        if matches!(result, Err(Error::Storage | Error::Unavailable)) {
+        if matches!(
+            result,
+            Err(Error::Storage | Error::StorageBusy | Error::Unavailable)
+        ) {
             return Err(result.err().ok_or(Error::Storage)?);
         }
-        let should_save:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM claims WHERE ceremony=?1 AND slot=?2 AND signing=?3 AND encryption=?4)",params![request.command.ceremony().as_slice(),request.device.id,request.device.signing.as_slice(),request.device.encryption.as_slice()],|r|r.get(0))?;
-        let reply = response(&self.signer, &request, digest, result)?;
-        if should_save
+        // Only committed transitions need exact replay. Notices are already stored by slot.
+        let should_save = tx.total_changes() != changes
+            && (result.is_ok()
+                || matches!(
+                    (&request.command, &result),
+                    (Command::Checkpoint { .. }, Err(Error::Conflict))
+                ))
             && !matches!(
                 request.command,
-                Command::State { .. } | Command::TerminalNotice { kind: 0, .. }
-            )
-        {
-            let count: u64 = tx.query_row(
-                "SELECT count(*) FROM operations WHERE ceremony=?1",
-                [request.command.ceremony().as_slice()],
-                |r| r.get(0),
-            )?;
-            if count >= 4096 {
-                return response(&self.signer, &request, digest, Err(Error::Quota));
+                Command::State { .. } | Command::TerminalNotice { .. }
+            );
+        let reply = response(&self.signer, &request, digest, result)?;
+        if should_save {
+            // Checkpoints are the only repeatable transition. Leave room for every
+            // bounded transition (claims, routes, terminal votes), regardless of this cap.
+            if matches!(request.command, Command::Checkpoint { .. }) && reply.error.is_none() {
+                let count: u64 = tx.query_row(
+                    "SELECT count(*) FROM operations WHERE ceremony=?1 AND slot=?2",
+                    params![request.command.ceremony().as_slice(), request.device.id],
+                    |r| r.get(0),
+                )?;
+                if count >= 256 {
+                    return response(&self.signer, &request, digest, Err(Error::Quota));
+                }
             }
             tx.execute(
-                "INSERT INTO operations VALUES(?1,?2,?3,?4,?5)",
+                "INSERT INTO operations(id,ceremony,digest,response,error,slot) VALUES(?1,?2,?3,?4,?5,?6)",
                 params![
                     request.operation.as_slice(),
                     request.command.ceremony().as_slice(),
                     digest.as_slice(),
                     &reply.bytes,
-                    reply.error.map(Error::code)
+                    reply.error.map(Error::code),
+                    request.device.id,
                 ],
             )?;
         }
@@ -409,23 +465,40 @@ impl AdmissionStore {
         Ok(reply)
     }
     pub fn pending(&self, now: u64, limit: usize) -> Result<Vec<ProvisionIntent>> {
-        self.pending_kind(now, limit, false)
+        self.pending_kind(now, limit, false, 1)
     }
     pub fn pending_retirement(&self, now: u64, limit: usize) -> Result<Vec<ProvisionIntent>> {
-        self.pending_kind(now, limit, true)
+        self.pending_kind(now, limit, true, 1)
     }
-    fn pending_kind(&self, now: u64, limit: usize, retire: bool) -> Result<Vec<ProvisionIntent>> {
+    pub(crate) fn pending_kind(
+        &self,
+        now: u64,
+        limit: usize,
+        retire: bool,
+        first_relay: usize,
+    ) -> Result<Vec<ProvisionIntent>> {
         if now > i64::MAX as u64 || !(1..=3).contains(&limit) {
             return Err(Error::Malformed);
         }
         let condition = if retire {
-            "m.purpose=1 AND m.retired=0 AND (c.terminal!=0 OR c.deadline<=?1)"
+            // A deadline observed outside the write transaction is not a decision.
+            "m.retired=0 AND ((m.purpose=1 AND c.terminal!=0)
+              OR (m.payment_state=1 AND c.terminal IN(1,3,4)))"
         } else {
-            "m.retired=0 AND m.provisioned=0 AND ((c.terminal=0 AND c.deadline>?1) OR (c.terminal=2 AND m.purpose=2))"
+            "m.retired=0 AND ((c.terminal=0 AND c.deadline>?1 AND m.provisioned=0)
+              OR (c.terminal=2 AND m.purpose=2 AND (m.provisioned=0 OR m.payment_state=1)))"
         };
-        let sql=format!("SELECT m.ceremony,m.slot,m.relay,m.purpose,m.mailbox,m.request,m.quota,c.deadline FROM mailboxes m JOIN ceremonies c ON c.id=m.ceremony WHERE m.next_retry<=?1 AND ({condition}) ORDER BY m.next_retry,m.relay,m.slot,m.purpose LIMIT ?2");
+        // Take the oldest due row on each relay before considering a second row there.
+        let sql = format!(
+            "SELECT m.ceremony,m.slot,m.relay,m.purpose,m.mailbox,m.request,m.quota,c.deadline,m.payment_state,c.terminal
+             FROM mailboxes m JOIN ceremonies c ON c.id=m.ceremony
+             WHERE m.next_retry<=?1 AND ({condition})
+             ORDER BY row_number() OVER(PARTITION BY m.relay
+                 ORDER BY m.next_retry,m.ceremony,m.slot,m.purpose), (m.relay+3-?3)%3
+             LIMIT ?2"
+        );
         let mut query = self.connection.prepare(&sql)?;
-        let rows = query.query_map(params![now, limit], |r| {
+        let rows = query.query_map(params![now, limit, first_relay], |r| {
             Ok((
                 r.get::<_, Vec<u8>>(0)?,
                 r.get::<_, u16>(1)?,
@@ -435,10 +508,31 @@ impl AdmissionStore {
                 r.get::<_, Vec<u8>>(5)?,
                 r.get::<_, u64>(6)?,
                 r.get::<_, u64>(7)?,
+                r.get::<_, u16>(8)?,
+                r.get::<_, u16>(9)?,
             ))
         })?;
         rows.map(|row| {
-            let (ceremony, slot, relay, purpose, mailbox, request, quota, expires) = row?;
+            let (
+                ceremony,
+                slot,
+                relay,
+                purpose,
+                mailbox,
+                request,
+                quota,
+                expires,
+                payment,
+                terminal,
+            ) = row?;
+            let action = match (purpose, payment, retire, terminal) {
+                (1, _, true, _) => Some(NamespaceAction::RetireSetup),
+                (1, _, false, _) => Some(NamespaceAction::ReserveSetup),
+                (2, 1, true, _) => Some(NamespaceAction::RetirePayment),
+                (2, 1, false, 2) => Some(NamespaceAction::PromotePayment),
+                (2, 1, false, _) => Some(NamespaceAction::ReservePayment),
+                _ => None,
+            };
             Ok(ProvisionIntent {
                 ceremony: ceremony.try_into().map_err(|_| Error::Storage)?,
                 slot,
@@ -449,6 +543,7 @@ impl AdmissionStore {
                 quota,
                 expires,
                 retire,
+                action,
             })
         })
         .collect()
@@ -478,7 +573,15 @@ impl AdmissionStore {
             attempts,
             u64::from_be_bytes(sample),
         );
-        tx.execute("UPDATE mailboxes SET provisioned=max(provisioned,?1),attempts=?2,next_retry=?3,retired=max(retired,?8) WHERE ceremony=?4 AND slot=?5 AND relay=?6 AND purpose=?7",params![u16::from(success && !intent.retire),attempts,now+delay,intent.ceremony.as_slice(),intent.slot,intent.relay,intent.purpose,u16::from(success && intent.retire)])?;
+        let retired = success && intent.retire;
+        let promoted = success && intent.action == Some(NamespaceAction::PromotePayment);
+        let changed = tx.execute("UPDATE mailboxes SET provisioned=max(provisioned,?1),attempts=?2,next_retry=?3,retired=?8,payment_state=CASE WHEN ?9 THEN 2 ELSE payment_state END WHERE ceremony=?4 AND slot=?5 AND relay=?6 AND purpose=?7 AND retired=0",params![success && !intent.retire,attempts,now+delay,intent.ceremony.as_slice(),intent.slot,intent.relay,intent.purpose,retired,promoted])?;
+        if retired && changed == 1 {
+            tx.execute(
+                "UPDATE grants SET mailboxes=mailboxes-1 WHERE id=(SELECT grant_id FROM ceremonies WHERE id=?1 AND terminal IN(1,3,4))",
+                [intent.ceremony.as_slice()],
+            )?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -716,18 +819,16 @@ fn apply_command(
                 return Err(Error::Quota);
             }
             let c = http::decode_creation(creation)?;
-            if *purpose == 1 {
-                let reserved:u64=tx.query_row("SELECT COALESCE(sum(quota),0) FROM mailboxes WHERE ceremony=?1 AND relay=?2 AND purpose=1",params![ceremony.as_slice(),relay],|r|r.get(0))?;
-                if reserved
-                    .checked_add(c.quota)
-                    .filter(|n| *n <= storage_bytes)
-                    .is_none()
-                {
-                    return Err(Error::Quota);
-                }
+            let reserved: u64 = if *purpose == 1 {
+                tx.query_row("SELECT COALESCE(sum(quota),0) FROM mailboxes WHERE ceremony=?1 AND relay=?2 AND purpose=1",params![ceremony.as_slice(),relay],|r|r.get(0))?
+            } else {
+                tx.query_row("SELECT COALESCE(sum(m.quota),0) FROM mailboxes m JOIN ceremonies c ON c.id=m.ceremony WHERE c.grant_id=?1 AND m.relay=?2 AND m.purpose=2 AND m.retired=0 AND (m.payment_state=1 OR m.ceremony=?3)",params![grant_id,relay,ceremony.as_slice()],|r|r.get(0))?
+            };
+            if reserved.saturating_add(c.quota) > storage_bytes {
+                return Err(Error::Quota);
             }
             tx.execute(
-                "INSERT INTO mailboxes VALUES(?1,?2,?3,?4,?5,?6,?7,0,0,0,0)",
+                "INSERT INTO mailboxes(ceremony,slot,relay,purpose,mailbox,request,quota,payment_state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![
                     ceremony.as_slice(),
                     slot,
@@ -735,7 +836,8 @@ fn apply_command(
                     purpose,
                     mailbox.as_slice(),
                     creation,
-                    c.quota
+                    c.quota,
+                    *purpose == 2,
                 ],
             )?;
             tx.execute(
@@ -844,6 +946,10 @@ fn apply_command(
             if count == member_count as u64 {
                 tx.execute(
                     "UPDATE ceremonies SET terminal=2 WHERE id=?1",
+                    [ceremony.as_slice()],
+                )?;
+                tx.execute(
+                    "UPDATE mailboxes SET next_retry=0 WHERE ceremony=?1 AND payment_state=1",
                     [ceremony.as_slice()],
                 )?;
             }

@@ -15,15 +15,19 @@ core/demo/.member-sandbox.lock
 # Any run state directory: member key packages, nonce secrets, note secrets.
 /tmp/loki-*
 loki-state/
+loki-member-[0-9]*/
 */state/alice/
 */state/bob/
 */state/carol/
 # Separate-member setup stores and operator passphrase files.
 **/secrets/
 *.passphrase
+*.pass
 # Member app state can live under any chosen data directory.
 passphrase
 profile.sealed
+identity.sealed
+share.sealed
 vault.card
 wallet.sqlite
 wallet.sqlite-wal

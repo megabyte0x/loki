@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import ts from 'typescript';
-import { api, connectLokiSigner, hasLokiSignerSession, lastLokiSignerSlot, LokiSignerStartupTimeout } from '../src/lib/api.ts';
+import { api, connectLokiSigner, hasLokiSignerSession, lastLokiSignerSlot } from '../src/lib/api.ts';
 
 // Compile just this JSX module so the existing Node test command can render the production component.
 const componentUrl = new URL('../src/components/NativeTabConnection.tsx', import.meta.url);
@@ -23,7 +23,6 @@ const old = 'http://127.0.0.1:40117';
 const current = 'http://[::1]:41227';
 const sessionKey = 'loki_device_session';
 const token = (letter) => letter.repeat(43);
-const stored = (tab) => JSON.parse(tab.get(sessionKey) ?? 'null');
 
 function tabFixture(t, fakeFetch) {
   let active;
@@ -60,10 +59,12 @@ test('the real native login component chooses Connect for LokiSigner and paste f
   assert.doesNotMatch(headless, /Connect LokiSigner/);
 });
 
-test('a new tab waits for registration, receives its own grant, and reconnects after the port changes', async (t) => {
-  let launch = 1, ready = false, requests = 0;
-  const posts = [], progress = [];
-  const tab1 = new Map(), tab2 = new Map();
+test('duplicating an approved tab copies the slot but needs its own Allow, and a stale grant can reconnect', async (t) => {
+  const first = await import('../src/lib/api.ts?tab=first');
+  const duplicate = await import('../src/lib/api.ts?tab=duplicate');
+  let launch = 1, ready = false, requests = 0, statusToken;
+  const posts = [], progress = [], nativeCalls = [];
+  const tab1 = new Map();
   const fixture = tabFixture(t, async (url, options = {}) => {
     if (url === '/api/members') {
       // The first launch's row is visible before the app has consumed its registration reply.
@@ -79,40 +80,48 @@ test('a new tab waits for registration, receives its own grant, and reconnects a
       return streamed('{"co', 'de":"061274"}\n', JSON.stringify({ token: token(String(++requests)) }) + '\n');
     }
     assert.match(url, /\/api\/status$/);
+    nativeCalls.push(options.headers['X-Loki-Token']);
     if (launch === 2 && url.startsWith(old)) return new Response(null, { status: 401 });
-    assert.equal(options.headers['X-Loki-Token'], token(String(requests)));
+    assert.equal(options.headers['X-Loki-Token'], statusToken);
     return Response.json({ phase: 'home' });
   });
-  const connect = () => connectLokiSigner(member.slot, (event) => progress.push(event), new AbortController().signal);
+  const connect = (wallet) => wallet.connectLokiSigner(member.slot, (event) => progress.push(event), new AbortController().signal);
 
   fixture.use(tab1);
-  const connecting = connect();
+  const connecting = connect(first);
   assert.deepEqual(progress, [{ phase: 'starting' }]);
-  assert.equal(stored(tab1), null);
+  assert.equal(first.hasLokiSignerSession(), false);
   await connecting;
   assert.deepEqual(posts, [`${old}/api/connect`, `${old}/api/connect`]);
   assert.deepEqual(progress, [{ phase: 'starting' }, { phase: 'compare', code: '061274' }]);
-  const first = stored(tab1);
-  assert.equal(first.capability, token('1'));
-  assert.equal((await api('status')).phase, 'home');
+  assert.equal(tab1.has(sessionKey), false);
+  statusToken = token('1');
+  assert.equal((await first.api('status')).phase, 'home');
 
+  const tab2 = new Map(tab1); // The browser duplicates sessionStorage, not the JS module.
   fixture.use(tab2);
-  assert.equal(hasLokiSignerSession(), false);
-  await connect();
-  assert.equal(stored(tab2).capability, token('2'));
-  assert.equal((await api('status')).phase, 'home');
-  assert.deepEqual(stored(tab1), first);
+  assert.equal(duplicate.lastLokiSignerSlot(), member.slot);
+  assert.equal(duplicate.hasLokiSignerSession(), false);
+  await assert.rejects(duplicate.api('status'), { status: 401 });
+  assert.deepEqual(nativeCalls, [token('1')]);
+  fixture.events.length = 0;
+  await connect(duplicate);
+  assert.equal(tab2.has(sessionKey), false);
+  statusToken = token('2');
+  assert.equal((await duplicate.api('status')).phase, 'home');
 
   fixture.use(tab1);
+  statusToken = token('1');
+  assert.equal((await first.api('status')).phase, 'home', 'the original retains its own grant');
   launch = 2;
-  await assert.rejects(api('status'), { status: 401 });
+  await assert.rejects(first.api('status'), { status: 401 });
   assert.deepEqual(fixture.events, ['loki:auth-lost']);
-  assert.equal(stored(tab1), null);
-  assert.equal(lastLokiSignerSlot(), member.slot);
-  await connect();
+  assert.equal(first.hasLokiSignerSession(), false);
+  assert.equal(first.lastLokiSignerSlot(), member.slot);
+  await connect(first);
   assert.equal(posts.at(-1), `${current}/api/connect`);
-  assert.equal(stored(tab1).capability, token('3'));
-  assert.equal((await api('status')).phase, 'home');
+  statusToken = token('3');
+  assert.equal((await first.api('status')).phase, 'home');
 });
 
 test('a stale loopback port retries discovery; a foreign URL or a refused response cannot set a session', async (t) => {
@@ -130,7 +139,8 @@ test('a stale loopback port retries discovery; a foreign URL or a refused respon
   const connect = () => connectLokiSigner(member.slot, (event) => events.push(event), new AbortController().signal);
   await assert.rejects(connect(), /did not allow/);
   assert.deepEqual(events, [{ phase: 'starting' }, { phase: 'compare', code: '061274' }]);
-  assert.equal(stored(tab), null);
+  assert.equal(hasLokiSignerSession(), false);
+  assert.equal(tab.has(sessionKey), false);
   assert.equal(posts, 2, 'an explicit refusal does not retry');
 
   for (const invalid of ['http://example.com:41227', 'http://127.0.0.1:41227/', 'http://user@127.0.0.1:41227', 'http://[::1]:41227#x']) {
@@ -147,19 +157,21 @@ test('a forbidden or busy connect response is final and displays no comparison c
     if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
     return ++posts === 1 ? new Response(null, { status }) : streamed('{"code":"061274"}\n', `{"token":"${token('a')}"}\n`);
   }).use(tab);
-  for (const [reply, message] of [[403, /did not allow/], [429, /showing another connection request.*choose Refuse/]]) {
+  for (const [reply, message] of [[403, /did not allow/], [429, /another connection request or waiting.*Refuse.*few seconds/]]) {
     status = reply;
     posts = 0;
     const events = [];
     await assert.rejects(connectLokiSigner(member.slot, (event) => events.push(event), new AbortController().signal), message);
     assert.equal(posts, 1);
     assert.deepEqual(events, [{ phase: 'starting' }]);
-    assert.equal(stored(tab), null);
+    assert.equal(hasLokiSignerSession(), false);
+    assert.equal(tab.has(sessionKey), false);
   }
 });
 
 test('startup retries stop after one minute and a new attempt can connect', { timeout: 5_000 }, async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
+  const wallet = await import('../src/lib/api.ts?tab=startup');
   const tab = new Map();
   let ready = false, posts = 0;
   tabFixture(t, async (url) => {
@@ -170,8 +182,8 @@ test('startup retries stop after one minute and a new attempt can connect', { ti
     return new Response(null, { status });
   }).use(tab);
   const events = [];
-  const connect = () => connectLokiSigner(member.slot, (event) => events.push(event), new AbortController().signal);
-  const stopped = assert.rejects(connect(), (error) => error instanceof LokiSignerStartupTimeout
+  const connect = () => wallet.connectLokiSigner(member.slot, (event) => events.push(event), new AbortController().signal);
+  const stopped = assert.rejects(connect(), (error) => error instanceof wallet.LokiSignerStartupTimeout
     && /open and unlocked.*local network permission.*browser may block/.test(error.message));
   for (let n = 0; n < 40; n++) {
     await new Promise(setImmediate);
@@ -180,10 +192,11 @@ test('startup retries stop after one minute and a new attempt can connect', { ti
   }
   await stopped;
   assert.deepEqual(events, [{ phase: 'starting' }]);
-  assert.equal(stored(tab), null);
+  assert.equal(wallet.hasLokiSignerSession(), false);
   ready = true;
   await connect();
-  assert.equal(stored(tab).capability, token('b'));
+  assert.equal(wallet.hasLokiSignerSession(), true);
+  assert.equal(tab.has(sessionKey), false);
 });
 
 test('only a code followed by a token in a live request can persist a grant', async (t) => {
@@ -196,6 +209,7 @@ test('only a code followed by a token in a live request can persist a grant', as
     : streamed(...frames)).use(tab);
   const request = new AbortController();
   await assert.rejects(connectLokiSigner(member.slot, () => {}, request.signal), /did not allow/);
+  assert.equal(hasLokiSignerSession(), false);
   assert.equal(tab.size, 0);
 
   frames = [code, grant];
@@ -203,14 +217,17 @@ test('only a code followed by a token in a live request can persist a grant', as
   await assert.rejects(connectLokiSigner(member.slot, (event) => {
     if (event.phase === 'compare') request.abort();
   }, request.signal), { name: 'AbortError' });
+  assert.equal(hasLokiSignerSession(), false);
   assert.equal(tab.size, 0);
 });
 
-test('a stored LokiSigner grant is not sent to a non-loopback address', async (t) => {
-  const tab = new Map([[sessionKey, JSON.stringify({ endpoint: 'http://not-loopback.example:41227', capability: token('d'), lokisigner: true })]]);
-  const fixture = tabFixture(t, () => assert.fail('an invalid stored address must not be contacted'));
-  fixture.use(tab);
-  await assert.rejects(api('status'), { status: 401, message: 'invalid LokiSigner endpoint' });
-  assert.equal(stored(tab), null);
-  assert.deepEqual(fixture.events, ['loki:auth-lost']);
+test('even a valid-looking LokiSigner grant stored by an older wallet is discarded, not used', async (t) => {
+  const tab = new Map([
+    [sessionKey, JSON.stringify({ endpoint: current, capability: token('d'), lokisigner: true })],
+    ['loki_lokisigner_slot', String(member.slot)],
+  ]);
+  tabFixture(t, () => assert.fail('a copied grant must not reach the signer')).use(tab);
+  await assert.rejects(api('status'), { status: 401 });
+  assert.equal(tab.has(sessionKey), false);
+  assert.equal(lastLokiSignerSlot(), member.slot);
 });

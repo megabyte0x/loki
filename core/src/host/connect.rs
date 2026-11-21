@@ -1,6 +1,6 @@
 //! One explicit local decision per browser response. There is no launch-wide GUI token.
 use std::{
-    collections::HashSet,
+    collections::HashMap,
     convert::Infallible,
     net::SocketAddr,
     sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex, Weak},
@@ -24,6 +24,9 @@ use super::{new_token, state::Shared};
 // Leave a margin below the browser's response timeout, even if the main thread is busy.
 const DEADLINE: Duration = Duration::from_secs(110);
 const COOLDOWN: Duration = Duration::from_secs(5);
+// The wallet polls every 1.5 s. Allow for browsers throttling background timers to one minute.
+#[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+const RECENT_ACTIVITY: Duration = Duration::from_secs(90);
 
 pub(crate) type LocalConnect = Arc<dyn Fn(&str, &str, &ConnectAttempt) -> bool + Send + Sync>;
 
@@ -50,7 +53,8 @@ impl Drop for ResponseAttempt {
 struct Grants {
     pending: Weak<ConnectAttempt>,
     last_prompt: Option<Instant>,
-    tokens: HashSet<String>,
+    tokens: HashMap<String, Instant>,
+    closed: bool,
 }
 
 pub(super) struct WalletTabs {
@@ -79,11 +83,32 @@ impl WalletTabs {
     }
 
     pub(super) fn authorizes(&self, request: &Request, token: &str) -> bool {
-        self.permits_request(request) && self.grants.lock().unwrap().tokens.contains(token)
+        if !self.permits_request(request) { return false; }
+        let mut grants = self.grants.lock().unwrap();
+        let Some(last_seen) = grants.tokens.get_mut(token) else { return false; };
+        *last_seen = Instant::now();
+        true
+    }
+
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    pub(super) fn count(&self) -> usize {
+        let grants = self.grants.lock().unwrap();
+        let now = Instant::now();
+        grants.tokens.values().filter(|&&last_seen| now - last_seen < RECENT_ACTIVITY).count()
     }
 
     pub(super) fn revoke_all(&self) {
+        self.clear(false);
+    }
+
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    pub(super) fn close(&self) {
+        self.clear(true);
+    }
+
+    fn clear(&self, close: bool) {
         let mut grants = self.grants.lock().unwrap();
+        grants.closed |= close;
         grants.tokens.clear();
         if let Some(attempt) = grants.pending.upgrade() {
             attempt.cancelled.store(true, Ordering::Release);
@@ -93,7 +118,7 @@ impl WalletTabs {
     fn begin(&self) -> Option<Arc<ConnectAttempt>> {
         let mut grants = self.grants.lock().unwrap();
         let now = Instant::now();
-        if grants.pending.strong_count() != 0 || grants.last_prompt.is_some_and(|last| now - last < self.cooldown) {
+        if grants.closed || grants.pending.strong_count() != 0 || grants.last_prompt.is_some_and(|last| now - last < self.cooldown) {
             return None;
         }
         let attempt = Arc::new(ConnectAttempt { cancelled: AtomicBool::new(false), deadline: now + self.deadline });
@@ -106,7 +131,7 @@ impl WalletTabs {
         let mut grants = self.grants.lock().unwrap();
         if attempt.cancelled() { return None; }
         let token = new_token();
-        grants.tokens.insert(token.clone());
+        grants.tokens.insert(token.clone(), Instant::now());
         Some(token)
     }
 }
@@ -307,6 +332,26 @@ mod tests {
         let after_restart = token(restarted.connect().header("origin", ORIGIN).send().await.unwrap()).await;
         assert_ne!(after_restart, first_token);
         assert_eq!(restarted.try_token(Some(ORIGIN), &after_restart).await.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn status_counts_recent_tabs_without_expiring_their_grants() {
+        let app = Host::start(Some(Arc::new(|_, _, _| true)), Duration::from_secs(3), Duration::ZERO).await;
+        app.registered().await;
+        let first = token(app.connect().header("origin", ORIGIN).send().await.unwrap()).await;
+        let second = token(app.connect().header("origin", ORIGIN).send().await.unwrap()).await;
+        assert_eq!(app.tabs().count(), 2);
+
+        let mut grants = app.tabs().grants.lock().unwrap();
+        let now = Instant::now();
+        *grants.tokens.get_mut(&first).unwrap() = now - Duration::from_secs(91);
+        *grants.tokens.get_mut(&second).unwrap() = now - Duration::from_secs(60);
+        drop(grants);
+        assert_eq!(app.tabs().count(), 1);
+        assert_eq!(app.try_token(Some("https://other.example"), &first).await.status(), StatusCode::FORBIDDEN);
+        assert_eq!(app.tabs().count(), 1);
+        assert_eq!(app.try_token(Some(ORIGIN), &first).await.status(), StatusCode::OK);
+        assert_eq!(app.tabs().count(), 2);
     }
 
     #[test]

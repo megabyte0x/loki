@@ -23,6 +23,8 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
+   - "Verify the nonce witnesses". Paste the pair fingerprint you received through a trusted
+     channel from the witness operators, not from the wallet.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
      chose (see below). Enter a local profile passphrase and choose **Pair**. Approve the
      Enclave prompt if macOS shows one.
@@ -64,7 +66,9 @@ a new pairing link waits for the registration result before reporting success.
 If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
 or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
 from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
-aside before pairing or restoring. LokiSigner moves the whole data folder to a dated sibling;
+aside before pairing or restoring. Choose it from the **LokiSigner** menu or a retry dialog.
+Opening a pairing link while the signer is running does not interrupt it or replace its profile.
+LokiSigner moves the whole data folder to a dated sibling;
 it deletes neither the folder nor its old keys in the Keychain. New and restored native profiles
 save a public random `native-key-scope`. The device login key and each new vault key use that
 scope and a distinct role, so they keep the same tags when the folder moves on the same Mac and
@@ -111,12 +115,22 @@ registration field,” breaking `/api/members` for everyone, not just those slot
 
 The signed `lokisigner_url` roster field tells everyone who can read `/api/members` that the
 slot uses LokiSigner and which local port it currently listens on. The field is separate
-from the peer endpoint and contains no tab token. A website the member visits can use that
-port and the member API's open ceremony routes to learn that LokiSigner is running, subject
-to the browser's local network permission. Only the pinned coordinator origin can ask to
-connect from a browser. Grants are stored in `sessionStorage`: duplicating a tab can copy its
-grant without another **Allow**. The coordinator serves the page but never receives the token
-in registration. Safari may block the wallet's request to loopback; this has not been verified.
+from the peer endpoint and contains no tab token. If your browser allows local network
+requests, another website may be able to tell that LokiSigner is running. Four ceremony
+routes accept requests from other origins so browser signers can join a vault, but require
+a valid invite to take part. Their replies can also reveal whether the profile is locked.
+Blocking other origins from reading responses would not by itself hide the local listener.
+
+Only the paired coordinator's website can ask to connect from a browser. LokiSigner cannot
+tell another program on your Mac apart from the wallet when it asks to connect. It can open
+a dialog as often as every five seconds, but it still needs an **Allow** in LokiSigner.
+Refuse any request you didn't start. While a dialog is pending or fewer than five seconds
+have passed since the last request started, your own tab may also have to wait.
+
+The grant stays in the approved page's memory. Duplicating a tab or reloading the page
+requires a new **Allow**. The wallet remembers the last slot so you can reconnect. The
+coordinator serves the page but never receives the grant during registration. Safari may
+block the HTTPS wallet's request to LokiSigner on this Mac; this has not been verified.
 
 ## Back up and restore a vault
 
@@ -124,12 +138,21 @@ After your vault is active, choose **Download encrypted backup** in the wallet's
 card. The ciphertext is stored in your LokiSigner profile on this Mac, not by the coordinator.
 **Keep the downloaded JSON somewhere other than this Mac.** If you lose the Mac and the file,
 the 24 words alone cannot recover the vault. Export one file per vault and store your words
-privately, separately from the files. Together the words and a file can recover your share.
+privately, separately from the files. Independently save each backup’s SHA-256 fingerprint
+from the original export. You’ll need it to authenticate the backup at restore time.
+
+For older exports, get the fingerprint from the original signer, or calculate it from an
+offline copy you already trust: hex-decode the JSON `backup` value, then SHA-256 the resulting
+ciphertext bytes (not the JSON file or the hex text). Use that fingerprint with the same
+exported ciphertext. A hash computed from an untrusted download, or supplied with it, does
+not establish authenticity. If you have neither an independent fingerprint nor a trusted
+copy or original signer, LokiSigner cannot safely restore that backup.
 
 On a new Mac, open LokiSigner without a pairing link. Choose **Restore from recovery words**,
 enter the original coordinator's HTTPS origin, confirm it, and review the signer configuration.
-Choose one backup file in LokiSigner, enter the 24 words, and set a new local profile passphrase.
-LokiSigner opens the file locally and checks that both recovered public identity keys identify
+Choose one backup file in LokiSigner, enter its independently saved fingerprint and 24 words,
+and set a new local profile passphrase. LokiSigner checks the fingerprint before opening the
+backup, then checks that both recovered public identity keys identify
 exactly one slot in the coordinator's roster. It saves the recovered vault and identity together,
 then registers the new Mac in that slot without reserving a new one. If the connection fails
 after saving, keep LokiSigner running or reopen and unlock it to retry. If the coordinator
@@ -163,8 +186,16 @@ verified every restored vault. A failed match, cancellation, or lockout does not
 exception. For older keys without enrolment metadata, a failed match can only offer a recovery
 hint, not confirm that the key is gone.
 
+A key that macOS cannot find counts as gone. That can also happen if you moved a profile
+created before #95 (whose key tags depended on the folder path), or if you opened it with an
+app signed by a different Apple developer team. Try the original path and signing team before
+restoring. If you already set the profile aside, quit LokiSigner and rename the archived folder
+back to its original name and location to undo the set-aside. If a new profile now occupies that
+location, move it out of the way without deleting it first.
+
 Restore each additional backup from **LokiSigner → Restore a vault…** in the unlocked app.
-It must belong to the same member and recovery words. It will not replace an existing vault.
+It needs the same independent fingerprint check and must belong to the same member and recovery
+words. It will not replace an existing vault.
 After the replacement registers, the coordinator's device binding and advertised endpoint
 point to the new Mac; the member slot and identity keys stay the same. This does not erase or
 revoke the old Mac's local share. Quit and retire the old signer if you still have it: a Mac
@@ -181,12 +212,12 @@ copy your words into the system clipboard or type them into the wallet.
 ## Verify a receive address
 
 In the **LokiSigner** menu, open **Vault addresses…**. Each active vault shows its network,
-your member slot, and the full receive address with a **Copy address** button. macOS may ask
-for Touch ID when LokiSigner first opens a vault's signer store. Use **Refresh** if you finish
-setting up a vault while the window is open.
+your member slot, and the full vault ID and receive address with a **Copy address** button.
+macOS may ask for Touch ID when LokiSigner first opens a vault's signer store. Use **Refresh**
+if you finish setting up a vault while the window is open. The window clears when the signer locks.
 
-Give senders the address copied from LokiSigner, or compare the full addresses before sharing
-the one on the wallet page. A page served by the coordinator could substitute a different
+Give senders the address copied from LokiSigner, or expand **Vault ID** and **Address** in the
+wallet and compare both full values before sharing. A page served by the coordinator could substitute a different
 address and redirect deposits. LokiSigner derives the address from the device-bound signer's
 group viewing key and checks it against the local public metadata. If it cannot verify a
 vault's address, it shows an error and offers nothing to copy. Vault names are creator-supplied
@@ -203,7 +234,8 @@ same setup document the signer checks in `dkg_begin`. The vault name comes from 
 invite. It follows the same rule as in **Vault addresses…**: it is shown as written, in its own
 one-line box, or replaced whole by "Name hidden (unsupported characters)" when it is longer
 than 80 characters or holds a control, format, default-ignorable or line-breaking character
-or a run of more than three combining marks.
+or a run of more than three combining marks. A name without a letter is also hidden, so a name
+made of digits and spaces cannot look like a second roster code.
 
 - **Codes match** records the agreement and tells the creator.
 - **Codes differ** records nothing, and LokiSigner refuses that vault until it restarts, so a
@@ -242,9 +274,8 @@ token to have compared the code with the other members.
 
 ## Signer configuration
 
-LokiSigner needs no terminal or flags. Its network, frostd relay, lightwalletd and the two
-nonce witnesses are chosen by **the coordinator whose origin the member confirmed** in the
-pairing dialog. That coordinator serves them at `GET <origin>/api/signer-config`. They are the
+LokiSigner needs no terminal or flags. The coordinator proposes the network, frostd relay,
+lightwalletd and two nonce witnesses at `GET <origin>/api/signer-config`. They are the
 values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_URL`,
 `LOKI_LIGHTWALLETD_URL` and `LOKI_NONCE_WITNESSES` in `core/loki-signer-wasm/serve.mjs`).
 
@@ -260,11 +291,13 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   signing would refuse. The request follows no redirect and times out. The app shows a fixed
   message on failure, not the coordinator’s reply or HTTP status.
 - **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
-  unlocks, owner-only (0600) in the data directory: `signer-config.json` with the coordinator
-  origin it came from, and the witnesses in `nonce-witnesses.json`, the `--nonce-witnesses`
-  format. A wrong passphrase saves nothing. A configuration from any coordinator other than the
-  paired one is refused and the saved one is left as it was. A new pairing link for the same
-  coordinator and slot refreshes it once the member confirms and unlocks.
+  unlocks. The coordinator origin, network, endpoints, witness pair and verified fingerprint are
+  atomically saved together in the owner-only (0600) `signer-config.json`. Older configurations
+  without a fingerprint require confirmation before the upgrade. A legacy `nonce-witnesses.json`
+  is never used with the new configuration. A wrong passphrase saves nothing. LokiSigner refuses
+  configuration from another coordinator without changing the saved configuration. A new pairing
+  link for the same coordinator and slot refreshes it once the member confirms and unlocks.
+  Quit the running signer before opening a link to refresh its configuration.
 - **Unlock.** A plain launch shows and uses the saved configuration. A profile paired before
   configurations were saved fetches it once from its paired coordinator.
 - **Flags.** An explicit `--network`, `--frostd-url`, `--lightwalletd-url` or
@@ -294,21 +327,59 @@ HTTP coordinators need an explicit development launch:
 
 ```sh
 core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner native --development-http
-# Or launch with a link and member configuration:
-core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner pair 'loki://pair?...' \
+# Or launch with member configuration, then click Open LokiSigner in the wallet:
+core/signer-app/out/LokiSigner.app/Contents/MacOS/LokiSigner native \
   --data /path/to/member --port 3601 --development-http \
   --frostd-url http://127.0.0.1:2744 --nonce-witnesses /path/to/witnesses.json
 ```
 
+Do not pass a pairing link on a command line. Automation can launch `native --pairing-stdin`
+and supply a single link followed by a newline over standard input from a private pipe.
+
 Other member flags are the existing `loki_member_app` flags: network, lightwalletd, relay,
 nonce witnesses, and peer allowlist. Each overrides the coordinator's value for its field,
-for that launch only. For members on separate Macs, configure a reachable
-HTTPS `--advertise-url` (forwarded to the member service) and the allowed `--peer` origins.
-The private browser session still uses loopback; it is never sent to that public endpoint.
+for that launch only. Members on separate Macs join over frostd: the invite names the creator's
+identity, each joiner seals its requests to the creator on the shared relay, and the creator
+answers while it is unlocked. The creator exposes no endpoint for this, but every member must
+use the same frostd (`--frostd-url`). Older invites without the creator's identity still join
+over HTTP. For that HTTP ceremony, the creator needs a reachable
+HTTPS `--advertise-url` and a separate `--peer-port`. Terminate TLS on a same-host proxy
+forwarding only to the ceremony listener at `127.0.0.1:<peer-port>`. Confirm that origin with
+the creator separately from the invite, then add it to each joiner's `--peer <slot=origin>`
+allowlist.
+The origin must resolve to public addresses; the joiner verifies TLS and does not follow redirects.
+Loopback origins on non-privileged ports are for co-located regtest or deliberate
+`--allow-loopback-peers` runs only.
+Never forward the private browser API listener (`--port`); it requires a loopback bind.
 The link contains only origin, slot and a random claim, never runtime configuration or keys;
 the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately
 zeroed. `serve` retains S4a's local-file unlock for development automation only.
+
+### Verify the witness pair
+
+Members must independently verify the first witness pair and any replacement. After upgrading
+an older profile, verify the saved pair even if its endpoints did not change. Operators can
+compute the fingerprint from their trusted `--nonce-witnesses` JSON file:
+
+```sh
+node -e '
+const pair = JSON.parse(require("node:fs").readFileSync(process.argv[1]));
+const hash = require("node:crypto").createHash("sha256");
+hash.update("Loki_nonce_witness_pins_v1\0");
+for (const { key, run, mailbox } of pair) {
+  for (const field of [key, run, mailbox]) hash.update(Buffer.from(field));
+}
+console.log(hash.digest("hex"));
+' /path/to/witnesses.json
+```
+
+Share only the 64-character fingerprint with members, through a channel they trust independently
+of the wallet. It covers both witnesses' relay keys, run IDs and mailbox IDs in file order, not
+their URLs or credentials. An explicit local `--nonce-witnesses` file is itself trusted operator
+configuration. Outstanding attempts using legacy nonce records or a different pair need a fresh
+signing attempt, even after the replacement is approved. Do not delete existing burn records or
+relay claim history when upgrading or rotating witnesses.
 
 ## Verification
 

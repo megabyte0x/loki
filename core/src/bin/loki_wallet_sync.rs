@@ -3,7 +3,7 @@ use std::{env, fs, path::Path};
 use loki_poc::{
     member_state,
     payment_manifest::MAX_INPUTS,
-    wallet_store::sync_member_wallet,
+    wallet_store::{PROVIDER_REPORTED, sync_member_wallet},
 };
 use zcash_client_backend::proto::service::Empty;
 use zeroize::Zeroizing;
@@ -46,6 +46,7 @@ async fn sync(args: &[String]) -> Result<(), String> {
             "network": member.network.label(),
             "height": height,
             "chain_tip": chain_tip,
+            "chain_trust": PROVIDER_REPORTED,
             "balance_zat": balance,
             "max_spendable_zat": wallet.max_spendable(MAX_INPUTS),
         })

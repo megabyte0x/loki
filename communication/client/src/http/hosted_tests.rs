@@ -21,6 +21,9 @@ fn trusted_client() -> RelayHttp {
     RelayHttp {
         client: RelayHttp::client_builder()
             .timeout(Duration::from_secs(3))
+            // The owned TLS fixture is not a permitted production destination.
+            .resolve("localhost", "127.0.0.1:0".parse().unwrap())
+            .resolve("mismatch.example", "127.0.0.1:0".parse().unwrap())
             .tls_certs_only([reqwest::Certificate::from_pem(ROOT).unwrap()])
             .build()
             .unwrap(),
@@ -103,6 +106,14 @@ async fn server(
 #[tokio::test]
 async fn verified_https_accepts_bound_relay_identity() {
     let (endpoint, pin, task) = server("localhost", false, false).await;
+    let restricted = RelayHttp {
+        client: RelayHttp::client_builder()
+            .tls_certs_only([reqwest::Certificate::from_pem(ROOT).unwrap()])
+            .build().unwrap(),
+        development: false,
+    };
+    assert_eq!(restricted.authenticate_endpoint(&pin, &endpoint).await, Err(ClientError::Transport));
+    assert!(!task.is_finished(), "a private DNS answer reached the listener");
     trusted_client()
         .authenticate_endpoint(&pin, &endpoint)
         .await
@@ -112,7 +123,7 @@ async fn verified_https_accepts_bound_relay_identity() {
 
 #[tokio::test]
 async fn verified_https_rejects_hostname_mismatch() {
-    let (endpoint, pin, task) = server("127.0.0.1", false, false).await;
+    let (endpoint, pin, task) = server("mismatch.example", false, false).await;
     assert_eq!(
         trusted_client()
             .authenticate_endpoint(&pin, &endpoint)
@@ -125,9 +136,14 @@ async fn verified_https_rejects_hostname_mismatch() {
 #[tokio::test]
 async fn production_trust_rejects_untrusted_certificate() {
     let (endpoint, pin, task) = server("localhost", false, false).await;
+    let client = RelayHttp {
+        client: RelayHttp::client_builder()
+            .resolve("localhost", "127.0.0.1:0".parse().unwrap())
+            .build().unwrap(),
+        development: false,
+    };
     assert_eq!(
-        RelayHttp::hosted()
-            .unwrap()
+        client
             .authenticate_endpoint(&pin, &endpoint)
             .await,
         Err(ClientError::Transport)

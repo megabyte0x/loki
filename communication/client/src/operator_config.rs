@@ -1,7 +1,44 @@
 use crate::{ClientError, ClientResult};
 use loki_relay_protocol::WireError;
+use std::net::IpAddr;
+
+// Conservative Internet-unicast allowlist; mapped and transition IPv6 are not accepted.
+pub(crate) fn public_destination(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let [a, b, c, _] = ip.octets();
+            !(matches!(a, 0 | 10 | 127 | 224..=255)
+                || matches!((a, b), (100, 64..=127) | (169, 254) | (172, 16..=31) | (192, 168) | (198, 18..=19))
+                || matches!((a, b, c), (192, 0, 0 | 2) | (192, 88, 99) | (198, 51, 100) | (203, 0, 113)))
+        }
+        IpAddr::V6(ip) => {
+            let [a, b, ..] = ip.segments();
+            (0x2000..=0x3fff).contains(&a)
+                && !((a == 0x2001 && (b < 0x0200 || b == 0x0db8)) || matches!(a, 0x2002 | 0x3fff))
+        }
+    }
+}
+
+/// Signed descriptors still have to pass local destination policy. DNS answers are checked
+/// by the transport when it connects, not assumed safe merely because a name passed import.
+pub fn validate_peer_destination(raw: &str, development: bool) -> ClientResult<()> {
+    let url = checked_url(raw, development)?;
+    let name = url.host_str().ok_or(ClientError::Config)?;
+    if name.trim_matches(['[', ']']).parse::<IpAddr>().is_err() {
+        let name = name.trim_end_matches('.');
+        if !name.contains('.') || [".localhost", ".local", ".internal", ".home.arpa"]
+            .iter().any(|suffix| name.ends_with(suffix)) || name == "home.arpa" {
+            return Err(ClientError::Config);
+        }
+    }
+    Ok(())
+}
 
 pub fn validate_endpoint(raw: &str, development: bool) -> ClientResult<()> {
+    checked_url(raw, development).map(|_| ())
+}
+
+fn checked_url(raw: &str, development: bool) -> ClientResult<reqwest::Url> {
     if raw.len() > 2048 {
         return Err(WireError::Bounds.into());
     }
@@ -53,7 +90,13 @@ pub fn validate_endpoint(raw: &str, development: bool) -> ClientResult<()> {
     {
         return Err(ClientError::Config);
     }
-    Ok(())
+    let address = url.host_str().and_then(|host| host.trim_matches(['[', ']']).parse::<IpAddr>().ok());
+    if let Some(address) = address {
+        if !public_destination(address) && !(development && scheme == "http" && address.is_loopback()) {
+            return Err(ClientError::Config);
+        }
+    }
+    Ok(url)
 }
 
 use ed25519_dalek::{Signature, VerifyingKey};

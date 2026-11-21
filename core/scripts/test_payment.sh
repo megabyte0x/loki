@@ -10,7 +10,7 @@
 # and the members must have been started with `--approve-from TOKEN_DIR/<i>.approvals`.
 #
 # Members sign only with an approval channel and two nonce witnesses. This script starts
-# two witness relays (or uses NONCE_WITNESSES, a provisioned witnesses.json) and runs each
+# two witness relays (or uses NONCE_WITNESSES, which needs separate operator enrollment) and runs each
 # member with `--approve-from`: it reads the signer's own `approval-request` summary from the
 # member's log and approves only the recipient, amount and network it proposed.
 set -euo pipefail
@@ -31,11 +31,12 @@ else
   tmp="$(mktemp -d)"
 fi
 pids=()
+witness_pids=()
 held=()
 cleanup() {
   # Release what this run reserved and did not get to spend.
   for attempt in "${held[@]}"; do api 1 POST /api/payment-discard "$(pair "$attempt")" >/dev/null 2>&1 || true; done
-  for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done
+  for pid in "${pids[@]}" "${witness_pids[@]}"; do kill "$pid" 2>/dev/null || true; done
   wait 2>/dev/null || true
   [[ -n "${VAULT:-}" ]] || echo "member data preserved: $tmp"
 }
@@ -81,7 +82,7 @@ if [[ -z "$witnesses" ]]; then
       --total-bytes 268435456 --mailbox-bytes 67108864 --mailbox-count 1024 >/dev/null || fail "witness relay $n init"
     cp "$tmp/relay-$n.secret" "$tmp/relay-$n/provision.secret"
     "$relay" serve --root "$tmp/relay-$n" --listen "127.0.0.1:$((witness_port+n))" >"$tmp/relay-$n.log" 2>&1 &
-    pids+=("$!")
+    witness_pids+=("$!")
   done
   for n in 1 2; do
     for _ in {1..100}; do nc -z 127.0.0.1 "$((witness_port+n))" 2>/dev/null && break; sleep 0.1; done
@@ -91,6 +92,9 @@ if [[ -z "$witnesses" ]]; then
   cargo run -q --locked --features relay-communication --example provision_nonce_witnesses -- \
     --relay-root "$tmp/relay-1" --relay-root "$tmp/relay-2" --out "$witnesses" --development-http \
     >"$tmp/provision.log" 2>&1 || fail "provisioning the nonce witnesses failed; see $tmp/provision.log"
+  kill "${witness_pids[@]}"
+  for pid in "${witness_pids[@]}"; do wait "$pid"; done
+  witness_pids=()
 fi
 echo "nonce witnesses: $witnesses"
 for i in 1 2 3; do
@@ -147,6 +151,27 @@ for i in 1 2 3; do
   [[ "$active" == true ]] || fail "DKG member $i: $status"
 done
 echo "Back up all three member directories before funding: $tmp"
+if [[ -z ${NONCE_WITNESSES:-} ]]; then
+  # This isolated run created the vault, controls both witnesses and just confirmed the roster.
+  joined=$(jq -ce '.invites[] | select(.slot == 2) | .code | gsub("-"; "+") | gsub("_"; "/") |
+    . + ("=" * ((4 - length % 4) % 4)) | @base64d | fromjson | {vault, slot, token}' <<<"$created")
+  roster=$(api 1 POST /api/roster "$joined" | jq -er --arg f "$fingerprint" 'select(.fingerprint == $f) | .roster')
+  for n in 1 2; do
+    mailbox=$(jq -er --argjson i "$((n-1))" '.[$i].mailbox | map((. / 16 | floor), (. % 16)) |
+      map(. as $nibble | "0123456789abcdef"[$nibble:$nibble + 1]) | join("")' "$witnesses")
+    for i in 1 2 3; do
+      key=$(jq -er --arg i "$i" '.[$i].signing' <<<"$roster")
+      "$relay" enroll-nonce --root "$tmp/relay-$n" --mailbox "$mailbox" --vault "$vault" \
+        --slot "$i" --signing-key "$key" --quota-bytes 1048576 || fail "witness $n enrollment for member $i"
+    done
+    "$relay" serve --root "$tmp/relay-$n" --listen "127.0.0.1:$((witness_port+n))" >>"$tmp/relay-$n.log" 2>&1 &
+    witness_pids+=("$!")
+    for _ in {1..100}; do nc -z 127.0.0.1 "$((witness_port+n))" 2>/dev/null && break; sleep 0.1; done
+    nc -z 127.0.0.1 "$((witness_port+n))" 2>/dev/null || fail "witness $n did not restart after enrollment"
+  done
+else
+  echo "Enroll vault $vault on both external witnesses before funding (see communication/deploy/README.md)."
+fi
 fi
 address="$(api 1 GET "/api/address?vault=$vault" | jq -er '.address')" || fail address
 # Without RECIPIENT the vault pays itself, so the test spends nothing but fees.

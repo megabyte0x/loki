@@ -1,3 +1,4 @@
+use loki_relay_protocol::nonce::Claimant;
 use loki_relay_server::{
     capability::provisioning_verifier, http::router, DbHandle, Limits, RelayError, RelayResult,
     RelayStore,
@@ -22,12 +23,17 @@ fn dispatch(args: impl Iterator<Item = String>) -> RelayResult<()> {
     match Cli::parse(args)? {
         Cli::Init(args) => init(args),
         Cli::Serve(args) => serve(args),
+        Cli::EnrollNonce { root, mailbox, claimant, quota } => {
+            let limits = persisted_limits(&root)?;
+            RelayStore::open(&root, limits)?.enroll_nonce_claimant(mailbox, claimant, quota)
+        }
     }
 }
 
 enum Cli {
     Init(InitArgs),
     Serve(ServeArgs),
+    EnrollNonce { root: PathBuf, mailbox: [u8; 32], claimant: Claimant, quota: u64 },
 }
 
 struct InitArgs {
@@ -98,6 +104,23 @@ impl Cli {
                     root: PathBuf::from(take("--root")?),
                     listen: parse_listen(&take("--listen")?)?,
                 }))
+            }
+            "enroll-nonce" if flags.len() == 6 => {
+                let id = |name| {
+                    let mut bytes = [0; 32];
+                    hex::decode_to_slice(take(name)?, &mut bytes).map_err(|_| RelayError::MalformedRequest)?;
+                    Ok::<_, RelayError>(bytes)
+                };
+                Ok(Self::EnrollNonce {
+                    root: PathBuf::from(take("--root")?),
+                    mailbox: id("--mailbox")?,
+                    claimant: Claimant {
+                        vault: id("--vault")?,
+                        slot: decimal(&take("--slot")?)?.try_into().map_err(|_| RelayError::MalformedRequest)?,
+                        key: id("--signing-key")?,
+                    },
+                    quota: decimal(&take("--quota-bytes")?)?,
+                })
             }
             _ => Err(RelayError::MalformedRequest),
         }
@@ -207,10 +230,7 @@ fn serve(args: ServeArgs) -> RelayResult<()> {
         io::stdout()
             .flush()
             .map_err(|_| RelayError::StorageUnavailable)?;
-        axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|_| RelayError::StorageUnavailable)?;
+        loki_http_ingress::serve(listener, app, shutdown_signal()).await;
         cleanup.abort();
         let _ = cleanup.await;
         owner.shutdown().await

@@ -21,6 +21,9 @@ use reddsa_frost::{orchard::SpendAuth, Signature, VerificationKey};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
+// The unique canonical encoding of the Pallas identity.
+const PALLAS_IDENTITY: [u8; 32] = [0; 32];
+
 fn now() -> Result<u64, String> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -73,6 +76,10 @@ fn verify(challenge: &Value, proof: &Value) -> Result<[u8; 32], String> {
     let ak = bytes::<32>(proof, "account_ak")?;
     let key =
         VerificationKey::<SpendAuth>::try_from(ak).map_err(|_| "invalid Orchard account key")?;
+    // RedDSA accepts the identity, but it cannot prove control of an account.
+    if ak == PALLAS_IDENTITY {
+        return Err("Orchard account key is the identity; see README.md for rebind steps".into());
+    }
     let signature = Signature::<SpendAuth>::from(bytes::<64>(proof, "signature")?);
     key.verify(&digest(challenge), &signature)
         .map_err(|_| String::from("account proof signature differs from the challenge"))?;
@@ -147,6 +154,16 @@ fn check_context(member: &Path, pass: &str, c: &Value) -> Result<(), String> {
     Ok(())
 }
 
+fn read_profile_account(profile: &MemberDir, pass: &str) -> Result<Vec<u8>, String> {
+    let ak = profile
+        .read_sealed("account.sealed", pass)
+        .map_err(|e| e.to_string())?;
+    if ak == PALLAS_IDENTITY {
+        return Err("profile account key is the identity; see README.md for rebind steps".into());
+    }
+    Ok(ak)
+}
+
 fn bind(args: &[String]) -> Result<(), String> {
     if args.len() != 5 {
         return Err(
@@ -164,11 +181,7 @@ fn bind(args: &[String]) -> Result<(), String> {
     let ak = verify(&c, &proof)?;
     let profile = MemberDir::open(root, "profile");
     if profile.exists("account.sealed") {
-        if profile
-            .read_sealed("account.sealed", &pass)
-            .map_err(|e| e.to_string())?
-            != ak
-        {
+        if read_profile_account(&profile, &pass)? != ak {
             return Err("this profile is linked to a different account".into());
         }
     } else {
@@ -202,11 +215,7 @@ fn check(args: &[String]) -> Result<(), String> {
     let c = challenge(&serde_json::to_vec(&record["challenge"]).unwrap(), false)?;
     check_context(member, &pass, &c)?;
     let ak = verify(&c, &record["proof"])?;
-    if MemberDir::open(root, "profile")
-        .read_sealed("account.sealed", &pass)
-        .map_err(|e| e.to_string())?
-        != ak
-    {
+    if read_profile_account(&MemberDir::open(root, "profile"), &pass)? != ak {
         return Err("vault membership is linked to another account".into());
     }
     println!(

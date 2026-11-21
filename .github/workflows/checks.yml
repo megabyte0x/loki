@@ -17,18 +17,34 @@ jobs:
         with:
           persist-credentials: false
       - name: Reject committed member secrets
+        shell: bash
+        env:
+          LC_ALL: C
         run: |
-          if git ls-files | grep -E '(^|/)(passphrase|[^/]+\.passphrase|profile\.sealed|vault\.card|wallet\.sqlite(-wal|-shm|-journal)?|\.unlock-[^/]*)$'; then
-            echo 'Member secrets must not be committed.' >&2
-            exit 1
-          fi
+          git ls-files -z | while IFS= read -r -d '' path; do
+            case "${path##*/}" in
+              passphrase|*.passphrase|*.pass|profile.sealed|identity.sealed|share.sealed|vault.card|wallet.sqlite|wallet.sqlite-wal|wallet.sqlite-shm|wallet.sqlite-journal|.unlock-*)
+                printf 'Member secrets must not be committed: %q\n' "$path" >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: Check secret ignore patterns
         run: |
-          for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test; do
-            git check-ignore -q --no-index "$candidate"
+          for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test loki-state/member-1/pids loki-member-1/member.log custom/local.pass custom/member-1.pass custom/identity.sealed custom/share.sealed; do
+            if ! git check-ignore -q --no-index "$candidate"; then
+              printf 'Expected Git to ignore %s\n' "$candidate" >&2
+              exit 1
+            fi
           done
           for candidate in communication/client/tests/fixtures/hosted-tls/server-key.pem core/tests/zip2005_keys.rs web/wallet/tests/registration.test.mjs; do
-            ! git check-ignore -q --no-index "$candidate"
+            status=0
+            git check-ignore -q --no-index "$candidate" || status=$?
+            case "$status" in
+              1) ;;
+              0) printf 'Git unexpectedly ignores %s\n' "$candidate" >&2; exit 1 ;;
+              *) printf 'git check-ignore failed for %s (status %s)\n' "$candidate" "$status" >&2; exit "$status" ;;
+            esac
           done
 
   rust:
@@ -58,11 +74,7 @@ jobs:
       - name: Test loki-signer-core
         working-directory: core
         run: cargo +1.95.0 test --locked -p loki-signer-core
-      # Known failure on Linux: the runner's clang compiles secp256k1's C for wasm32, so the
-      # link stubs in core/loki-signer-wasm/src/lib.rs (secp256k1_link_stub) define those
-      # symbols twice. Drop continue-on-error once the stubs are gated.
       - name: Build wasm signer
-        continue-on-error: true
         working-directory: core
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
@@ -72,6 +84,65 @@ jobs:
         env:
           RUSTFLAGS: --cfg getrandom_backend="wasm_js"
         run: cargo +1.95.0 build --locked --target wasm32-unknown-unknown
+
+  macos-signer:
+    name: LokiSigner (macOS arm64)
+    runs-on: macos-26
+    timeout-minutes: 45
+    env:
+      RUSTUP_TOOLCHAIN: 1.95.0
+      DEVELOPER_DIR: /Applications/Xcode_26.1.1.app/Contents/Developer
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FROSTD_REV: 53df99c2bd61f7cb60a0d1f634822a76be3799cf
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Cache frostd
+        id: frostd-cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: ~/.cargo/bin/frostd
+          key: macos-26-${{ runner.arch }}-frostd-${{ env.RUSTUP_TOOLCHAIN }}-${{ env.FROSTD_REV }}
+      - name: Install frostd
+        if: steps.frostd-cache.outputs.cache-hit != 'true'
+        run: cargo install --locked --git https://github.com/ZcashFoundation/frost-tools --rev "$FROSTD_REV" frostd
+      - name: Cache Cargo build
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            core/target
+          key: macos-26-${{ runner.arch }}-cargo-${{ env.RUSTUP_TOOLCHAIN }}-${{ env.DEVELOPER_DIR }}-${{ hashFiles('core/Cargo.lock') }}
+      - name: Test native host and FFI
+        working-directory: core
+        shell: bash
+        env:
+          FROSTD_URL: http://127.0.0.1:2744
+        run: |
+          frostd -n -i 127.0.0.1 -p 2744 > "$RUNNER_TEMP/frostd.log" 2>&1 &
+          trap 'kill "$!" 2>/dev/null || true' EXIT
+          curl --retry 10 --retry-connrefused --retry-delay 1 --max-time 2 -sS -o /dev/null "$FROSTD_URL" || { cat "$RUNNER_TEMP/frostd.log"; exit 1; }
+          cargo test --locked -p loki-poc --lib --features apple-enclave,relay-communication -- enclave_ffi host::
+      - name: Test Swift Enclave backend without hardware
+        run: bash core/enclave-spike/build.sh --test-backend
+      - name: Build unsigned LokiSigner
+        working-directory: core/signer-app
+        shell: bash
+        run: |
+          gem install --user-install --no-document xcodeproj -v 1.27.0
+          # Use this build's dylib rather than picking an arbitrary copy from the cache.
+          backend=$(cargo build --locked --lib --features apple-enclave,relay-communication --message-format=json-render-diagnostics |
+            jq -er 'select(.reason == "build-script-executed" and (.linked_libs | index("dylib=se_backend"))) | .out_dir')
+          mkdir -p libs
+          cp ../target/debug/libloki_poc.a "$backend/libse_backend.dylib" libs/
+          ruby gen.rb
+          xcodebuild -project LokiSigner.xcodeproj -scheme LokiSigner -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' -derivedDataPath "$RUNNER_TEMP/LokiSigner" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
 
   web:
     runs-on: ubuntu-24.04

@@ -4,8 +4,9 @@ import UniformTypeIdentifiers
 
 enum SignerStartFailure: Error, Equatable {
     case cancelled, pairingLinkNeeded, invalidLink, differentPairing, configuration, coordinatorOrigin
-    case emptyPassphrase, unlock, deviceKey, registrationRefused, registrationFailed, unexpected
-    case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, wrongProfile
+    case savedEndpointsRefreshFailed
+    case invalidProfileName, emptyPassphrase, unlock, deviceKey, registrationRefused, registrationFailed, unexpected
+    case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, badBackupFingerprint, wrongProfile
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
     case notFresh, dataFolderUnavailable, protectedProfile, setAsideFailed
     case key(String), keyGone(String), registrationRosterUnavailable, testnetOnly
@@ -23,11 +24,13 @@ enum SignerStartFailure: Error, Equatable {
         case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
         case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
         case .testnetOnly: return "The LokiSigner wallet only supports testnet. This coordinator did not provide a testnet configuration."
+        case .savedEndpointsRefreshFailed: return "A saved server address contains a path LokiSigner no longer supports. LokiSigner couldn’t load updated settings from your paired coordinator. Check that you can reach the coordinator, or ask its operator for help, then try again."
         case .coordinatorOrigin: return "Enter the original coordinator’s HTTPS address, without a page or path, and try again."
+        case .invalidProfileName: return "Choose a short, single-line profile name without invisible formatting characters, or leave it blank to use Member."
         case .emptyPassphrase: return "Enter your local profile passphrase and try again."
         case .unlock: return "LokiSigner couldn’t unlock this profile. Check your passphrase and try again."
         case .deviceKey: return "This Mac couldn’t use the device key LokiSigner needs to connect. Try again, or set aside the profile if it has no vaults."
-        case .registrationRefused: return "The coordinator refused this pairing. Try unlocking again, or get a new pairing link from the wallet."
+        case .registrationRefused: return "The coordinator refused this pairing. Try again to use the saved slot. If it has gone to another member, ask the coordinator for a new pairing link."
         case .registrationFailed: return "LokiSigner couldn’t finish connecting to the coordinator. Check your connection and try again."
         case .registrationRosterUnavailable: return "LokiSigner couldn’t reach the coordinator. Check your connection, then try again."
         case .key(let message), .keyGone(let message): return message
@@ -36,6 +39,7 @@ enum SignerStartFailure: Error, Equatable {
         case .missingRecoveryWords: return "Enter your recovery words and try again."
         case .invalidBackup: return "Choose a valid LokiSigner recovery backup file and try again."
         case .backupMismatch: return "LokiSigner couldn’t restore this vault. Check the recovery words and backup, then try again."
+        case .badBackupFingerprint: return "Enter the matching 64-character SHA-256 fingerprint from your original signer or a known-good offline copy. Don’t use a fingerprint supplied with an untrusted file."
         case .wrongProfile: return "These recovery words or this backup don’t match the unlocked profile. Check that they belong to this member and try again."
         case .vaultExists: return "This vault already has data in the profile. LokiSigner didn’t replace it. Choose a different backup."
         case .rosterUnavailable: return "LokiSigner couldn’t read the coordinator’s member list. Check the coordinator and your connection, then try again."
@@ -52,14 +56,15 @@ enum SignerStartFailure: Error, Equatable {
 
 @_silgen_name("loki_member_app_restore_vault")
 func loki_member_app_restore_vault(_ words: UnsafeMutablePointer<UInt8>?, _ count: Int,
-    _ file: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+    _ file: UnsafePointer<CChar>, _ fingerprint: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
 @_silgen_name("loki_member_app_restore_profile")
 func loki_member_app_restore_profile(_ launch: UnsafePointer<CChar>,
     _ words: UnsafeMutablePointer<UInt8>?, _ wordCount: Int,
     _ pass: UnsafeMutablePointer<UInt8>?, _ passCount: Int, _ file: UnsafePointer<CChar>,
-    _ notify: @convention(c) (UnsafePointer<CChar>?, UnsafePointer<CChar>?) -> Void,
-    _ approve: @convention(c) (UnsafePointer<CChar>?) -> Int32,
+    _ fingerprint: UnsafePointer<CChar>,
+    _ notify: NativeNotice,
+    _ approve: ApprovalDecision,
     _ confirmRoster: @convention(c) (UnsafePointer<CChar>?) -> Int32,
     _ connect: ConnectDecision) -> UnsafeMutablePointer<CChar>?
 
@@ -126,11 +131,13 @@ func firstRunChoice() -> NSApplication.ModalResponse {
 // After the main thread hands this off, only the restore worker accesses these buffers.
 final class RecoveryInput: @unchecked Sendable {
     let file: String
+    let fingerprint: String
     var words: [UInt8]
     var pass: [UInt8]
 
-    init(file: String, words: [UInt8], pass: [UInt8]) {
+    init(file: String, fingerprint: String, words: [UInt8], pass: [UInt8]) {
         self.file = file
+        self.fingerprint = fingerprint
         self.words = words
         self.pass = pass
     }
@@ -145,12 +152,16 @@ private func recoveryBackupPicker() -> NSOpenPanel {
 }
 
 private struct RecoveryPrompt {
+    let fingerprint: NSTextField
     let words: NSSecureTextField
     let pass: NSSecureTextField
     private let newProfile: Bool
 
     init(newProfile: Bool) {
         self.newProfile = newProfile
+        fingerprint = NSTextField(frame: NSRect(x: 0, y: newProfile ? 60 : 30, width: 400, height: 22))
+        fingerprint.placeholderString = "Independently saved backup fingerprint (64 hex characters)"
+        fingerprint.setAccessibilityLabel("Independently saved backup fingerprint")
         words = NSSecureTextField(frame: NSRect(x: 0, y: newProfile ? 30 : 0, width: 400, height: 22))
         words.placeholderString = "24 recovery words, separated by spaces"
         words.setAccessibilityLabel("24 recovery words")
@@ -159,14 +170,18 @@ private struct RecoveryPrompt {
         pass.setAccessibilityLabel("New local profile passphrase")
     }
 
+    var fields: [NSTextField] { newProfile ? [fingerprint, words, pass] : [fingerprint, words] }
+
     func standaloneAlert() -> NSAlert {
         let alert = NSAlert()
         alert.messageText = "Restore a vault"
-        alert.informativeText = "Encrypted backup selected. Enter its 24 recovery words here, never on the wallet page."
-        let fields = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: newProfile ? 52 : 22))
-        fields.addSubview(words)
-        if newProfile { fields.addSubview(pass); words.nextKeyView = pass }
-        alert.accessoryView = fields
+        alert.informativeText = "Enter the SHA-256 fingerprint you saved from your original signer or a known-good offline copy, not one supplied with this file. Enter your recovery words here, never on the wallet page."
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: 400, height: newProfile ? 82 : 52))
+        view.addSubview(fingerprint)
+        view.addSubview(words)
+        fingerprint.nextKeyView = words
+        if newProfile { view.addSubview(pass); words.nextKeyView = pass }
+        alert.accessoryView = view
         alert.addButton(withTitle: "Restore vault")
         alert.addButton(withTitle: "Cancel")
         return alert
@@ -174,26 +189,34 @@ private struct RecoveryPrompt {
 
     func review() -> SignerReview {
         let r = SignerReview.self
-        let entry = r.field("24 recovery words", words) + (newProfile ? r.field("New local profile passphrase", pass) : [])
+        let entry = r.field("Backup fingerprint · saved independently", fingerprint) + r.field("24 recovery words", words)
+            + (newProfile ? r.field("New local profile passphrase", pass) : [])
         return SignerReview(section: newProfile ? "Recovery · fresh profile" : "Recovery · unlocked profile",
             title: newProfile ? "Restore your signer" : "Restore another vault",
             intro: "Use the backup and words that match this signer’s identity.", content: [
                 r.card("Encrypted backup file", [r.label("Backup selected", weight: .semibold),
                     r.label("Selected using the macOS file picker. Its contents stay local.", tone: r.muted)]),
-                r.card("Private entry on this Mac", entry + [r.label("Existing vault data will not be overwritten.", tone: r.muted)]),
+                r.card("Private entry on this Mac", entry + [
+                    r.label("Use the fingerprint from your original signer or a known-good offline copy, never one supplied with this file.", tone: r.muted),
+                    r.label("Existing vault data will not be overwritten.", tone: r.muted)]),
             ], hint: newProfile ? "Recovery words stay in the local signer." : "Your unlocked profile is kept.",
             actions: [newProfile ? "Restore signer" : "Restore vault", "Cancel"], primary: 0)
     }
 
     func input(_ response: NSApplication.ModalResponse, file: URL) -> Result<RecoveryInput, SignerStartFailure> {
         guard response == .alertFirstButtonReturn else { return .failure(.cancelled) }
+        let anchor = fingerprint.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard anchor.utf8.count == 64, anchor.utf8.allSatisfy({ (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }) else {
+            return .failure(.badBackupFingerprint)
+        }
         guard !words.stringValue.isEmpty, !newProfile || !pass.stringValue.isEmpty else {
             return .failure(newProfile ? .missingRecoveryInput : .missingRecoveryWords)
         }
-        return .success(RecoveryInput(file: file.path, words: Array(words.stringValue.utf8), pass: Array(pass.stringValue.utf8)))
+        return .success(RecoveryInput(file: file.path, fingerprint: anchor, words: Array(words.stringValue.utf8), pass: Array(pass.stringValue.utf8)))
     }
 
     func clear() {
+        fingerprint.stringValue = ""
         words.stringValue = ""
         pass.stringValue = ""
     }
@@ -209,7 +232,7 @@ func restoreInput(newProfile: Bool) -> Result<RecoveryInput, SignerStartFailure>
     let prompt = RecoveryPrompt(newProfile: newProfile)
     let alert = prompt.standaloneAlert()
     let words = prompt.words
-    alert.window.initialFirstResponder = words
+    alert.window.initialFirstResponder = prompt.fingerprint
     if let editor = alert.window.fieldEditor(true, for: words) as? NSTextView {
         editor.isContinuousSpellCheckingEnabled = false
         editor.isGrammarCheckingEnabled = false
@@ -238,7 +261,7 @@ func restoreInput(newProfile: Bool, signer: NativeSigner, complete: @escaping (R
         guard response == .OK, let file = picker.url else { complete(.failure(.cancelled)); return }
 
         let prompt = RecoveryPrompt(newProfile: newProfile)
-        signer.presentPrompt(prompt.review(), fields: newProfile ? [prompt.words, prompt.pass] : [prompt.words]) { response in
+        signer.presentPrompt(prompt.review(), fields: prompt.fields) { response in
             let input = prompt.input(response, file: file)
             prompt.clear()
             complete(input)
@@ -251,18 +274,20 @@ func recoveryError(_ reply: UnsafeMutablePointer<CChar>?) -> SignerStartFailure?
     if let reply,
        let result = try? JSONSerialization.jsonObject(with: Data(String(cString: reply).utf8)) as? [String: Any] {
         if result["restored"] as? Bool == true { return nil }
-        if let message = result["key_error"] as? String { return .key(message) }
         switch result["error"] as? String {
-        case "Choose a valid LokiSigner recovery backup file (at most 256 KiB).": return .invalidBackup
-        case "This backup or these recovery words do not match the unlocked LokiSigner profile.": return .wrongProfile
-        case "This vault already has data in the profile. LokiSigner did not replace it.": return .vaultExists
-        case "First-run recovery needs a new LokiSigner profile directory.": return .notFresh
+        case "key-error":
+            if let message = result["key_error"] as? String { return .key(message) }
+        case "invalid-backup": return .invalidBackup
+        case "backup-fingerprint-mismatch": return .badBackupFingerprint
+        case "wrong-profile": return .wrongProfile
+        case "vault-exists": return .vaultExists
+        case "profile-not-fresh": return .notFresh
         case "data-folder-unavailable": return .dataFolderUnavailable
-        case "LokiSigner could not read the coordinator roster. Check the coordinator and try again.": return .rosterUnavailable
-        case "The coordinator roster does not identify exactly one slot for this backup.": return .rosterMismatch
-        case "Vault restored to this Mac, but LokiSigner could not start. Try unlocking again; your recovery words are not needed.": return .restoredButStopped
-        case "Unlock LokiSigner before restoring a vault.": return .unlockToRestore
-        case "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.": return .backupMismatch
+        case "roster-unavailable": return .rosterUnavailable
+        case "roster-mismatch": return .rosterMismatch
+        case "restored-but-stopped": return .restoredButStopped
+        case "profile-locked": return .unlockToRestore
+        case "restore-refused": return .backupMismatch
         default: break
         }
     }

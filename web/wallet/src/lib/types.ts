@@ -54,6 +54,8 @@ export type CeremonyStatus = {
 /** The stuck payment a replacement request replaces; it spends the same note. */
 export type Replaces = { attempt: string; cancel: boolean };
 
+export type ChainProvenance = { chain_trust?: "provider_reported" };
+
 export type Payment = {
   attempt: string;
   phase: string;
@@ -63,13 +65,14 @@ export type Payment = {
   approvals?: number[];
   approval_requested?: boolean;
   can_discard?: boolean;
+  can_dismiss?: boolean;
   // This member holds the signed transaction and can send it, or send it again.
   can_send?: boolean;
   sending?: boolean;
   // The payment looks stuck: any member may replace it by spending the same note.
   can_replace?: boolean;
   replaces?: Replaces | null;
-  replaced_by?: string | null;
+  spent_by?: string | null;
   error?: string | null;
   txid?: string | null;
   direction?: "sent" | "received";
@@ -79,10 +82,11 @@ export type Payment = {
   signers?: number[];
 };
 
-export type PaymentSession = {
+export type PaymentSession = ChainProvenance & {
   phase: string;
   signatures_received: boolean;
   txid?: string | null;
+  spent_by?: string | null;
   replaces?: Replaces | null;
   approvals: number[];
   approval_requested: boolean;

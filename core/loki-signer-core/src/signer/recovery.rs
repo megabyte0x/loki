@@ -99,10 +99,14 @@ impl RecoveryKey {
         self.signing.verifying_key().to_bytes()
     }
 
-    /// Authorize a replacement device by signing its public key with the recovery key — the
-    /// escape-hatch step on a new phone. Only the 24 words produce a signature Loki accepts.
+    /// Authorize first enrollment of a device by signing its SEC1 public key.
     pub fn authorize_device(&self, device_pub: &[u8]) -> [u8; 64] {
         self.signing.sign(device_pub).to_bytes()
+    }
+
+    /// Re-authorize a revoked device for the current generation issued by the local profile.
+    pub fn authorize_device_renewal(&self, device_pub: &[u8], generation: &[u8; 32]) -> [u8; 64] {
+        self.signing.sign(&device_renewal_message(device_pub, generation)).to_bytes()
     }
 
     /// Open an HPKE share backup made by [`seal_backup`] for this recovery key. `vault_id` must
@@ -126,17 +130,19 @@ impl RecoveryKey {
     }
 }
 
-/// Check that `sig` is this recovery identity's authorization of `device_pub` — i.e. the
-/// holder of the 24 words signed that device key. Loki runs this before enrolling a new
-/// device. Bad signature / wrong recovery key -> `Err`.
+pub(crate) fn device_renewal_message(device_pub: &[u8], generation: &[u8; 32]) -> Vec<u8> {
+    [b"loki-local-device-renewal-v1\0".as_slice(), generation, device_pub].concat()
+}
+
+/// Verify a recovery signature over the device key or the domain-separated renewal message.
 pub fn verify_device_authorization(
     recovery_signing_pub: &[u8; 32],
-    device_pub: &[u8],
+    message: &[u8],
     sig: &[u8; 64],
 ) -> Result<(), String> {
     let vk = VerifyingKey::from_bytes(recovery_signing_pub)
         .map_err(|e| format!("bad recovery signing key: {e}"))?;
-    vk.verify(device_pub, &ed25519_dalek::Signature::from_bytes(sig))
+    vk.verify(message, &ed25519_dalek::Signature::from_bytes(sig))
         .map_err(|_| "device authorization signature does not verify".to_string())
 }
 

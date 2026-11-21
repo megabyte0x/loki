@@ -2037,12 +2037,15 @@ dependencies = [
  "loki-relay-protocol",
  "loki-signer-core",
  "p256",
+ "prost",
  "rand",
  "rand_chacha",
  "rand_core 0.10.1",
  "rand_core 0.6.4",
  "reqwest",
+ "rpassword",
  "rusqlite",
+ "rustix",
  "rustls",
  "serde",
  "serde_json",
@@ -2119,6 +2122,7 @@ dependencies = [
  "hkdf 0.12.4",
  "hpke",
  "incrementalmerkletree",
+ "loki-relay-protocol",
  "p256",
  "prost",
  "rand",
@@ -2156,6 +2160,7 @@ dependencies = [
  "cc",
  "console_error_panic_hook",
  "hex",
+ "js-sys",
  "loki-signer-core",
  "rand",
  "rand_core 0.6.4",
@@ -2861,6 +2866,27 @@ name = "ripemd"
 version = "0.2.0-pre.4"
 dependencies = [
  "digest 0.11.0-pre.9",
+]
+
+[[package]]
+name = "rpassword"
+version = "7.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fa2c5d9304b618df61ff17f3d3485c6e1854a3d94902a49abbb8d43dfbe0464"
+dependencies = [
+ "libc",
+ "rtoolbox",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "rtoolbox"
+version = "0.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9a1efe12a1469752d0e6ff5ebec0b6ef4924cc5c4c71046b0ec730040535819d"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

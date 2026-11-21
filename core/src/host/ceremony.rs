@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -22,7 +23,7 @@ use zeroize::Zeroizing;
 
 use super::{
     routes::{blocking, err},
-    state::Shared,
+    state::{Config, Shared},
 };
 use crate::{
     frost_roster::FrostRoster,
@@ -34,8 +35,9 @@ use crate::{
         local::{roster_code, ApprovalPolicy, BackupDevice, DevicePrompts, LocalSigner, RosterDecision, SignerError},
         Network, Signer,
     },
+    signing_session::{MessageKind, SessionContext},
     state::MemberDir,
-    transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, RelayLog, Transport},
+    transport::{FrostdLoginKey, FrostdTransport, Outbound, Peer, RelayLog, SealedPeer, Transport},
     vault, zip2005,
 };
 
@@ -87,7 +89,7 @@ pub(super) struct WireIdentity {
 }
 
 impl WireIdentity {
-    fn from_public(p: PublicIdentity) -> Self {
+    pub(super) fn from_public(p: PublicIdentity) -> Self {
         Self {
             id: p.id,
             signing: hex::encode(p.signing),
@@ -148,9 +150,12 @@ pub(super) struct Ceremony {
     // matches the creator's byte-for-byte (joiners must not reconstruct it from a guess).
     #[serde(default)]
     birth_height: Option<u32>,
-    // The roster code this member confirmed in `agree`; the signer's roster prompt matches it.
-    #[serde(default)]
+    // Do not resume from older agreement records, which may have come from HTTP alone.
+    #[serde(default, rename = "locally_confirmed_roster_code")]
     roster_code: Option<String>,
+    // A joiner's copy of the creator's identity from the invite: requests go to it over frostd.
+    #[serde(default)]
+    creator: Option<WireIdentity>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,17 +167,42 @@ struct Invite {
     members: u16,
     threshold: u16,
     name: String,
+    // The creator's identity and relay: a joiner reaches the creator over frostd, not HTTP.
+    #[serde(default)]
+    creator: Option<WireIdentity>,
+    #[serde(default)]
+    frostd_url: Option<String>,
 }
 
+/// The embedded wallet's join precheck, before the shared `join` handler runs. A relay invite
+/// must carry a valid creator identity: it joins through this member's own frostd, never the
+/// relay or HTTP endpoint the invite names, so its `creator_base_url` (often loopback) is not
+/// checked. Only an invite with no relay fields is a legacy HTTP invite, and its creator must be
+/// the paired coordinator, an allowed peer or this signer; `join` then applies the peer checks.
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
-pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> bool {
-    let Some(invite) = body["invite"].as_str().filter(|s| s.len() <= 4096)
+pub(super) fn embedded_invite_target(config: &super::Config, body: &Value) -> Result<(), &'static str> {
+    const INVALID: &str = "invalid invite";
+    let raw: Value = body["invite"].as_str().filter(|s| s.len() <= 4096)
         .and_then(|s| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s).ok())
-        .and_then(|bytes| serde_json::from_slice::<Invite>(&bytes).ok()) else { return false; };
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .filter(Value::is_object).ok_or(INVALID)?;
+    let relay = !raw["creator"].is_null() || !raw["frostd_url"].is_null();
+    let invite: Invite = serde_json::from_value(raw).map_err(|_| INVALID)?;
+    if relay {
+        invite.creator.as_ref().ok_or("relay invite has no creator identity")?
+            .public(1).map_err(|_| "relay invite has an invalid creator identity")?;
+        return crate::transport::require_tls_off_loopback(&config.frostd_url)
+            .map_err(|_| "this signer has no usable relay for a relay invite");
+    }
     let url = invite.creator_base_url.as_str();
-    config.registration.as_ref().is_some_and(|paired| paired.coordinator == url)
+    if config.registration.as_ref().is_some_and(|paired| paired.coordinator == url)
         || config.peers.values().any(|peer| peer == url)
         || config.lokisigner_url().as_deref() == Some(url)
+    {
+        Ok(())
+    } else {
+        Err("invite does not name the paired coordinator or an allowed peer")
+    }
 }
 
 /// Shared roster policy, including the member cap.
@@ -186,8 +216,24 @@ fn vault_bytes(vault: &str) -> Result<[u8; 32], String> {
 }
 
 pub(super) fn dir(data: &Path, vault: &str) -> Result<MemberDir, String> {
-    vault_bytes(vault)?;
-    Ok(MemberDir::open(&data.join("vaults"), vault))
+    let canonical = hex::encode(vault_bytes(vault)?);
+    let parent = data.join("vaults");
+    let entries = match std::fs::read_dir(&parent) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MemberDir::open(&parent, &canonical)),
+        Err(e) => return Err(e.to_string()),
+    };
+    // Use a unique legacy spelling in place: renaming it could orphan path-bound keys.
+    let mut existing = None;
+    for entry in entries {
+        let name = entry.map_err(|e| e.to_string())?.file_name();
+        if let Some(name) = name.to_str().filter(|name| name.eq_ignore_ascii_case(&canonical)) {
+            if existing.replace(name.to_owned()).is_some() {
+                return Err("multiple directories for this vault; preserve both and resolve the conflict before restoring".into());
+            }
+        }
+    }
+    Ok(MemberDir::open(&parent, existing.as_deref().unwrap_or(&canonical)))
 }
 
 pub(super) fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, String> {
@@ -195,15 +241,15 @@ pub(super) fn load(data: &Path, pass: &str, vault: &str) -> Result<Ceremony, Str
         .read_sealed("ceremony.sealed", pass)
         .map_err(|e| e.to_string())?;
     let c: Ceremony = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
-    if c.vault != vault {
+    if vault_bytes(&c.vault)? != vault_bytes(vault)? {
         return Err("ceremony vault mismatch".into());
     }
     Ok(c)
 }
 
 fn save(data: &Path, pass: &str, c: &Ceremony) -> Result<(), String> {
-    let root = data.join("vaults");
-    let d = MemberDir::create(&root, &c.vault).map_err(|e| e.to_string())?;
+    let path = dir(data, &c.vault)?;
+    let d = MemberDir::create(path.path(), "").map_err(|e| e.to_string())?;
     save_to(&d, pass, c)
 }
 
@@ -321,6 +367,8 @@ fn invitations(c: &Ceremony) -> Result<Vec<Value>, String> {
                     members: c.members,
                     threshold: c.threshold,
                     name: c.name.clone(),
+                    creator: c.slots.get(&1).and_then(|s| s.identity.clone()),
+                    frostd_url: Some(c.frostd_url.clone()),
                 })
                 .map_err(|e| e.to_string())?,
             );
@@ -334,38 +382,135 @@ enum PeerRequestError {
     Rejected(String),
 }
 
-fn peer_request(method: &str, url: &str, body: Option<Value>) -> Result<Value, String> {
-    peer_request_result(method, url, body).map_err(|error| match error {
-        PeerRequestError::Unavailable(message) | PeerRequestError::Rejected(message) => message,
-    })
+impl PeerRequestError {
+    fn message(self) -> String {
+        match self {
+            Self::Unavailable(message) | Self::Rejected(message) => message,
+        }
+    }
 }
 
-fn peer_request_result(method: &str, url: &str, body: Option<Value>) -> Result<Value, PeerRequestError> {
+/// A joiner's request `op` (enroll, roster, agreed or session) to the creator: sealed over
+/// frostd when the invite named the creator, otherwise to the creator's HTTP route.
+fn ask_creator(config: &Config, data: &Path, pass: &str, c: &Ceremony, op: &str) -> Result<Value, PeerRequestError> {
+    let mut body = joiner_auth(c).map_err(PeerRequestError::Rejected)?;
+    let Some(creator) = &c.creator else {
+        if op == "enroll" {
+            body["identity"] = json!(c.slots.get(&c.my_slot).and_then(|s| s.identity.as_ref()));
+        }
+        return peer_request_result(config, &c.creator_base_url, &format!("/api/{op}"), body);
+    };
+    body["op"] = json!(op);
+    let me = identity(data, pass, c.my_slot).map_err(PeerRequestError::Rejected)?;
+    let creator = creator.public(1).map_err(PeerRequestError::Rejected)?;
+    relay_request(&c.frostd_url, &me, &creator, &c.vault, &body)
+}
+
+/// The sealed-envelope context of one join exchange between the creator (slot 1) and a joiner.
+fn join_context(vault: &str, session: Uuid, slot: u16) -> Result<SessionContext, String> {
+    Ok(SessionContext::control(vault_bytes(vault)?, session, 1, slot))
+}
+
+/// One join request over frostd: the joiner opens a session of itself and the creator, seals
+/// `body` to the creator, and waits for the creator's sealed reply on that session.
+fn relay_request(url: &str, me: &Identity, creator: &PublicIdentity, vault: &str, body: &Value)
+    -> Result<Value, PeerRequestError>
+{
+    use PeerRequestError::{Rejected, Unavailable};
+    let mut tx = super::payment::relay(me, url).map_err(Unavailable)?;
+    let ch = tx.open(&[Peer(me.public().encryption), Peer(creator.encryption)], 2)
+        .map_err(|e| Unavailable(e.to_string()))?;
+    let context = join_context(vault, ch.session_id(), me.public().id).map_err(Rejected)?;
+    let sealed = SealedPeer::seal_join(me, creator, &context, &serde_json::to_vec(body).map_err(|e| Rejected(e.to_string()))?)
+        .map_err(Rejected)?;
+    let reply = (|| {
+        tx.send(&ch, &[Peer(creator.encryption)], &Outbound::Peer(sealed))
+            .map_err(|e| Unavailable(e.to_string()))?;
+        // The creator polls frostd about once a second.
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(250));
+            for msg in tx.recv(&ch, false).map_err(|e| Unavailable(e.to_string()))? {
+                let Ok(opened) = me.open_session(creator, &context, &msg.message) else { continue };
+                if msg.from.0 != creator.encryption || opened.kind() != MessageKind::PeerReply {
+                    continue;
+                }
+                let reply: Value = serde_json::from_slice(opened.body()).map_err(|e| Rejected(e.to_string()))?;
+                return match reply["error"].as_str() {
+                    Some(e @ ("roster pending" | "session pending")) => Err(Unavailable(e.into())),
+                    Some(e) => Err(Rejected(e.into())),
+                    None => Ok(reply),
+                };
+            }
+        }
+        Err(Unavailable("the creator did not answer over frostd".into()))
+    })();
+    let _ = tx.close(ch);
+    reply
+}
+
+// Allow global unicast only, excluding special-use and transition ranges.
+fn public_peer_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !matches!(ip.octets(),
+            [0 | 10 | 127 | 224..=255, ..]
+            | [100, 64..=127, ..] | [169, 254, ..] | [172, 16..=31, ..] | [192, 168, ..]
+            | [192, 0, 0 | 2, _] | [192, 88, 99, _] | [198, 18 | 19, ..]
+            | [198, 51, 100, _] | [203, 0, 113, _]),
+        IpAddr::V6(ip) => matches!(ip.segments(), [0x2000..=0x3fff, ..])
+            && !matches!(ip.segments(), [0x2001, 0..=0x1ff | 0xdb8, ..] | [0x2002, ..]
+                | [0x3fff, 0..=0xfff, ..]),
+    }
+}
+
+fn peer_request_result(config: &Config, base: &str, route: &str, body: Value) -> Result<Value, PeerRequestError> {
+    use PeerRequestError::{Rejected, Unavailable};
+    let mut url = config.validate_peer_url(base).map_err(Rejected)?;
+    url.set_path(route);
     let runtime = tokio::runtime::Runtime::new()
-        .map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
+        .map_err(|e| Unavailable(e.to_string()))?;
     runtime.block_on(async {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
+        let mut client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
-            .build()
-            .map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
-        let req = if method == "POST" {
-            client.post(url).json(&body.unwrap_or(json!({})))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
+        let refused = || Rejected("creator origin must use public addresses outside local development".into());
+        let host = url.host_str().ok_or_else(refused)?;
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            // The origin policy only admits these two literals in local development.
+            if !matches!(host, "127.0.0.1" | "[::1]") && !public_peer_address(ip) {
+                return Err(refused());
+            }
         } else {
-            client.get(url)
-        };
-        let response = req.send().await.map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
+            let port = url.port_or_known_default().ok_or_else(refused)?;
+            let addresses: Vec<_> = tokio::time::timeout(Duration::from_secs(10), tokio::net::lookup_host((host, port)))
+                .await.map_err(|_| Unavailable("creator DNS lookup timed out".into()))?
+                .map_err(|e| Unavailable(format!("creator DNS lookup failed: {e}")))?
+                .collect();
+            if addresses.is_empty() {
+                return Err(Unavailable("creator DNS returned no addresses".into()));
+            }
+            if addresses.iter().any(|address| !public_peer_address(address.ip())) {
+                return Err(refused());
+            }
+            // Dial only the checked answers; retain the configured hostname for TLS.
+            client = client.resolve_to_addrs(host, &addresses);
+        }
+        let client = client.build().map_err(|e| Unavailable(e.to_string()))?;
+        let response = client.post(url).json(&body).send().await.map_err(|e| Unavailable(e.to_string()))?;
         let status = response.status();
-        let value: Value = response.json().await.map_err(|e| PeerRequestError::Unavailable(e.to_string()))?;
+        if status.is_redirection() {
+            return Err(Rejected("creator redirected the ceremony request".into()));
+        }
+        let value: Value = response.json().await.map_err(|e| Unavailable(e.to_string()))?;
         if !status.is_success() {
             let message = value["error"]
                 .as_str()
                 .unwrap_or("peer request failed")
                 .to_owned();
             return Err(if status.is_server_error() || matches!(status.as_u16(), 401 | 404 | 408 | 429) {
-                PeerRequestError::Unavailable(message)
+                Unavailable(message)
             } else {
-                PeerRequestError::Rejected(message)
+                Rejected(message)
             });
         }
         Ok(value)
@@ -437,7 +582,7 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
                 .peers
                 .get(&1)
                 .cloned()
-                .unwrap_or_else(|| format!("http://127.0.0.1:{}", st.config.port)),
+                .unwrap_or_else(|| st.config.base_url()),
             frostd_url: st.config.frostd_url.clone(),
             slots,
             fingerprint: None,
@@ -449,8 +594,10 @@ pub(super) async fn create(State(st): State<Shared>, Json(body): Json<Value>) ->
             error: None,
             birth_height: None,
             roster_code: None,
+            creator: None,
         };
         save(&data, &pass, &c)?;
+        spawn_join_relay(&st);
         Ok(json!({"vault":c.vault,"invites":invitations(&c)?}))
     })
     .await
@@ -479,8 +626,10 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
     {
         return err(StatusCode::BAD_REQUEST, "invalid invite");
     }
-    if let Err(e) = crate::transport::require_tls_off_loopback(&invite.creator_base_url) {
-        return err(StatusCode::BAD_REQUEST, e);
+    if let Some(creator) = &invite.creator {
+        if let Err(e) = creator.public(1) {
+            return err(StatusCode::BAD_REQUEST, e);
+        }
     }
     let (data, pass) = match unlocked(&st).await {
         Ok(x) => x,
@@ -490,13 +639,6 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let me = identity(&data, &pass, invite.slot)?;
         let wire = WireIdentity::from_public(me.public());
-        peer_request(
-            "POST",
-            &format!("{}/api/enroll", invite.creator_base_url),
-            Some(json!({
-                "vault":invite.vault,"slot":invite.slot,"token":invite.token,"identity":wire
-            })),
-        )?;
         let mut slots = BTreeMap::new();
         slots.insert(
             invite.slot,
@@ -523,11 +665,14 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             error: None,
             birth_height: None,
             roster_code: None,
+            creator: invite.creator,
         };
-        if dir(&data, &c.vault)?.exists("ceremony.sealed") {
+        let exists = dir(&data, &c.vault)?.exists("ceremony.sealed");
+        if exists {
             let old = load(&data, &pass, &c.vault)?;
             if old.my_slot != c.my_slot
                 || old.creator_base_url != c.creator_base_url
+                || old.creator != c.creator
                 || old
                     .slots
                     .get(&c.my_slot)
@@ -540,7 +685,9 @@ pub(super) async fn join(State(st): State<Shared>, Json(body): Json<Value>) -> R
             {
                 return Err("existing ceremony does not match invite".into());
             }
-        } else {
+        }
+        ask_creator(&st.config, &data, &pass, &c, "enroll").map_err(PeerRequestError::message)?;
+        if !exists {
             save(&data, &pass, &c)?;
         }
         Ok(json!({"vault":invite.vault}))
@@ -565,36 +712,41 @@ pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) ->
         Ok(x) => x,
         Err(e) => return e,
     };
-    blocking(move || {
-        let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = load(&data, &pass, &vault)?;
-        if c.my_slot != 1 {
-            return Err("only creator can enroll".into());
+    blocking(move || enroll_member(&st, &data, &pass, &vault, slot, &token, wire)).await
+}
+
+/// The creator records `wire` in `slot` for the holder of that slot's invite token.
+fn enroll_member(st: &Shared, data: &Path, pass: &str, vault: &str, slot: u16, token: &str, wire: WireIdentity)
+    -> Result<Value, String>
+{
+    wire.public(slot)?;
+    let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+    let mut c = load(data, pass, vault)?;
+    if c.my_slot != 1 {
+        return Err("only creator can enroll".into());
+    }
+    let target = c.slots.get_mut(&slot).ok_or("unknown slot")?;
+    let expected = target.pending_token.as_ref().ok_or("missing slot token")?;
+    if !token_eq(expected, token) {
+        return Err("invalid invite token".into());
+    }
+    if let Some(existing) = &target.identity {
+        if existing != &wire {
+            return Err("slot already enrolled".into());
         }
-        let target = c.slots.get_mut(&slot).ok_or("unknown slot")?;
-        let expected = target.pending_token.as_ref().ok_or("missing slot token")?;
-        if !token_eq(expected, &token) {
-            return Err("invalid invite token".into());
+    } else {
+        target.identity = Some(wire);
+    }
+    if c.slots.values().all(|s| s.identity.is_some()) {
+        c.fingerprint = Some(hex::encode(roster_of(&c)?.fingerprint()));
+        // Fixed with the roster so every member can show the roster code before agreeing.
+        let network = VaultNetwork::parse(&st.config.network)?;
+        if network == VaultNetwork::Testnet && c.birth_height.is_none() {
+            c.birth_height = Some(setup_birth_height(network, 1, None, || testnet_tip(st, network))?);
         }
-        if let Some(existing) = &target.identity {
-            if existing != &wire {
-                return Err("slot already enrolled".into());
-            }
-        } else {
-            target.identity = Some(wire);
-        }
-        if c.slots.values().all(|s| s.identity.is_some()) {
-            c.fingerprint = Some(hex::encode(roster_of(&c)?.fingerprint()));
-            // Fixed with the roster so every member can show the roster code before agreeing.
-            let network = VaultNetwork::parse(&st.config.network)?;
-            if network == VaultNetwork::Testnet && c.birth_height.is_none() {
-                c.birth_height = Some(setup_birth_height(network, 1, None, || testnet_tip(&st, network))?);
-            }
-        }
-        save(&data, &pass, &c)?;
-        Ok(json!({"ok":true}))
-    })
-    .await
+    }
+    save(data, pass, &c)?;
+    Ok(json!({"ok":true}))
 }
 
 fn token_eq(expected: &str, given: &str) -> bool {
@@ -650,17 +802,7 @@ pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) ->
         Ok(x) => x,
         Err(e) => return e,
     };
-    let reply = blocking(move || {
-        let c = for_joiner(&data, &pass, &body)?;
-        let fingerprint = c.fingerprint.ok_or("roster pending")?;
-        let roster: BTreeMap<_, _> = c
-            .slots
-            .into_iter()
-            .map(|(slot, s)| (slot, s.identity))
-            .collect();
-        Ok(json!({"fingerprint":fingerprint,"roster":roster,"birth_height":c.birth_height}))
-    })
-    .await;
+    let reply = blocking(move || roster_reply(&data, &pass, &body)).await;
     if reply.1 .0["error"] == "roster pending" {
         err(StatusCode::NOT_FOUND, "roster pending")
     } else {
@@ -668,15 +810,22 @@ pub(super) async fn roster(State(st): State<Shared>, Json(body): Json<Value>) ->
     }
 }
 
-fn refresh_roster(c: &mut Ceremony) -> Result<(), String> {
+fn roster_reply(data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
+    let c = for_joiner(data, pass, body)?;
+    let fingerprint = c.fingerprint.ok_or("roster pending")?;
+    let roster: BTreeMap<_, _> = c
+        .slots
+        .into_iter()
+        .map(|(slot, s)| (slot, s.identity))
+        .collect();
+    Ok(json!({"fingerprint":fingerprint,"roster":roster,"birth_height":c.birth_height}))
+}
+
+fn refresh_roster(config: &Config, data: &Path, pass: &str, c: &mut Ceremony) -> Result<(), String> {
     if c.my_slot == 1 {
         return Ok(());
     }
-    let remote = peer_request(
-        "POST",
-        &format!("{}/api/roster", c.creator_base_url),
-        Some(joiner_auth(c)?),
-    )?;
+    let remote = ask_creator(config, data, pass, c, "roster").map_err(PeerRequestError::message)?;
     let fingerprint = remote["fingerprint"]
         .as_str()
         .ok_or("missing roster fingerprint")?;
@@ -731,17 +880,20 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
         let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
         let mut c = load(&data, &pass, &vault)?;
         if c.my_slot != 1 && c.fingerprint.is_none() {
-            if refresh_roster(&mut c).is_ok() {
+            if refresh_roster(&st.config, &data, &pass, &mut c).is_ok() {
                 save(&data, &pass, &c)?;
             }
         }
         let active = dir(&data, &vault)?.exists("vault.sealed");
+        let local_agreed = c.agreed.contains(&c.my_slot);
+        let confirmed = local_agreed && (active || c.roster_code.is_some());
+        let confirmations = c.agreed.len() - usize::from(local_agreed && !confirmed);
         let running_here = st.active_dkgs.lock().map_err(|e| e.to_string())?.contains(&vault);
         let phase = if active {
             "active"
         } else if c.error.is_some() || (c.dkg_started && !running_here) {
             "setup_interrupted"
-        } else if c.dkg_started || (c.my_slot == 1 && c.agreed.len() == usize::from(c.members)) {
+        } else if c.dkg_started || (c.my_slot == 1 && confirmations == usize::from(c.members)) {
             "creating_keys"
         } else if c.fingerprint.is_some() {
             "compare_roster"
@@ -749,19 +901,22 @@ pub(super) async fn status(st: Shared, vault: String) -> Reply {
             "waiting_for_members"
         };
         let mut value = json!({"phase":phase,"members":c.members,"threshold":c.threshold,
-            "confirmations":c.agreed.len(),"confirmed":c.agreed.contains(&c.my_slot),
-            "fingerprint":c.fingerprint});
+            "confirmations":confirmations,"confirmed":confirmed,
+            "fingerprint":c.fingerprint,"secure_element":st.config.secure_element});
         if c.fingerprint.is_some() {
             value["roster_code"] = json!(setup_roster_code(&c, VaultNetwork::parse(&st.config.network)?).ok());
         }
         // LokiSigner asks the member to compare the code; the page shows where that stands.
-        if st.roster_confirmation.is_some() {
+        if st.config.native && st.roster_confirmation.is_some() {
             let open = st.roster_asking.lock().map_err(|e| e.to_string())?.as_deref() == Some(vault.as_str());
             let differ = st.roster_refused.lock().map_err(|e| e.to_string())?.contains(&vault);
             value["roster_dialog"] = if differ { json!("codes_differ") } else if open { json!("open") } else { Value::Null };
         }
-        if c.my_slot == 1 {
+        if c.my_slot == 1 && matches!(phase, "waiting_for_members" | "compare_roster") {
             value["invites"] = json!(invitations(&c)?);
+            if !active {
+                spawn_join_relay(&st);
+            }
         }
         if let Some(error) = c.error {
             value["error"] = json!(error);
@@ -800,12 +955,8 @@ fn spawn_dkg(st: Shared, vault: String, data: std::path::PathBuf, pass: Zeroizin
 /// `POST /api/agree`: this member agrees to the roster whose fingerprint and 24-digit code the
 /// request names, once setup has not started, the roster is fresh and both match.
 ///
-/// With LokiSigner's roster channel attached ([`AppState::roster_confirmation`]), the request
-/// cannot agree by itself: LokiSigner shows the member the code derived here and only their
-/// "Codes match" records agreement. A headless member (`loki_member_app`, `LokiSigner serve`)
-/// has no screen and trusts its caller to have compared the code with the other members.
-///
-/// [`AppState::roster_confirmation`]: super::state::AppState::roster_confirmation
+/// The request only opens a local prompt (LokiSigner or the foreground terminal).
+/// Without an affirmative answer, it never records this member's agreement.
 pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     let (Some(vault), Some(fingerprint), Some(roster_code)) =
         (body["vault"].as_str(), body["fingerprint"].as_str(), body["roster_code"].as_str())
@@ -824,15 +975,11 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
     let reply = blocking(move || {
         let (st, data, pass, vault) = (&work_st, &work_data, &work_pass, &work_vault);
         let network = VaultNetwork::parse(&st.config.network)?;
-        let Some(confirm) = st.roster_confirmation.clone() else {
-            let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-            let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
-            return record_agreement(data, pass, c, code);
-        };
+        let confirm = st.roster_confirmation.as_ref().ok_or(ROSTER_NOT_CONFIRMED)?;
         let _asking = RosterAsking::claim(st, vault)?;
         let summary = {
             let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
-            let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)?;
+            let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)?;
             roster_summary(&c, network, &code)
         };
         // The member may take minutes to compare codes by phone: other requests need the
@@ -853,9 +1000,9 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
         }
         // Everything is checked again: the member confirmed the code of the roster shown, and
         // the request names that same code, so any change to the roster or the setup refuses.
-        let (c, code) = agreement(data, pass, vault, &fingerprint, &roster_code, network)
+        let (c, code) = agreement(&st.config, data, pass, vault, &fingerprint, &roster_code, network)
             .map_err(|e| format!("{ROSTER_CHANGED}: {e}"))?;
-        record_agreement(data, pass, c, code)
+        record_agreement(&st.config, data, pass, c, code)
     })
     .await;
     if reply.0 == StatusCode::OK {
@@ -866,8 +1013,8 @@ pub(super) async fn agree(State(st): State<Shared>, Json(body): Json<Value>) -> 
 
 /// The member chose "Codes differ" in LokiSigner; it refuses this vault until it restarts.
 const ROSTER_CODES_DIFFER: &str = "roster codes differ: LokiSigner refuses this vault until it restarts";
-/// The LokiSigner dialog closed or timed out; a new request asks again.
-const ROSTER_NOT_CONFIRMED: &str = "roster code not confirmed in LokiSigner";
+/// No local prompt was available or the member did not answer; a new request can ask again.
+const ROSTER_NOT_CONFIRMED: &str = "roster code not confirmed locally";
 /// LokiSigner already shows a roster dialog.
 const ROSTER_ASKING: &str = "LokiSigner is already asking about a roster code";
 /// The setup changed while LokiSigner asked; nothing was recorded.
@@ -905,13 +1052,13 @@ impl Drop for RosterAsking<'_> {
 /// from the creator, and the request's fingerprint and code are this roster's. Returns the
 /// ceremony and the code of its setup document.
 fn agreement(
-    data: &Path, pass: &str, vault: &str, fingerprint: &str, roster_code: &str, network: VaultNetwork,
+    config: &Config, data: &Path, pass: &str, vault: &str, fingerprint: &str, roster_code: &str, network: VaultNetwork,
 ) -> Result<(Ceremony, String), String> {
     let mut c = load(data, pass, vault)?;
     if c.dkg_started || c.error.is_some() {
         return Err("DKG interrupted or already running; create a fresh vault if interrupted".into());
     }
-    refresh_roster(&mut c)?;
+    refresh_roster(config, data, pass, &mut c)?;
     if c.fingerprint.as_deref() != Some(fingerprint) {
         return Err("roster fingerprint mismatch".into());
     }
@@ -923,13 +1070,9 @@ fn agreement(
 }
 
 /// Tells the creator (a joiner only) and records this member's agreement and confirmed code.
-fn record_agreement(data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
+fn record_agreement(config: &Config, data: &Path, pass: &str, mut c: Ceremony, code: String) -> Result<Value, String> {
     if c.my_slot != 1 {
-        peer_request(
-            "POST",
-            &format!("{}/api/agreed", c.creator_base_url),
-            Some(joiner_auth(&c)?),
-        )?;
+        ask_creator(config, data, pass, &c, "agreed").map_err(PeerRequestError::message)?;
     }
     c.agreed.insert(c.my_slot);
     c.roster_code = Some(code);
@@ -967,21 +1110,22 @@ pub(super) async fn agreed(State(st): State<Shared>, Json(body): Json<Value>) ->
     let work_data = data.clone();
     let work_pass = pass.clone();
     let work_st = st.clone();
-    let reply = blocking(move || {
-        let _guard = work_st.ceremony.lock().map_err(|e| e.to_string())?;
-        let mut c = for_joiner(&work_data, &work_pass, &body)?;
-        if c.fingerprint.is_none() {
-            return Err("roster pending".into());
-        }
-        c.agreed.insert(slot);
-        save(&work_data, &work_pass, &c)?;
-        Ok(json!({"ok":true}))
-    })
-    .await;
+    let reply = blocking(move || agreed_member(&work_st, &work_data, &work_pass, &body, slot)).await;
     if reply.0 == StatusCode::OK {
         spawn_dkg(st, vault, data, pass);
     }
     reply
+}
+
+fn agreed_member(st: &Shared, data: &Path, pass: &str, body: &Value, slot: u16) -> Result<Value, String> {
+    let _guard = st.ceremony.lock().map_err(|e| e.to_string())?;
+    let mut c = for_joiner(data, pass, body)?;
+    if c.fingerprint.is_none() {
+        return Err("roster pending".into());
+    }
+    c.agreed.insert(slot);
+    save(data, pass, &c)?;
+    Ok(json!({"ok":true}))
 }
 
 pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
@@ -989,26 +1133,134 @@ pub(super) async fn session(State(st): State<Shared>, Json(body): Json<Value>) -
         Ok(x) => x,
         Err(e) => return e,
     };
-    let reply = blocking(move || {
-        let c = for_joiner(&data, &pass, &body)?;
-        if let Some(error) = c.error {
-            return Err(format!("Creator setup failed: {error}"));
-        }
-        if c.agreed.len() != usize::from(c.members) {
-            return Err("session pending".into());
-        }
-        Ok(json!({
-            "session_id": c.session_id.ok_or("session pending")?,
-            "coordinator_peer": c.coordinator_peer,
-            "vs_session_id": c.vs_session_id,
-            "birth_height": c.birth_height,
-        }))
-    })
-    .await;
+    let reply = blocking(move || session_reply(&data, &pass, &body)).await;
     if reply.1 .0["error"] == "session pending" {
         err(StatusCode::NOT_FOUND, "session pending")
     } else {
         reply
+    }
+}
+
+fn session_reply(data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
+    let c = for_joiner(data, pass, body)?;
+    if let Some(error) = c.error {
+        return Err(format!("Creator setup failed: {error}"));
+    }
+    if c.agreed.len() != usize::from(c.members) {
+        return Err("session pending".into());
+    }
+    Ok(json!({
+        "session_id": c.session_id.ok_or("session pending")?,
+        "coordinator_peer": c.coordinator_peer,
+        "vs_session_id": c.vs_session_id,
+        "birth_height": c.birth_height,
+    }))
+}
+
+/// Starts the creator's loop that answers joiners over frostd, unless it runs. It holds the
+/// app state weakly and stops once the profile locks or no ceremony it created is still setting up.
+pub(super) fn spawn_join_relay(st: &Shared) {
+    if st.join_relay.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let weak = std::sync::Arc::downgrade(st);
+    tokio::task::spawn_blocking(move || {
+        let mut relay = None;
+        while let Some(st) = weak.upgrade() {
+            match serve_joins(&st, &mut relay) {
+                Ok(true) => {}
+                Ok(false) => {
+                    st.join_relay.store(false, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+                Err(e) => {
+                    eprintln!("join relay: {e}");
+                    relay = None;
+                }
+            }
+            drop(st);
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+/// Vaults this member created whose members are still joining.
+pub(super) fn waiting_for_joiners(data: &Path, pass: &str) -> Vec<String> {
+    std::fs::read_dir(data.join("vaults")).into_iter().flatten().flatten()
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .filter(|vault| dir(data, vault).is_ok_and(|d| !d.exists("vault.sealed")))
+        .filter(|vault| load(data, pass, vault).is_ok_and(|c| c.my_slot == 1 && c.slots.get(&1).is_some_and(|s| s.identity.is_some())))
+        .collect()
+}
+
+/// One pass of the creator's join relay: every two-member session a joiner opened with the
+/// creator is drained, and each request sealed to the creator for a ceremony it is still
+/// setting up is answered on that session. Returns whether there is still a ceremony to serve.
+fn serve_joins(st: &Shared, relay: &mut Option<FrostdTransport>) -> Result<bool, String> {
+    let Some((data, pass)) = st.session.blocking_read().as_ref().map(|s| (s.data.clone(), s.passphrase.clone())) else {
+        return Ok(false);
+    };
+    let waiting = waiting_for_joiners(&data, &pass);
+    if waiting.is_empty() {
+        return Ok(false);
+    }
+    let me = identity(&data, &pass, 1)?;
+    let mine = me.public().encryption;
+    let tx = match relay {
+        Some(tx) => tx,
+        None => relay.insert(super::payment::member_relay(st, &me)?),
+    };
+    for session in tx.list_sessions().map_err(|e| e.to_string())? {
+        let Ok((participants, Some(owner))) = tx.session_details(session) else { continue };
+        // Payment and DKG sessions have every member, or an owner outside them.
+        if participants.len() != 2 || owner == mine || !participants.contains(&mine) || !participants.contains(&owner) {
+            continue;
+        }
+        let ch = tx.join(session).map_err(|e| e.to_string())?;
+        for msg in tx.recv_control_bounded(session, Duration::from_secs(5)).map_err(|e| e.to_string())? {
+            let Some((joiner, context, body)) = open_join(&me, &waiting, session, &msg.from.0, &msg.message) else {
+                continue;
+            };
+            let reply = answer_join(st, &data, &pass, &joiner, body).unwrap_or_else(|e| json!({"error": e}));
+            let sealed = SealedPeer::seal(&me, &joiner, &context, MessageKind::PeerReply,
+                &serde_json::to_vec(&reply).map_err(|e| e.to_string())?)?;
+            tx.send(&ch, &[Peer(joiner.encryption)], &Outbound::Peer(sealed)).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(true)
+}
+
+/// A join request relay sender `from` sealed to the creator `me` for one of the `waiting`
+/// vaults on `session`: the joiner's identity, the context to answer under, and the request.
+fn open_join(me: &Identity, waiting: &[String], session: Uuid, from: &[u8; 32], wire: &[u8])
+    -> Option<(PublicIdentity, SessionContext, Value)>
+{
+    let (joiner, sealed) = SealedPeer::join_sender(from, wire).ok()?;
+    waiting.iter().find_map(|vault| {
+        let context = join_context(vault, session, joiner.id).ok()?;
+        let opened = me.open_session(&joiner, &context, sealed).ok()?;
+        let body: Value = serde_json::from_slice(opened.body()).ok()?;
+        if opened.kind() != MessageKind::PeerRequest || body["vault"] != vault.as_str() || body["slot"] != joiner.id {
+            return None;
+        }
+        Some((joiner.clone(), context, body))
+    })
+}
+
+/// The creator's answer to one joiner request: the same logic as the HTTP routes.
+fn answer_join(st: &Shared, data: &Path, pass: &str, joiner: &PublicIdentity, body: Value) -> Result<Value, String> {
+    let vault = body["vault"].as_str().ok_or("missing vault")?.to_owned();
+    let token = body["token"].as_str().ok_or("missing token")?;
+    match body["op"].as_str() {
+        Some("enroll") => enroll_member(st, data, pass, &vault, joiner.id, token, WireIdentity::from_public(joiner.clone())),
+        Some("roster") => roster_reply(data, pass, &body),
+        Some("agreed") => {
+            let reply = agreed_member(st, data, pass, &body, joiner.id)?;
+            spawn_dkg(st.clone(), vault, data.to_owned(), Zeroizing::new(pass.to_owned()));
+            Ok(reply)
+        }
+        Some("session") => session_reply(data, pass, &body),
+        _ => Err("unknown join request".into()),
     }
 }
 
@@ -1119,8 +1371,8 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
         if c.dkg_started || c.error.is_some() || dir(data, vault_id)?.exists("vault.sealed") {
             return Ok(json!({"ok":true}));
         }
-        if (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
-            || (c.my_slot != 1 && !c.agreed.contains(&c.my_slot))
+        if c.roster_code.is_none() || !c.agreed.contains(&c.my_slot)
+            || (c.my_slot == 1 && c.agreed.len() != usize::from(c.members))
         {
             return Ok(json!({"ok":true}));
         }
@@ -1132,9 +1384,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
                 if st.session.blocking_read().is_none() {
                     return Ok(json!({"ok":true}));
                 }
-                match peer_request_result(
-                    "POST", &format!("{}/api/session", c.creator_base_url), Some(joiner_auth(&c)?),
-                ) {
+                match ask_creator(&st.config, data, pass, &c, "session") {
                     Ok(response) => {
                         let id = response["session_id"].as_str()
                             .and_then(|id| Uuid::parse_str(id).ok()).ok_or("invalid creator session")?;
@@ -1210,7 +1460,7 @@ fn run_background(st: Shared, data: &Path, pass: &str, vault_id: &str) -> Result
             VaultNetwork::Testnet => Network::Testnet,
         };
         // DKG never signs a payment; any request still goes to the member, or is refused.
-        let mut prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot));
+        let mut prompts = hosted_prompts(&signer_dir, pass, super::approval_policy(st.approval.clone(), signer_network, c.my_slot, None));
         // Matches only the code this member confirmed in `agree`.
         let confirmed = c.roster_code.clone();
         prompts.roster = Box::new(move |code| roster_decision(confirmed.as_deref(), code));
@@ -1347,6 +1597,7 @@ mod tests {
             error: None,
             birth_height: None,
             roster_code: None,
+            creator: None,
         };
         let fingerprint = roster_of(&c).unwrap().fingerprint();
         assert_eq!(fingerprint, roster_of(&c).unwrap().fingerprint());
@@ -1362,35 +1613,38 @@ mod tests {
         std::fs::create_dir_all(&data).unwrap();
         let vault = hex::encode([8u8; 32]);
         let slots = (1..=3)
-            .map(|slot| (slot, Slot { identity: None, pending_token: Some("token".into()) }))
+            .map(|slot| (slot, Slot { identity: Some(WireIdentity::from_public(Identity::new(slot).public())), pending_token: None }))
             .collect();
-        let ceremony = Ceremony {
+        let mut ceremony = Ceremony {
             vault: vault.clone(), name: "test".into(), members: 3, threshold: 2,
             my_slot: 1, creator_base_url: String::new(), frostd_url: String::new(),
-            slots, fingerprint: Some("fingerprint".into()), agreed: BTreeSet::new(),
+            slots, fingerprint: None, agreed: BTreeSet::from([1, 2, 3]),
             session_id: None, coordinator_peer: None, vs_session_id: None,
-            dkg_started: true, error: None, birth_height: None, roster_code: None,
+            dkg_started: true, error: None, birth_height: None, roster_code: None, creator: None,
         };
+        let fingerprint = hex::encode(roster_of(&ceremony).unwrap().fingerprint());
+        let code = setup_roster_code(&ceremony, VaultNetwork::Regtest).unwrap();
+        ceremony.fingerprint = Some(fingerprint.clone());
+        ceremony.roster_code = Some(code.clone());
         save(&data, "pass", &ceremony).unwrap();
-        let st = std::sync::Arc::new(AppState::new(Config {
-            data: data.clone(), port: 3001, network: "regtest".into(), native: false,
-            lightwalletd: None, transport: "local".into(), operator_bundle: None,
-            operator_key: None, enrollment_issuer: None, development_http: false,
-            token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
-            peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
-            secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
-        }));
+        let st = std::sync::Arc::new(AppState {
+            roster_confirmation: Some(std::sync::Arc::new(|_| panic!("interrupted setup must not open a local prompt"))),
+            ..AppState::new(test_config(&data, 3001))
+        });
         *st.session.write().await = Some(Session {
             passphrase: Zeroizing::new("pass".into()), data: data.clone(),
         });
 
         let reply = status(st.clone(), vault.clone()).await;
         assert_eq!(reply.1 .0["phase"], "setup_interrupted");
-        let reply = agree(State(st), Json(json!({"vault":vault,"fingerprint":"fingerprint","roster_code":"code"}))).await;
+        let reply = agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)).await;
         assert_eq!(reply.0, StatusCode::BAD_REQUEST);
         assert!(reply.1 .0["error"].as_str().unwrap().contains("interrupted"));
-        assert!(load(&data, "pass", &vault).unwrap().dkg_started);
+        assert!(st.active_dkgs.lock().unwrap().is_empty());
+        let saved = load(&data, "pass", &vault).unwrap();
+        assert!(saved.dkg_started);
+        assert_eq!(saved.agreed, ceremony.agreed);
+        assert_eq!(saved.roster_code, ceremony.roster_code);
         std::fs::remove_dir_all(data).unwrap();
     }
 
@@ -1413,6 +1667,7 @@ mod tests {
             peers: BTreeMap::new(),
             registration: None,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             secure_element: "software".into(),
             nonce_witnesses: None,
@@ -1495,7 +1750,7 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }));
         for (name, members, threshold, error) in [
@@ -1509,6 +1764,170 @@ mod tests {
             assert_eq!(status, StatusCode::BAD_REQUEST);
             assert_eq!(reply["error"], error, "{members} {threshold}");
         }
+    }
+
+    #[tokio::test]
+    async fn invites_carry_the_advertised_url() {
+        let data = std::env::temp_dir().join(format!("loki-advertise-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&data).unwrap();
+        let config = Config { advertise_url: Some("https://creator.example/".into()), ..test_config(&data, 3001) };
+        let st = std::sync::Arc::new(AppState::new(config));
+        *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.clone() });
+        let created = create(State(st), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        for item in created.1 .0["invites"].as_array().unwrap() {
+            let invite: Invite = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(item["code"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(invite.creator_base_url, "https://creator.example");
+        }
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// The creator answers only a join request sealed by the identity it names, for a vault it
+    /// is setting up, and only with that slot's invite token.
+    #[tokio::test]
+    async fn a_forged_or_wrong_token_join_request_is_refused() {
+        let data = std::env::temp_dir().join(format!("loki-join-forged-{}", Uuid::new_v4()));
+        let st = member(&data, 3601, None).await;
+        let created = create(State(st.clone()), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        let invite: Invite = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(created.1 .0["invites"][0]["code"].as_str().unwrap()).unwrap()).unwrap();
+        let creator = identity(&data, "pass", 1).unwrap();
+        assert!(invite.creator == Some(WireIdentity::from_public(creator.public())));
+        let (joiner, attacker) = (Identity::new(2), Identity::new(2));
+        let session = Uuid::new_v4();
+        let context = join_context(&vault, session, 2).unwrap();
+        let body = json!({"op":"enroll","vault":vault,"slot":2,"token":invite.token});
+        let wire = |own: &Identity, context: &SessionContext, body: &Value| {
+            Outbound::Peer(SealedPeer::seal_join(own, &creator.public(), context, &serde_json::to_vec(body).unwrap()).unwrap())
+                .to_bytes().unwrap()
+        };
+        let from = joiner.public().encryption;
+        let honest = wire(&joiner, &context, &body);
+        assert!(open_join(&creator, &[vault.clone()], session, &from, &honest).is_some());
+
+        // Sealed by another key than the relay sender's, signed by another key than the one it
+        // names, unsealed, for another session, or naming another slot: none opens.
+        let mut renamed = wire(&attacker, &context, &body);
+        renamed[2..34].copy_from_slice(&joiner.public().signing);
+        let mut unsealed = honest[..34].to_vec();
+        unsealed.extend(serde_json::to_vec(&body).unwrap());
+        let mut other_slot = honest.clone();
+        other_slot[..2].copy_from_slice(&3u16.to_be_bytes());
+        for (from, forged) in [
+            (from, wire(&attacker, &context, &body)),
+            (attacker.public().encryption, renamed),
+            (from, unsealed),
+            (from, wire(&joiner, &join_context(&vault, Uuid::new_v4(), 2).unwrap(), &body)),
+            (from, other_slot),
+        ] {
+            assert!(open_join(&creator, &[vault.clone()], session, &from, &forged).is_none());
+        }
+        assert!(open_join(&creator, &[hex::encode([1u8; 32])], session, &from, &honest).is_none());
+
+        let (joiner_public, _, _) = open_join(&creator, &[vault.clone()], session, &from, &honest).unwrap();
+        for (op, error) in [("enroll", "invalid invite token"), ("roster", "invalid member token"), ("session", "invalid member token")] {
+            let wrong = json!({"op":op,"vault":vault,"slot":2,"token":tokens_other(&invite.token)});
+            assert_eq!(answer_join(&st, &data, "pass", &joiner_public, wrong).unwrap_err(), error);
+        }
+        assert!(load(&data, "pass", &vault).unwrap().slots[&2].identity.is_none());
+        assert_eq!(answer_join(&st, &data, "pass", &joiner_public, body).unwrap(), json!({"ok":true}));
+        assert!(load(&data, "pass", &vault).unwrap().slots[&2].identity == Some(WireIdentity::from_public(joiner.public())));
+        *st.session.write().await = None;
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    /// A token of the same length that differs in its last byte.
+    fn tokens_other(token: &str) -> String {
+        format!("{}{}", &token[..token.len() - 1], if token.ends_with('A') { 'B' } else { 'A' })
+    }
+
+    /// Two joiners on their own data dirs join, agree and finish DKG with the creator over
+    /// frostd alone: the invite's HTTP URL is a closed port. Needs `FROSTD_URL`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unlocking_a_creator_mid_setup_restarts_its_join_loop() {
+        let data = std::env::temp_dir().join(format!("loki-join-unlock-{}", Uuid::new_v4()));
+        let st = member(&data, 3001, None).await;
+        let created = create(State(st.clone()), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+        assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+        let running = |st: &Shared| st.join_relay.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(running(&st));
+        st.lock_session().await;
+        for _ in 0..50 {
+            if !running(&st) { break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!running(&st), "the loop stops when the profile locks");
+        let session = Session { passphrase: Zeroizing::new("pass".into()), data: data.clone() };
+        assert!(st.activate_session(st.session_generation(), session).await);
+        assert!(running(&st), "unlock restarts the loop without a status call");
+        st.lock_session().await;
+        std::fs::remove_dir_all(data).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_join_completes_over_frostd_without_the_creators_http_routes() {
+        let Ok(url) = std::env::var("FROSTD_URL") else {
+            eprintln!("FROSTD_URL unset; skipped");
+            return;
+        };
+        let root = std::env::temp_dir().join(format!("loki-join-relay-{}", Uuid::new_v4()));
+        let mut members = Vec::new();
+        let mut dialogs = Vec::new();
+        for name in ["creator", "joiner2", "joiner3"] {
+            let data = root.join(name);
+            std::fs::create_dir_all(&data).unwrap();
+            let config = Config { frostd_url: url.clone(), advertise_url: Some("http://127.0.0.1:9".into()), ..test_config(&data, 3601) };
+            let (confirm, dialog) = Dialog::new();
+            let st = std::sync::Arc::new(AppState { roster_confirmation: Some(confirm), ..AppState::new(config) });
+            *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data });
+            members.push(st);
+            dialogs.push(dialog);
+        }
+        // Locking ends every member's waits, so the runtime stops even when an assertion fails.
+        struct LockOnDrop(Vec<Shared>);
+        impl Drop for LockOnDrop {
+            fn drop(&mut self) {
+                for st in &self.0 {
+                    if let Ok(mut session) = st.session.try_write() { *session = None; }
+                }
+            }
+        }
+        let _lock = LockOnDrop(members.clone());
+        let created = create(State(members[0].clone()), Json(json!({"name":"relay","members":3,"threshold":2}))).await;
+        assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+        let vault = created.1 .0["vault"].as_str().unwrap().to_owned();
+        for slot in 2..=3usize {
+            let code = created.1 .0["invites"].as_array().unwrap().iter()
+                .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap();
+            let invite: Invite = serde_json::from_slice(&base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(code).unwrap()).unwrap();
+            assert_eq!(invite.creator_base_url, "http://127.0.0.1:9");
+            let reply = join(State(members[slot - 1].clone()), Json(json!({"invite":code}))).await;
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        }
+        for (st, dialog) in members.iter().zip(dialogs) {
+            let (fingerprint, code, signer_code) = compare(st, &vault).await;
+            let request = tokio::spawn(agree(State(st.clone()), agree_body(&vault, &fingerprint, &code)));
+            assert_eq!(dialog.open()["roster_code"], signer_code.as_str());
+            dialog.answer.send(crate::host::RosterAnswer::Match).unwrap();
+            let reply = request.await.unwrap();
+            assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        }
+        let mut addresses = BTreeSet::new();
+        for st in &members {
+            let deadline = std::time::Instant::now() + Duration::from_secs(180);
+            loop {
+                let reply = status(st.clone(), vault.clone()).await.1 .0;
+                if reply["phase"] == "active" { break; }
+                assert!(reply.get("error").is_none() && std::time::Instant::now() < deadline, "{reply}");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            let query = BTreeMap::from([("vault".to_owned(), vault.clone())]);
+            addresses.insert(address(State(st.clone()), Query(query)).await.1 .0["address"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(addresses.len(), 1, "{addresses:?}");
+        drop(_lock);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1529,7 +1948,7 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
         }));
         *st.session.write().await = Some(Session {
@@ -1571,10 +1990,9 @@ mod tests {
         }
         let reply = agree(State(st.clone()),
             Json(json!({"vault":vault,"fingerprint":fingerprint,"roster_code":code}))).await;
-        assert_eq!(reply.0, StatusCode::OK, "{}", reply.1 .0);
+        assert_eq!(reply.1 .0["error"], ROSTER_NOT_CONFIRMED);
         let c = load(&data, "pass", &vault).unwrap();
-        assert!(c.agreed.contains(&1));
-        assert_eq!(c.roster_code.as_deref(), Some(code.as_str()));
+        assert!(c.agreed.is_empty() && c.roster_code.is_none());
 
         // On Testnet the code covers the birth height fixed with the roster.
         let mut c = c;
@@ -1593,15 +2011,54 @@ mod tests {
             operator_key: None, enrollment_issuer: None, development_http: false,
             token: "test".into(), frostd_url: "http://127.0.0.1:2744".into(),
             peers: BTreeMap::new(),
-            registration: None, bind: "127.0.0.1".parse().unwrap(), advertise_url: None,
+            registration: None, bind: "127.0.0.1".parse().unwrap(), peer_port: None, advertise_url: None,
             secure_element: "software".into(), nonce_witnesses: None, loopback_peers: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn status_reports_the_configured_secure_element() {
+        let client = reqwest::Client::new();
+        for element in ["apple", "software"] {
+            let data = std::env::temp_dir().join(format!("loki-storage-status-{}", Uuid::new_v4()));
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let config = Config { secure_element: element.into(), ..test_config(&data, addr.port()) };
+            // Status describes the configuration; no platform key is needed to report it.
+            let st = std::sync::Arc::new(AppState::new(config));
+            let router = crate::host::routes::router(st.clone());
+            tokio::spawn(async move { axum::serve(listener, router).await });
+            let status = |query: &str| client.get(format!("http://{addr}/api/status{query}"))
+                .header("x-loki-token", "test");
+            let read = |response: reqwest::RequestBuilder| async move {
+                response.send().await.unwrap().error_for_status().unwrap().json::<Value>().await.unwrap()
+            };
+
+            let new_profile = read(status("")).await;
+            assert_eq!(new_profile["phase"], "new_profile");
+            assert_eq!(new_profile["secure_element"], element);
+
+            crate::profile::create(&data, "pass", "test").unwrap();
+            *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.clone() });
+            let created = create(State(st), Json(json!({"name":"test","members":3,"threshold":2}))).await;
+            assert_eq!(created.0, StatusCode::OK, "{}", created.1 .0);
+            let vault = created.1 .0["vault"].as_str().unwrap();
+
+            let home = read(status("")).await;
+            assert_eq!(home["phase"], "home");
+            assert_eq!(home["secure_element"], element);
+            let setup = read(status(&format!("?vault={vault}"))).await;
+            assert_eq!(setup["phase"], "waiting_for_members");
+            assert_eq!(setup["secure_element"], element);
+            std::fs::remove_dir_all(data).unwrap();
         }
     }
 
     /// An unlocked member on `data`, with LokiSigner's roster dialog when `dialog` is given.
     async fn member(data: &Path, port: u16, dialog: Option<crate::host::LocalRosterConfirmation>) -> Shared {
         std::fs::create_dir_all(data).unwrap();
-        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(test_config(data, port)) });
+        let config = Config { native: dialog.is_some(), ..test_config(data, port) };
+        let st = std::sync::Arc::new(AppState { roster_confirmation: dialog, ..AppState::new(config) });
         *st.session.write().await = Some(Session { passphrase: Zeroizing::new("pass".into()), data: data.to_owned() });
         st
     }
@@ -1647,7 +2104,15 @@ mod tests {
                 .find(|item| item["slot"] == slot).unwrap()["code"].as_str().unwrap().to_owned();
             invites.insert(slot, code.clone());
             let reply = match (slot, joiner) {
-                (2, Some(joiner)) => join(State(joiner.clone()), Json(json!({"invite":code}))).await,
+                // An invite without the creator's identity: the joiner reaches the creator over
+                // HTTP, so the test needs no relay.
+                (2, Some(joiner)) => {
+                    let mut fields: Value = serde_json::from_slice(
+                        &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&code).unwrap()).unwrap();
+                    fields.as_object_mut().unwrap().remove("creator");
+                    let code = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(fields.to_string());
+                    join(State(joiner.clone()), Json(json!({"invite":code}))).await
+                }
                 _ => {
                     let invite: Invite = serde_json::from_slice(
                         &base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&code).unwrap()).unwrap();
@@ -1863,7 +2328,7 @@ mod tests {
         let mut pubkeys = Vec::with_capacity(64);
         pubkeys.extend_from_slice(&rkey.public_bytes());
         pubkeys.extend_from_slice(&rkey.signing_public());
-        std::fs::write(data.join("recovery.pub"), &pubkeys).unwrap();
+        crate::host::recovery::adopt_recovery(&data, &rkey, pass).unwrap();
         drop(rkey);
 
         let (material, shares, public) = dealer_vault(&data, vault, pass);
@@ -1873,6 +2338,7 @@ mod tests {
         // Activation seals the recovery backup — the wiring under test.
         crate::host::recovery::seal_vault_backup(&data, &sdir, &vault, pass).unwrap();
         let blob = std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap();
+        let fingerprint = BackupArtifact(blob.clone()).fingerprint();
         assert!(
             !blob.windows(share_bytes.len()).any(|w| w == share_bytes.as_slice()),
             "the recovery backup is HPKE ciphertext, never the share plaintext",
@@ -1888,6 +2354,7 @@ mod tests {
             data: data.clone(),
             port: 3001,
             bind: "127.0.0.1".parse().unwrap(),
+            peer_port: None,
             advertise_url: None,
             network: "regtest".into(),
             lightwalletd: None,
@@ -1907,12 +2374,12 @@ mod tests {
 
         // Wrong words cannot open the backup, and restore needs the exported blob here.
         let (other, _) = RecoveryKey::generate().unwrap();
-        assert!(restore_vault_from_backup(&data, &vault_hex, &other, Some(&blob), pass, &config).is_err());
-        assert!(restore_vault_from_backup(&data, &vault_hex, &words, None, pass, &config).is_err());
+        assert!(restore_vault_from_backup(&data, &vault_hex, &other, Some(&blob), Some(&fingerprint), pass, &config).is_err());
+        assert!(restore_vault_from_backup(&data, &vault_hex, &words, None, Some(&fingerprint), pass, &config).is_err());
         // A profile that already holds another member identity is never overwritten.
         let root = MemberDir::create(&data, "").unwrap();
         root.write_sealed("identity.sealed", &Identity::new(1).to_secret_bytes(), pass).unwrap();
-        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config);
+        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config);
         assert!(conflict.unwrap_err().contains("different member identity"));
         assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
         std::fs::remove_dir_all(&data).unwrap();
@@ -1922,7 +2389,7 @@ mod tests {
         other_pub.extend_from_slice(&other_key.signing_public());
         MemberDir::create(&data, "").unwrap();
         std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
-        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config);
+        let conflict = restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config);
         assert!(conflict.unwrap_err().contains("different recovery words"));
         assert!(!dir(&data, &vault_hex).unwrap().exists("vault.sealed"));
         assert!(!data.join("identity.sealed").exists());
@@ -1930,13 +2397,13 @@ mod tests {
         std::fs::remove_dir_all(&data).unwrap();
 
         // The real words restore a member the payment path can open and sign with.
-        restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).unwrap();
+        restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config).unwrap();
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
             .expect("the restored member opens for signing");
         // Restore brings the recovery identity: `recovery.pub` holds both public keys of these
         // words, so a later start or recovery setup does not mint a second set.
         assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), pubkeys);
-        assert!(tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(crate::host::recovery::establish_recovery(&data)).unwrap().is_none());
+        assert!(crate::host::recovery::exists(&data));
 
         // `vault.sealed` is public metadata only. The restored member completes a rerandomized
         // FROST round with member 2 using the key package from the signer store, read through
@@ -1965,7 +2432,7 @@ mod tests {
         assert_eq!(group.verifying_key(), public.verifying_key());
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         assert!(
-            restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), pass, &config).is_err(),
+            restore_vault_from_backup(&data, &vault_hex, &words, Some(&blob), Some(&fingerprint), pass, &config).is_err(),
             "never replace an existing vault",
         );
 
@@ -2006,14 +2473,14 @@ mod tests {
         assert_eq!(unchanged, legacy);
         assert!(sdir.join("backup.sealed").exists());
         // The same share migrates once: vault.sealed keeps exactly its public metadata, the
-        // passphrase copy goes, the recovery backup stays, and the member still opens.
+        // unusable passphrase copy is not trusted for conversion, and the member still opens.
         legacy["key_package"] = json!(hex::encode(restored.serialize().unwrap()));
         write_legacy(&legacy);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex)
             .expect("the migrated member opens for signing");
         let migrated: Value = serde_json::from_slice(&vdir.read_sealed("vault.sealed", pass).unwrap()).unwrap();
         assert_eq!(migrated, sealed);
-        assert!(!sdir.join("backup.sealed").exists());
+        assert!(sdir.join("backup.sealed").exists());
         assert_eq!(std::fs::read(crate::host::recovery::backup_file(&sdir)).unwrap(), blob);
         crate::host::payment::load_vault(&AppState::new(make_config()), &data, pass, &vault_hex).unwrap();
 
@@ -2113,8 +2580,21 @@ mod tests {
         std::fs::remove_dir_all(&data).unwrap();
     }
 
+    fn setup_recovery_locally(data: &Path, pass: &str) -> String {
+        let words = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let displayed = words.clone();
+        let notice: crate::host::LocalNotice = std::sync::Arc::new(move |_, phrase| {
+            *displayed.lock().unwrap() = Some(phrase.to_owned());
+            true
+        });
+        super::super::recovery::confirm_recovery(data, pass, &notice).unwrap();
+        super::super::recovery::seal_missing_backups(data, pass).unwrap();
+        drop(notice);
+        std::sync::Arc::try_unwrap(words).unwrap().into_inner().unwrap().unwrap()
+    }
+
     /// A vault that became active before the member set up recovery still gets its recovery
-    /// backup: right after `POST /api/recovery-setup`, and at the next unlock if it is missing.
+    /// backup: right after local setup, and at the next unlock if it is missing.
     #[tokio::test(flavor = "multi_thread")]
     async fn recovery_backup_is_sealed_for_an_already_active_vault_at_setup_and_unlock() {
         use crate::signer::recovery::RecoveryKey;
@@ -2144,8 +2624,7 @@ mod tests {
 
         assert!(call(reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
         assert_eq!(status().await, json!({"recovery_identity": false, "recovery_backup": false}));
-        let words = call(reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
-            .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
+        let words = setup_recovery_locally(&data, pass);
         assert_eq!(status().await, json!({"recovery_identity": true, "recovery_backup": true}));
         let key = RecoveryKey::from_words(&words).unwrap();
         let opened = crate::signer::backup::verify_recovery(&BackupArtifact(std::fs::read(&backup).unwrap()), &key, &vault).unwrap();
@@ -2180,14 +2659,13 @@ mod tests {
         (base, token)
     }
 
-    /// Restore-on-new-device drill through the host recovery routes: the old device exports its
-    /// recovery backup, a CLEAN data dir restores it with the words over `POST
-    /// /api/recovery-restore`, the payment path opens its signer (`custody::open_signer`), and it
+    /// Restore-on-new-device drill: the old device exports its recovery backup, a CLEAN data dir
+    /// restores it locally, the payment path opens its signer (`custody::open_signer`), and it
     /// signs through the store's nonce dir at the restored epoch. A nonce the old device
     /// committed before the restore, and a package carrying that old commitment, are both
     /// refused afterwards.
     #[tokio::test(flavor = "multi_thread")]
-    async fn restore_on_new_device_over_routes_signs_and_refuses_pre_restore_nonce() {
+    async fn local_restore_on_new_device_signs_and_refuses_pre_restore_nonce() {
         use crate::signer::nonce::NonceStore;
         use crate::signer::secure_element::SoftwareSecureElement;
         let root = std::env::temp_dir().join(format!("loki-restore-drill-{}", Uuid::new_v4()));
@@ -2203,10 +2681,9 @@ mod tests {
         // Old device: an active vault, recovery set up, backup exported over the route.
         crate::profile::create(&old, pass, "Old").unwrap();
         let (_material, shares, public) = dealer_vault(&old, vault, pass);
+        let words = setup_recovery_locally(&old, pass);
         let (old_base, old_token) = spawn_host(&old).await;
         assert!(call(&old_base, &old_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
-        let words = call(&old_base, &old_token, reqwest::Method::POST, "/api/recovery-setup", json!({})).await.unwrap()
-            .json::<Value>().await.unwrap()["words"].as_str().unwrap().to_owned();
         let backup = call(&old_base, &old_token, reqwest::Method::GET, &format!("/api/recovery-backup?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap()["backup"].as_str().unwrap().to_owned();
 
@@ -2218,17 +2695,18 @@ mod tests {
         let peer = frost::keys::KeyPackage::try_from(shares[&id2].clone()).unwrap();
         let stale_id = hex::encode([[3u8; 32], [3u8; 32]].concat());
         let old_nonces = signer_dir(&old, &vault_hex).unwrap().join("nonces");
-        let old_commitment = NonceStore::open(&old_nonces).unwrap()
-            .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share()).unwrap();
+        let old_commitment = NonceStore::open(&old_nonces, vault, 1).unwrap()
+            .commit(&stale_id, &SoftwareSecureElement::generate(), old_key.signing_share(), None).unwrap();
 
-        // New device: a clean data dir restores from the exported backup and the words alone.
+        // New device: a clean data dir restores the backup pinned on the old signer.
         crate::profile::create(&new, pass, "New").unwrap();
+        let config = crate::host::config_from_args(&[
+            "--data".into(), new.to_str().unwrap().into(), "--port".into(), "3601".into(),
+        ]).unwrap();
+        let backup = BackupArtifact(hex::decode(&backup).unwrap());
+        restore_vault_from_backup(&new, &vault_hex, &words, Some(&backup.0), Some(&backup.fingerprint()), pass, &config).unwrap();
         let (new_base, new_token) = spawn_host(&new).await;
         assert!(call(&new_base, &new_token, reqwest::Method::POST, "/api/unlock", json!({"passphrase": pass})).await.unwrap().status().is_success());
-        let restored = call(&new_base, &new_token, reqwest::Method::POST, "/api/recovery-restore",
-            json!({"vault": vault_hex, "words": words, "backup": backup})).await.unwrap();
-        assert_eq!(restored.status(), reqwest::StatusCode::OK);
-        assert_eq!(restored.json::<Value>().await.unwrap(), json!({"restored": true}));
         let status = call(&new_base, &new_token, reqwest::Method::GET, &format!("/api/recovery-status?vault={vault_hex}"), json!({}))
             .await.unwrap().json::<Value>().await.unwrap();
         assert_eq!(status, json!({"recovery_identity": true, "recovery_backup": true}));
@@ -2240,9 +2718,7 @@ mod tests {
         let sdir = signer_dir(&new, &vault_hex).unwrap();
         let new_nonces = sdir.join("nonces");
         assert!(!new_nonces.exists(), "a clean device starts with no nonces");
-        let st = AppState::new(crate::host::config_from_args(&[
-            "--data".into(), new.to_str().unwrap().into(), "--port".into(), "3601".into(),
-        ]).unwrap());
+        let st = AppState::new(config);
         let signer = crate::host::custody::open_signer(&st, &new, pass, &vault_hex, 1, Box::new(|_| false))
             .expect("the restored member opens for signing");
         let (group, _) = signer.hosted_metadata().unwrap();
@@ -2252,9 +2728,9 @@ mod tests {
             .read(&se, crate::signer::store::FileKind::Share).unwrap().expect("the restored store holds the share");
         assert!(epoch > 0, "a restore bumps the share epoch");
         let key = frost::keys::KeyPackage::deserialize(&crate::signer::local::decode_share(&raw).unwrap().0).unwrap();
-        let store = NonceStore::open_at_epoch(&new_nonces, epoch).unwrap();
+        let store = NonceStore::open_at_epoch(&new_nonces, epoch, vault, 1).unwrap();
         let fresh_id = hex::encode([[4u8; 32], [4u8; 32]].concat());
-        let c1 = store.commit(&fresh_id, &se, key.signing_share()).unwrap();
+        let c1 = store.commit(&fresh_id, &se, key.signing_share(), None).unwrap();
         let (n2, c2) = frost::round1::commit(peer.signing_share(), &mut OsRng);
         let package_with = |own| {
             let commitments = BTreeMap::from([(id1, own), (id2, c2)]);
@@ -2263,7 +2739,7 @@ mod tests {
             (package, params, <[u8; 32]>::try_from(seed).unwrap())
         };
         let (package, params, seed) = package_with(c1);
-        let own = store.sign_and_burn(&fresh_id, &se, &package, &key, &seed, &|| false).unwrap();
+        let own = store.sign_and_burn(&fresh_id, &se, &package, &key, &seed, None, &|| false).unwrap();
         let theirs = frost_rerandomized::sign_with_randomizer_seed(&package, &n2, &peer, &seed).unwrap();
         let signature = frost_rerandomized::aggregate(&package, &BTreeMap::from([(id1, own), (id2, theirs)]), &group, &params)
             .expect("the restored member's share aggregates");
@@ -2273,13 +2749,13 @@ mod tests {
         // replaced by a fresh nonce for that id.
         std::fs::copy(old_nonces.join(format!("{stale_id}.nonce")), new_nonces.join(format!("{stale_id}.nonce"))).unwrap();
         let (package, _, seed) = package_with(old_commitment);
-        assert!(store.sign_and_burn(&stale_id, &se, &package, &key, &seed, &|| false).is_err());
-        assert!(store.commit(&stale_id, &se, key.signing_share()).is_err());
+        assert!(store.sign_and_burn(&stale_id, &se, &package, &key, &seed, None, &|| false).is_err());
+        assert!(store.commit(&stale_id, &se, key.signing_share(), None).is_err());
         assert!(!new_nonces.join(format!("{stale_id}.burn")).exists(), "no share was released");
         // A package carrying the pre-restore commitment is refused against the new nonce.
         let retry_id = hex::encode([[3u8; 32], [8u8; 32]].concat());
-        store.commit(&retry_id, &se, key.signing_share()).unwrap();
-        assert!(store.sign_and_burn(&retry_id, &se, &package, &key, &seed, &|| false).is_err());
+        store.commit(&retry_id, &se, key.signing_share(), None).unwrap();
+        assert!(store.sign_and_burn(&retry_id, &se, &package, &key, &seed, None, &|| false).is_err());
         assert!(!new_nonces.join(format!("{retry_id}.burn")).exists(), "no share was released");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2306,11 +2782,13 @@ mod tests {
         });
         let file = root.join("recovery.json");
         let document = exported(&material);
+        let fingerprint_of = |doc: &Value| backup::BackupArtifact(hex::decode(doc["backup"].as_str().unwrap()).unwrap()).fingerprint();
+        let anchor = fingerprint_of(&document);
         let identity = Identity::from_secret_bytes(&material.identity).unwrap().public();
         let signing = hex::encode(identity.signing);
         let relay = hex::encode(identity.encryption);
         // Coordinator slot deliberately differs from the backup's FROST member id.
-        let entry = json!({"slot": 31, "signing_pubkey": signing, "relay_pubkey": relay, "advertise_url": "http://127.0.0.1:10000"});
+        let entry = json!({"slot": 11, "signing_pubkey": signing, "relay_pubkey": relay, "advertise_url": "http://127.0.0.1:10000"});
         let mut wrong_relay = entry.clone();
         wrong_relay["relay_pubkey"] = json!(hex::encode([78; 32]));
         let roster = Arc::new(Mutex::new(vec![wrong_relay.clone()]));
@@ -2332,10 +2810,10 @@ mod tests {
                 received.lock().unwrap().push(body);
                 async move {
                     use axum::http::StatusCode;
-                    if slot != Some(47) {
+                    if slot != Some(14) {
                         return Err((StatusCode::BAD_REQUEST, Json(json!({"error": "registered identity cannot change slot"}))));
                     }
-                    Ok(Json(json!({"challenge": "ab".repeat(32)})))
+                    Ok(Json(json!({"challenge": "ab".repeat(32), "relay_challenge_pubkey": registration::TEST_RELAY_CHALLENGE_KEY})))
                 }
             }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2352,11 +2830,18 @@ mod tests {
         let mut settings = config();
         let mut wrong_vault = document.clone();
         wrong_vault["vault"] = json!(hex::encode([8; 32]));
-        let refused = "LokiSigner could not restore this vault. Check the recovery words and backup, then try again.";
-        let bad_file = "Choose a valid LokiSigner recovery backup file (at most 256 KiB).";
-        let mismatch = "The coordinator roster does not identify exactly one slot for this backup.";
+        let refused = "restore-refused";
+        let bad_file = "invalid-backup";
+        let mismatch = "roster-mismatch";
         let secret = |words: &str| Zeroizing::new(words.as_bytes().to_vec());
+        let restore_new = |settings: &mut Config, words: &str, origin: &str| {
+            native_recovery::restore_new(settings, pass, secret(words), &file, &anchor, origin, None)
+        };
         tokio::task::block_in_place(|| {
+            // A legitimate but different export of the very same material must not match.
+            std::fs::write(&file, exported(&material).to_string()).unwrap();
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err("backup-fingerprint-mismatch"));
+            assert!(!data.exists());
             for (contents, input, expected) in [
                 (document.to_string(), other_words.as_str(), refused),
                 (wrong_vault.to_string(), words.as_str(), refused),
@@ -2365,33 +2850,35 @@ mod tests {
                 (format!(r#"{{"vault":"{vault_hex}","vault":"{vault_hex}","backup":{}}}"#, document["backup"]), words.as_str(), bad_file),
             ] {
                 std::fs::write(&file, contents).unwrap();
-                assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(input), &file, &origin, None), Err(expected));
+                assert_eq!(restore_new(&mut settings, input, &origin), Err(expected));
                 assert!(!data.exists());
             }
             assert_eq!(roster_reads.load(Ordering::SeqCst), 0, "invalid backups never reach the roster lookup");
             std::fs::write(&file, document.to_string()).unwrap();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert_eq!(restore_new(&mut settings, &words, &format!("{origin}/wallet")),
+                Err("roster-unavailable"));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err(mismatch));
             assert!(!data.exists());
             *roster.lock().unwrap() = vec![entry.clone(), entry.clone()];
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(mismatch));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err("roster-unavailable"));
             assert!(!data.exists());
-            *roster.lock().unwrap() = vec![wrong_relay, entry];
+            *roster.lock().unwrap() = vec![entry];
             settings.secure_element = "invalid fixture backend".into();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None), Err(refused));
+            assert_eq!(restore_new(&mut settings, &words, &origin), Err(refused));
             assert!(!data.exists(), "even a failure during installation must not publish the profile");
             settings.secure_element = "software".into();
             crate::profile::create(&data, pass, "Mistaken new member").unwrap();
-            assert!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).is_err());
+            assert!(restore_new(&mut settings, &words, &origin).is_err());
             native_recovery::set_aside(&data, false).unwrap();
             std::fs::create_dir_all(data.join("signer")).unwrap();
             std::fs::write(data.join("signer/share.sealed"), b"unrecognised data").unwrap();
-            assert_eq!(native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None),
-                Err("First-run recovery needs a new LokiSigner profile directory."));
+            assert_eq!(restore_new(&mut settings, &words, &origin),
+                Err("profile-not-fresh"));
             assert_eq!(std::fs::read(data.join("signer/share.sealed")).unwrap(), b"unrecognised data");
             std::fs::remove_dir_all(data.join("signer")).unwrap();
             std::fs::create_dir_all(data.join("profile")).unwrap();
             std::fs::write(data.join(NATIVE_KEY_SCOPE), b"interrupted write").unwrap();
-            native_recovery::restore_new(&mut settings, pass, secret(&words), &file, &origin, None).unwrap();
+            restore_new(&mut settings, &words, &origin).unwrap();
             let archives: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().path())
                 .filter(|p| p.file_name().unwrap().to_string_lossy().starts_with("restored-set-aside-")).collect();
             assert_eq!(archives.len(), 2);
@@ -2401,7 +2888,7 @@ mod tests {
         let old_pub = std::fs::read(data.join("recovery.pub")).unwrap();
         assert_eq!(old_pub, [key.public_bytes(), key.signing_public()].concat());
         assert!(crate::host::state::read_native_key_scope(&data).unwrap().is_some());
-        assert_eq!(settings.registration.as_ref().unwrap().slot, Some(31));
+        assert_eq!(settings.registration.as_ref().unwrap().slot, Some(11));
         let state = Arc::new(AppState::new(settings));
         let notice: crate::host::LocalNotice = Arc::new(|_, _| panic!("restored profile must never mint new words"));
         let unlock = || Some(Zeroizing::new(pass.into()));
@@ -2411,15 +2898,21 @@ mod tests {
 
         let s = state.clone();
         tokio::task::block_in_place(|| {
+            let restore_running = |fingerprint: &str| native_recovery::restore_running(&s, secret(&words), &file, fingerprint);
+            assert_eq!(restore_running(&anchor), Err("profile-locked"));
             *s.session.blocking_write() = Some(crate::host::state::Session::unlock(data.clone(), Zeroizing::new(pass.into())).unwrap().0);
+            assert_eq!(restore_running(""), Err("backup-fingerprint-mismatch"));
+            assert_eq!(restore_running(&anchor), Err("vault-exists"));
             let signer = crate::host::custody::open_signer(&s, &data, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             assert_eq!(signer.hosted_metadata().unwrap().0.verifying_key(), public.verifying_key());
 
             // Same words with another member's valid backup must not install into a running profile.
             let (other_member, _, _) = dealer_vault(&root.join("other"), [7; 32], pass);
-            std::fs::write(&file, exported(&other_member).to_string()).unwrap();
-            let wrong_profile = "This backup or these recovery words do not match the unlocked LokiSigner profile.";
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            let other_export = exported(&other_member);
+            let other_anchor = fingerprint_of(&other_export);
+            std::fs::write(&file, other_export.to_string()).unwrap();
+            let wrong_profile = "wrong-profile";
+            assert_eq!(restore_running(&other_anchor), Err(wrong_profile));
             assert!(!dir(&data, &hex::encode([7; 32])).unwrap().path().exists());
 
             // Another vault for the same member: change the vault-bound roster and fingerprint.
@@ -2430,14 +2923,16 @@ mod tests {
             vault_roster["vault"] = json!(another_hex);
             another_vault.roster = serde_json::to_vec(&vault_roster).unwrap();
             another_vault.roster_fingerprint = crate::member_state::Roster::from_bytes(&another_vault.roster).unwrap().fingerprint();
-            std::fs::write(&file, exported(&another_vault).to_string()).unwrap();
+            let another_export = exported(&another_vault);
+            let another_anchor = fingerprint_of(&another_export);
+            std::fs::write(&file, another_export.to_string()).unwrap();
             let other_pub = [other_key.public_bytes(), other_key.signing_public()].concat();
             std::fs::write(data.join("recovery.pub"), &other_pub).unwrap();
-            assert_eq!(native_recovery::restore_running(&s, secret(&words), &file), Err(wrong_profile));
+            assert_eq!(restore_running(&another_anchor), Err(wrong_profile));
             assert_eq!(std::fs::read(data.join("recovery.pub")).unwrap(), other_pub);
             assert!(!dir(&data, &another_hex).unwrap().path().exists());
             std::fs::write(data.join("recovery.pub"), &old_pub).unwrap();
-            native_recovery::restore_running(&s, secret(&words), &file).unwrap();
+            restore_running(&another_anchor).unwrap();
             assert!(dir(&data, &another_hex).unwrap().exists("vault.sealed"));
         });
 
@@ -2450,11 +2945,11 @@ mod tests {
         let mut resumed = config();
         resumed.registration = Some(RegistrationConfig::resume(&data, true).unwrap());
         let resumed = Arc::new(AppState::new(resumed));
-        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(47));
+        roster.lock().unwrap().iter_mut().filter(|m| m["relay_pubkey"] == relay).for_each(|m| m["slot"] = json!(14));
         assert_eq!(registration::start(&resumed, unlock(), Some(&notice)).await.unwrap(), "restore-ready");
         let registered = resumed.registration.read().await.clone().unwrap();
-        assert_eq!(registered.slot, 47);
-        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(47));
+        assert_eq!(registered.slot, 14);
+        assert_eq!(RegistrationConfig::resume(&data, true).unwrap().slot, Some(14));
         assert_eq!(registered.signing_pubkey, signing);
         assert_eq!(registered.relay_pubkey, relay);
         assert!(!data.join(registration::RESTORE_PENDING).exists());
@@ -2477,11 +2972,11 @@ mod tests {
             });
             std::fs::write(&file, document.to_string()).unwrap();
             tokio::task::block_in_place(|| {
-                assert_eq!(native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None),
+                assert_eq!(restore_new(&mut apple, &words, &origin),
                     Err(KeyFailure::Cancelled.message()));
                 assert!(!apple.data.exists());
                 block_device.store(false, Ordering::SeqCst);
-                native_recovery::restore_new(&mut apple, pass, secret(&words), &file, &origin, None).unwrap();
+                restore_new(&mut apple, &words, &origin).unwrap();
             });
             assert!(!apple.data.join("device-registration-confirmed").exists());
             assert!(registration::DeviceKey::open(&apple, pass).is_ok());
@@ -2492,18 +2987,18 @@ mod tests {
             assert!(registration::DeviceKey::open(&apple, pass).is_ok());
             crate::host::custody::open_signer(&AppState::new(apple), &moved, pass, &vault_hex, 1, Box::new(|_| false)).unwrap();
             let actual = tags.lock().unwrap();
-            let scope = std::fs::read_to_string(moved.join(NATIVE_KEY_SCOPE)).unwrap();
-            let vault = format!("cash.loki.member.kek.v2:{scope}:vault:{vault_hex}").into_bytes();
-            let device = format!("cash.loki.member.kek.v2:{scope}:device-auth").into_bytes();
-            assert_ne!(actual[0].2, vault, "a failed first restore does not publish its scope");
+            let restored = std::fs::read_to_string(moved.join("vaults").join(&vault_hex).join("signer/native-restored-key")).unwrap();
+            let vault = format!("cash.loki.member.kek.restore.v1:{restored}:signer").into_bytes();
+            let device = format!("cash.loki.member.kek.restore.v1:{restored}:device-auth").into_bytes();
+            assert_ne!(actual[0].2, vault, "a failed restore does not reuse its Keychain tags");
             assert_ne!(actual[1].2, device);
             assert_eq!(actual[2..], [
-                (false, true, vault.clone()), (true, true, device.clone()),
+                (false, true, vault.clone()), (true, true, device.clone()), (false, false, vault.clone()),
                 (true, false, device.clone()), (true, false, device), (false, false, vault),
             ]);
         }
         let sent = enrollment.lock().unwrap();
-        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [31, 31, 47]);
+        assert_eq!(sent.iter().map(|request| request["slot"].as_u64().unwrap()).collect::<Vec<_>>(), [11, 11, 14]);
         for request in sent.iter() {
             assert_eq!(request.as_object().unwrap().keys().collect::<Vec<_>>(), ["advertise_url", "authorization", "device_pubkey", "lokisigner_url", "relay_pubkey", "signing_pubkey", "slot"]);
             assert_eq!(request["lokisigner_url"], "http://127.0.0.1:10001");
@@ -2615,6 +3110,7 @@ pub(super) fn restore_vault_from_backup(
     vault: &str,
     words: &str,
     backup: Option<&[u8]>,
+    fingerprint: Option<&str>,
     pass: &str,
     config: &super::Config,
 ) -> Result<(), String> {
@@ -2626,7 +3122,13 @@ pub(super) fn restore_vault_from_backup(
         None => std::fs::read(&local)
             .map_err(|_| "no recovery backup for this vault; supply the exported backup".to_string())?,
     };
-    restore_opened_backup(RecoveryBackup::open(vault, key, blob)?, data, &dir, pass, config, None)
+    let artifact = BackupArtifact(blob);
+    if let Some(fingerprint) = fingerprint {
+        artifact.check_fingerprint(fingerprint)?;
+    } else if !dir.exists("vault.sealed") {
+        return Err("a fresh restore needs the independently saved SHA-256 fingerprint of the backup".into());
+    }
+    restore_opened_backup(RecoveryBackup::open(vault, key, artifact.0)?, data, &dir, pass, config, None)
 }
 
 pub(super) struct RecoveryBackup {
@@ -2639,8 +3141,9 @@ pub(super) struct RecoveryBackup {
 impl RecoveryBackup {
     pub(super) fn open(vault: &str, key: crate::signer::recovery::RecoveryKey, blob: Vec<u8>) -> Result<Self, String> {
         let artifact = BackupArtifact(blob);
-        let material = crate::signer::backup::verify_recovery(&artifact, &key, &vault_bytes(vault)?)?;
-        Ok(Self { material, key, blob: artifact.0, vault: vault.into() })
+        let vault_id = vault_bytes(vault)?;
+        let material = crate::signer::backup::verify_recovery(&artifact, &key, &vault_id)?;
+        Ok(Self { material, key, blob: artifact.0, vault: hex::encode(vault_id) })
     }
 }
 
@@ -2652,32 +3155,18 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     let local = super::recovery::backup_file(&sdir);
     let pp = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
         .map_err(|e| e.to_string())?;
-    let kp = frost::keys::KeyPackage::deserialize(&material.key_package).map_err(|e| e.to_string())?;
-    let id = frost::Identifier::try_from(material.member_id).map_err(|e| e.to_string())?;
-    if kp.identifier() != &id || kp.verifying_key() != pp.verifying_key()
-        || pp.min_signers() != Some(material.threshold)
-        || pp.verifying_shares().len() != usize::from(material.members)
-        || pp.verifying_shares().get(&id) != Some(kp.verifying_share()) {
-        return Err("recovery share differs from its public vault metadata".into());
-    }
     // Signing needs every member's relay identity, which only the backup's roster carries.
     // `verify_recovery` already bound that roster to this vault and to the backup's identity.
     if material.roster.is_empty() || material.identity.is_empty() {
         return Err("this backup has no roster, so it cannot rebuild a member that signs".into());
     }
     let roster = crate::member_state::Roster::from_bytes(&material.roster)?;
-    if roster.threshold != material.threshold || roster.members.len() != usize::from(material.members) {
-        return Err("recovery roster differs from its vault metadata".into());
-    }
     let network = match material.network {
         Network::Regtest => VaultNetwork::Regtest,
         Network::Testnet => VaultNetwork::Testnet,
     };
     if network.label() != config.network {
         return Err("recovery backup is for a different network".into());
-    }
-    if dest.exists("vault.sealed") {
-        return Err("vault already exists; restore into a fresh device profile".into());
     }
     // The profile's identity serves every vault it holds, so restore never replaces one.
     let root = MemberDir::open(data, ".");
@@ -2696,6 +3185,29 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
     // The words that open this backup become the profile's recovery identity, so a later start
     // or recovery setup never mints a second, unrelated set the backup is not sealed to.
     let write_recovery = super::recovery::check_recovery(data, &key)?;
+    if dest.exists("vault.sealed") {
+        // Repair only the export of an already restored headless vault; never touch its
+        // live share or epoch. The unlocked device store is the independent trust anchor.
+        if published_key_dir.is_some() || write_identity || write_recovery
+            || std::fs::read(&local).is_ok_and(|prior| prior == blob) {
+            return Err("vault already exists; restore into a fresh device profile".into());
+        }
+        let installed = load(data, pass, vault)?;
+        let installed_roster = roster_of(&installed)?;
+        if installed.birth_height != material.birth_height || installed_roster.threshold != roster.threshold
+            || !installed_roster.members.values().eq(roster.members.values()) {
+            return Err("recovery backup does not match this vault's installed roster".into());
+        }
+        let store = crate::signer::store::SignerStore::open(&sdir)?;
+        let se = config.open_secure_element(&sdir, pass)?;
+        let expected = crate::signer::local::encode_share(&material.key_package, &material.public_package, &material.group_sk);
+        if store.vault() != vault_id || store.member() != material.member_id || store.network() != material.network
+            || !store.read(&se, crate::signer::store::FileKind::Share)?
+                .is_some_and(|(_, share)| share.as_slice() == expected.as_slice()) {
+            return Err("recovery backup does not match this vault's installed share".into());
+        }
+        return super::recovery::install_backup(&sdir, &blob);
+    }
     let mut ceremony = Ceremony {
         vault: vault.to_owned(),
         name: material.label.clone(),
@@ -2717,6 +3229,7 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
         error: None,
         birth_height: material.birth_height,
         roster_code: None,
+        creator: None,
     };
     // The ceremony records the relay roster's fingerprint, not the setup document's.
     let fingerprint = hex::encode(roster_of(&ceremony)?.fingerprint());
@@ -2750,12 +3263,10 @@ pub(super) fn restore_opened_backup(backup: RecoveryBackup, data: &Path, dest: &
             .map_err(|e| e.to_string())?;
     }
     if write_recovery {
-        super::recovery::adopt_recovery(data, &key)?;
+        super::recovery::adopt_recovery(data, &key, pass)?;
     }
     // Keep the backup on the new device so it can be exported again.
-    if !local.exists() {
-        std::fs::write(&local, &blob).map_err(|e| e.to_string())?;
-    }
+    super::recovery::install_backup(&sdir, &blob)?;
     save_to(dest, pass, &ceremony)?;
     // Written last: `vault.sealed` is what marks the vault active.
     dest.write_sealed("vault.sealed", &bytes, pass)

@@ -3,8 +3,12 @@ import AppKit
 @_silgen_name("loki_member_app_vault_addresses")
 func loki_member_app_vault_addresses() -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("loki_member_app_can_view_addresses")
+private func loki_member_app_can_view_addresses() -> Int32
+
 private struct VaultAddressReply: Decodable {
     struct Vault: Decodable {
+        let vault: String?
         let name: String?
         let slot: UInt16?
         let network: String?
@@ -31,12 +35,32 @@ final class VaultAddressesWindow: NSObject {
     private lazy var window = makeWindow()
     private let rows = NSStackView()
     private lazy var refreshButton = NSButton(title: "Refresh", target: self, action: #selector(refresh(_:)))
+    private var session: UUID?
     private var addresses: [String] = []
 
     @objc func show(_ sender: Any?) {
         window.makeKeyAndOrderFront(sender)
         NSApp.activate(ignoringOtherApps: true)
-        refresh(sender)
+        if session != nil { refresh(sender) }
+        else { showLocked() }
+    }
+
+    func setUnlocked(_ unlocked: Bool) {
+        session = unlocked ? UUID() : nil
+        if unlocked {
+            refreshButton.isEnabled = true
+            if rows.window?.isVisible == true { refresh(nil) }
+        } else {
+            showLocked()
+        }
+    }
+
+    private func showLocked() {
+        session = nil
+        refreshButton.isEnabled = false
+        rows.window?.endEditing(for: nil)
+        clearRows()
+        rows.addArrangedSubview(NSTextField(labelWithString: "Unlock LokiSigner to view vault addresses."))
     }
 
     private func makeWindow() -> NSWindow {
@@ -47,7 +71,7 @@ final class VaultAddressesWindow: NSObject {
         window.center()
 
         let intro = NSTextField(wrappingLabelWithString:
-            "Share an address copied from LokiSigner, or compare it with the wallet page before sharing. macOS may ask for Touch ID to verify an address.")
+            "Share an address copied from LokiSigner, or match the vault ID and full address with the wallet before sharing. macOS may ask for Touch ID to verify an address.")
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
         scroll.autohidesScrollers = true
@@ -86,21 +110,27 @@ final class VaultAddressesWindow: NSObject {
     }
 
     @objc private func refresh(_ sender: Any?) {
-        guard refreshButton.isEnabled else { return }
+        guard let session, refreshButton.isEnabled else { return }
         refreshButton.isEnabled = false
         render(nil, loading: true)
         DispatchQueue.global(qos: .userInitiated).async {
             let reply = VaultAddressReply.load()
             DispatchQueue.main.async {
+                guard self.session == session else { return }
+                guard loki_member_app_can_view_addresses() != 0 else { self.showLocked(); return }
                 self.render(reply, loading: false)
                 self.refreshButton.isEnabled = true
             }
         }
     }
 
-    private func render(_ reply: VaultAddressReply?, loading: Bool) {
+    private func clearRows() {
         rows.arrangedSubviews.forEach { $0.removeFromSuperview() }
         addresses.removeAll()
+    }
+
+    private func render(_ reply: VaultAddressReply?, loading: Bool) {
+        clearRows()
         guard let vaults = reply?.vaults, !vaults.isEmpty else {
             let message = loading ? "Checking vault addresses…" : reply?.error
                 ?? (reply?.vaults != nil ? "This member has no active vaults." : "LokiSigner could not list vaults.")
@@ -126,7 +156,15 @@ final class VaultAddressesWindow: NSObject {
                 let network = vault.network.map { "Network: \($0)    ·    " } ?? ""
                 row.addArrangedSubview(NSTextField(labelWithString: "\(network)Member slot: \(slot)"))
             }
-            if let address = vault.address, vault.error == nil {
+            if let id = vault.vault, let address = vault.address, vault.error == nil {
+                row.addArrangedSubview(NSTextField(labelWithString: "Vault ID:"))
+                let identifier = NSTextField(wrappingLabelWithString: id)
+                identifier.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
+                identifier.lineBreakMode = .byCharWrapping
+                identifier.isSelectable = true
+                identifier.setAccessibilityLabel("Vault ID")
+                row.addArrangedSubview(identifier)
+                identifier.widthAnchor.constraint(equalTo: row.widthAnchor).isActive = true
                 let field = NSTextField(wrappingLabelWithString: address)
                 field.font = .monospacedSystemFont(ofSize: 13, weight: .regular)
                 field.lineBreakMode = .byCharWrapping
@@ -148,6 +186,8 @@ final class VaultAddressesWindow: NSObject {
     }
 
     @objc private func copyAddress(_ sender: NSButton) {
+        guard session != nil, loki_member_app_can_view_addresses() != 0 else { showLocked(); return }
+        guard let window = rows.window, sender.window === window, addresses.indices.contains(sender.tag) else { return }
         NSPasteboard.general.clearContents()
         if NSPasteboard.general.setString(addresses[sender.tag], forType: .string) {
             sender.title = "Copied"

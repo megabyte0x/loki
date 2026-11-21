@@ -1,9 +1,9 @@
 // The deployment's signer configuration for the native signer (LokiSigner), served by this
 // coordinator at /api/signer-config. Its one source is the signer origin's own /config.json
 // (core/loki-signer-wasm/serve.mjs), which the browser signer runs with; nothing is copied here.
-// The witness `read` capabilities in it are already public on the signer origin (since #72).
+// The witness configuration contains only routes and public pins.
 
-export type WitnessConfig = { endpoint: string; key: number[]; run: number[]; mailbox: number[]; read: number[] };
+export type WitnessConfig = { endpoint: string; key: number[]; run: number[]; mailbox: number[] };
 export type SignerConfig = {
   network: "testnet" | "regtest";
   frostdUrl: string;
@@ -46,7 +46,7 @@ export async function signerConfig(origin: string, timeoutMs = 10_000): Promise<
   if (!Array.isArray(raw.nonceWitnesses) || raw.nonceWitnesses.length !== 2) throw invalid("nonce witness list");
   const witness = (w: Record<string, unknown>): WitnessConfig => ({
     endpoint: url(w?.endpoint, "nonce witness endpoint"),
-    key: bytes(w.key, "key"), run: bytes(w.run, "run"), mailbox: bytes(w.mailbox, "mailbox"), read: bytes(w.read, "read"),
+    key: bytes(w.key, "key"), run: bytes(w.run, "run"), mailbox: bytes(w.mailbox, "mailbox"),
   });
   return {
     network: raw.network,

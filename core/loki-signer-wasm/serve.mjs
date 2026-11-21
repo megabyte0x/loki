@@ -16,8 +16,7 @@
 //                         (space-separated CSP sources; default: loopback member apps)
 //   LOKI_NONCE_WITNESSES  the two nonce-witness relays every signature is claimed at: the same
 //                         JSON file a native member takes with --nonce-witnesses. Without it
-//                         the browser signer refuses to sign. NOTE: each entry's mailbox
-//                         `read` capability is served to every page load of this origin.
+//                         the browser signer refuses to sign. Only routes and pins are public.
 //   LOKI_NETWORK          the deployment's network, testnet (default) or regtest; mainnet is
 //                         refused. A regtest stack must set it, or LokiSigner is told testnet. Served for the native signer (LokiSigner), which reads this
 //                         config through the wallet's /api/signer-config.
@@ -46,7 +45,7 @@ const lightwalletdGrpcWebUrl = process.env.LOKI_LIGHTWALLETD_GRPCWEB_URL || "";
 const hex = (bytes) => Buffer.from(bytes).toString("hex");
 const nonceWitnesses = process.env.LOKI_NONCE_WITNESSES
   ? JSON.parse(readFileSync(process.env.LOKI_NONCE_WITNESSES, "utf8")).map((w) => ({
-      endpoint: w.endpoint, key: hex(w.key), run: hex(w.run), mailbox: hex(w.mailbox), read: hex(w.read),
+      endpoint: w.endpoint, key: hex(w.key), run: hex(w.run), mailbox: hex(w.mailbox),
     }))
   : [];
 
@@ -88,28 +87,37 @@ bundle.set("/build-hash.json", Buffer.from(JSON.stringify(build)));
 const csp = [
   "default-src 'none'",
   "script-src 'self' 'wasm-unsafe-eval'",
-  "worker-src 'self'",
   "style-src 'self'",
   `connect-src 'self' ${frostdUrl ? new URL(frostdUrl).origin : ""} ${nonceWitnesses.map((w) => new URL(w.endpoint).origin).join(" ")} ${lightwalletdGrpcWebUrl ? new URL(lightwalletdGrpcWebUrl).origin : ""} ${ceremonyOrigins}`.replace(/\s+/g, " ").trim(),
   "img-src 'self'",
   "base-uri 'none'",
   "form-action 'none'",
-  `frame-ancestors ${walletOrigin}`, // only the wallet may embed the signer
 ].join("; ");
 
 createServer((req, res) => {
   if (req.method !== "GET" && req.method !== "HEAD") { res.writeHead(405).end(); return; }
-  const path = new URL(req.url, "http://x").pathname;
+  const target = req.url;
+  if (!/^\/(?!\/)[^\s\\#]*$/.test(target)) { res.writeHead(400).end(); return; }
+  let path;
+  try {
+    path = new URL(target, "http://x").pathname;
+  } catch {
+    res.writeHead(400).end();
+    return;
+  }
   const key = path === "/" ? "/signer.html" : path;
-  const body = bundle.get(key);
-  const type = body ? types[extname(key)] || "application/octet-stream" : "text/plain";
+  const receiveAddress = key === "/receive-address";
+  const topLevelOnly = receiveAddress || key === "/manage-custody" || key === "/approve-payment";
+  const asset = topLevelOnly ? "/signer.html" : key;
+  const body = bundle.get(asset);
+  const type = body ? types[extname(asset)] || "application/octet-stream" : "text/plain";
   res.writeHead(body ? 200 : 404, {
     "Content-Type": type.startsWith("text/") ? `${type}; charset=utf-8` : type,
     "Cache-Control": "no-store",
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Cross-Origin-Resource-Policy": "same-origin",
-    "Content-Security-Policy": csp,
+    "Content-Security-Policy": `${csp}; worker-src ${receiveAddress ? "'none'" : "'self'"}; frame-ancestors ${topLevelOnly ? "'none'" : walletOrigin}`,
   });
   res.end(req.method === "HEAD" ? undefined : body ?? "not found");
 }).listen(port, () => console.log(`loki signer origin on http://localhost:${port} (wallet ${walletOrigin}) build ${build.bundle}`));

@@ -8,8 +8,10 @@
 use orchard::{
     keys::{FullViewingKey, OutgoingViewingKey, Scope},
     note::{ExtractedNoteCommitment, Rho},
+    note_encryption::{IronwoodDomain, IronwoodNoteEncryption},
     Note,
 };
+use zcash_note_encryption::{try_note_decryption, Domain};
 use zcash_primitives::transaction::fees::zip317::{GRACE_ACTIONS, MARGINAL_FEE};
 use zcash_protocol::memo::MemoBytes;
 
@@ -36,6 +38,7 @@ pub enum Refusal {
     },
     MissingOpening(String),
     OpeningsDoNotMatchCommitment(String),
+    InvalidOutputEncryption(String),
     MemoDiffers(String),
     ChangeAddressDiffers {
         expected: String,
@@ -75,6 +78,7 @@ impl std::fmt::Display for Refusal {
             OpeningsDoNotMatchCommitment(s) => {
                 write!(f, "openings do not match the commitment: {s}")
             }
+            InvalidOutputEncryption(s) => write!(f, "invalid output encryption: {s}"),
             MemoDiffers(s) => write!(f, "memo differs from the intent: {s}"),
             ChangeAddressDiffers { expected, found } => write!(
                 f,
@@ -146,7 +150,7 @@ pub(crate) fn open_output(
     Ok((note, recipient.to_raw_address_bytes(), value.inner()))
 }
 
-/// Prove the memo by re-encryption.
+/// Verify the transmitted note ciphertext and key by re-encryption.
 ///
 /// `enc_ciphertext` is a deterministic function of the note and its memo: the ephemeral
 /// secret is derived from the note's rseed, so there is no randomness left to differ.
@@ -159,18 +163,42 @@ fn check_memo(
     expected: &MemoBytes,
     label: &str,
 ) -> Result<(), Refusal> {
-    let enc = orchard::note_encryption::IronwoodNoteEncryption::new(
-        None::<OutgoingViewingKey>,
-        *note,
-        *expected.as_array(),
-    );
-
+    let enc = IronwoodNoteEncryption::new(None::<OutgoingViewingKey>, *note, *expected.as_array());
     let recomputed = enc.encrypt_note_plaintext();
-    let actual: &[u8] = &action.output().encrypted_note().enc_ciphertext;
+    let actual = action.output().encrypted_note();
 
-    if &recomputed[..] != actual {
+    if recomputed != actual.enc_ciphertext {
         return Err(Refusal::MemoDiffers(format!(
             "{label}: re-encrypting with the intended memo does not reproduce enc_ciphertext"
+        )));
+    }
+    if note.value().inner() != 0 && IronwoodDomain::epk_bytes(enc.epk()).0 != actual.epk_bytes {
+        return Err(Refusal::InvalidOutputEncryption(format!(
+            "{label}: re-encryption does not reproduce the transmitted ephemeral key"
+        )));
+    }
+    Ok(())
+}
+
+/// Verify that the vault can discover the reviewed change in a scan.
+pub(crate) fn check_change_decryption(
+    action: &orchard::pczt::Action,
+    note: &Note,
+    vault_fvk: &FullViewingKey,
+    label: &str,
+) -> Result<(), Refusal> {
+    if note.value().inner() == 0 {
+        return Ok(());
+    }
+    let domain = IronwoodDomain::for_pczt_action(action);
+    let ivk = vault_fvk.to_ivk(Scope::Internal).prepare();
+    // Recipient decryption checks the transmitted key and commitment. Also match the
+    // address and value being reviewed against the decrypted plaintext.
+    if !try_note_decryption(&domain, &ivk, action).is_some_and(|(decrypted, recipient, _)| {
+        recipient == note.recipient() && decrypted.value() == note.value()
+    }) {
+        return Err(Refusal::InvalidOutputEncryption(format!(
+            "{label}: vault cannot decrypt the expected change note"
         )));
     }
     Ok(())
@@ -267,6 +295,7 @@ pub fn check_candidate(
             }
             // Change carries no memo; proving that binds it as tightly as the payment.
             check_memo(action, &note, &empty_memo, &label)?;
+            check_change_decryption(action, &note, vault_fvk, &label)?;
             changes += 1;
         } else if value == 0 && check_memo(action, &note, &padding_memo, &label).is_ok() {
             padding += 1;

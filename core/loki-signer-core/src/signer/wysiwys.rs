@@ -8,14 +8,15 @@
 //! Derivation:
 //! - recipient / amount / change: each output note is reconstructed from its openings
 //!   (`verify::open_output`), then classified as change iff its address equals the vault's
-//!   own internal address, otherwise it is the payment. No expected recipient is consulted.
+//!   own internal address, otherwise it is the payment. Nonzero change must also decrypt
+//!   with the vault's internal viewing key. No expected recipient is consulted.
 //! - memo: the vault is the SENDER, so it recovers its own output's memo from
 //!   `enc_ciphertext` using the esk/pk_d of the reconstructed note.
 //! - fee: inputs minus outputs, from the opened values.
 //! - network: the consensus branch id committed in the PCZT global (the bytes bind it).
 
 use super::local::SignerError;
-use crate::verify::open_output;
+use crate::verify::{check_change_decryption, open_output};
 use orchard::{
     keys::FullViewingKey,
     note::{ExtractedNoteCommitment, Nullifier, TransmittedNoteCiphertext},
@@ -120,6 +121,8 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
                         total_out.checked_add(value).ok_or("output value overflow")?;
 
                     if recipient == change_address {
+                        check_change_decryption(action, &note, vault_fvk, &label)
+                            .map_err(|e| e.to_string())?;
                         change_zat =
                             change_zat.checked_add(value).ok_or("change overflow")?;
                         continue;
@@ -131,7 +134,7 @@ pub fn describe_pczt(pczt_bytes: &[u8], vault_fvk: &FullViewingKey) -> Result<Pa
                         return Err("pczt has more than one non-change payment output".into());
                     }
                     // Recover the payee memo from the ciphertext as the SENDER (vault):
-                    // the reconstructed note's esk/pk_d decrypt enc_ciphertext.
+                    // recovery with the reconstructed esk/pk_d also checks the transmitted epk.
                     let memo = recover_memo(action, &note)
                         .ok_or_else(|| format!("output {i} memo cannot be recovered"))?;
                     payee = Some((recipient, value, memo));

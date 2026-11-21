@@ -11,7 +11,7 @@
 use std::{future::{pending, Future}, time::Duration};
 
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use tokio::{runtime::Runtime, sync::watch, time::Instant};
 use uuid::Uuid;
@@ -20,6 +20,10 @@ pub use loki_signer_core::transport::*;
 
 /// Only TLS, or plain HTTP to this machine, may carry relay or peer traffic.
 pub fn require_tls_off_loopback(base_url: &str) -> Result<(), String> {
+    tls_url(base_url).map(|_| ())
+}
+
+fn tls_url(base_url: &str) -> Result<reqwest::Url, String> {
     let url = reqwest::Url::parse(base_url).map_err(|e| format!("{base_url}: {e}"))?;
     let host = url.host_str().unwrap_or_default();
     let loopback = host == "localhost"
@@ -28,10 +32,25 @@ pub fn require_tls_off_loopback(base_url: &str) -> Result<(), String> {
             .parse::<std::net::IpAddr>()
             .is_ok_and(|ip| ip.is_loopback());
     match url.scheme() {
-        "https" => Ok(()),
-        "http" if loopback => Ok(()),
+        "https" => Ok(url),
+        "http" if loopback => Ok(url),
         _ => Err(format!("{base_url} must use https:// unless it is on loopback")),
     }
+}
+
+pub(crate) async fn read_bounded(response: &mut reqwest::Response, cap: usize) -> Result<Vec<u8>, String> {
+    let too_large = || format!("response exceeds {cap} bytes");
+    if response.content_length().is_some_and(|len| len > cap as u64) {
+        return Err(too_large());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if chunk.len() > cap - body.len() {
+            return Err(too_large());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// An open frostd session for one logged-in member.
@@ -69,6 +88,15 @@ pub struct FrostdTransport {
 // does not take the version-conflicting `frost-client` crate as a dependency (ADOPTION
 // §2: core is on frost-core 3.0.0, frost-client on 2.x — embedding it would duplicate the
 // crypto crates). The audited relay binary is unchanged; only its JSON contract is here.
+// Keep these client budgets in sync with wasm-transport. MAX_MSG_SIZE is frostd's send limit;
+// receive also needs a batch budget because frostd drains the entire pending queue at once.
+const MAX_MSG_SIZE: usize = 65_535;
+const MAX_RECEIVE_MESSAGES: usize = 1024;
+const RECEIVE_CAP: usize = 8 * 1024 * 1024;
+const LIST_CAP: usize = 256 * 1024;
+const INFO_CAP: usize = 128 * 1024;
+const CONTROL_CAP: usize = 4096;
+
 #[derive(Deserialize)]
 struct ChallengeOut {
     challenge: Uuid,
@@ -91,37 +119,33 @@ struct SessionInfoOut {
     #[serde(default)]
     coordinator_pubkey: Option<HexKey>,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Deserialize)]
 struct WireMsg {
     sender: HexKey,
-    #[serde(with = "hex_bytes")]
+    #[serde(deserialize_with = "decode_message")]
     msg: Vec<u8>,
 }
 #[derive(Deserialize)]
 struct ReceiveOut {
     msgs: Vec<WireMsg>,
 }
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Deserialize)]
 #[serde(transparent)]
-struct HexKey(#[serde(with = "hex_bytes")] Vec<u8>);
+struct HexKey(#[serde(deserialize_with = "decode_key")] [u8; 32]);
 
 // frostd serializes byte fields as lower-hex strings (`serdect` hex-or-bin). Mirror that.
-mod hex_bytes {
-    use serde::de::Error as _;
-    use serde::{Deserialize, Deserializer, Serializer};
-    pub fn serialize<S>(b: &[u8], s: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        s.serialize_str(&hex::encode(b))
+fn decode_key<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+    let mut key = [0; 32];
+    hex::decode_to_slice(String::deserialize(d)?, &mut key).map_err(serde::de::Error::custom)?;
+    Ok(key)
+}
+
+fn decode_message<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    let s = String::deserialize(d)?;
+    if s.len() > 2 * MAX_MSG_SIZE {
+        return Err(serde::de::Error::custom("relay message too large"));
     }
-    pub fn deserialize<'de, D>(d: D) -> Result<Vec<u8>, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(d)?;
-        hex::decode(&s).map_err(D::Error::custom)
-    }
+    hex::decode(s).map_err(serde::de::Error::custom)
 }
 
 impl FrostdTransport {
@@ -137,14 +161,18 @@ impl FrostdTransport {
         stop: Option<watch::Receiver<bool>>,
         deadline: Option<Instant>,
     ) -> Result<Self, TransportError> {
-        require_tls_off_loopback(base_url).map_err(TransportError::Http)?;
+        let url = tls_url(base_url).map_err(TransportError::Http)?;
+        if !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
+            return Err(TransportError::Http("invalid relay base URL".into()));
+        }
         let runtime = Runtime::new().map_err(|e| TransportError::Http(e.to_string()))?;
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| TransportError::Http(e.to_string()))?;
         let mut t = Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
+            base_url: url.as_str().trim_end_matches('/').to_string(),
             client,
             runtime,
             me: login.peer(),
@@ -181,26 +209,24 @@ impl FrostdTransport {
         url: String,
         token: Option<Uuid>,
         body: serde_json::Value,
+        cap: usize,
     ) -> Result<O, TransportError> {
         let mut req = client.post(&url).json(&body);
         if let Some(t) = token {
             req = req.bearer_auth(t.to_string());
         }
-        let resp = req
+        let mut resp = req
             .send()
             .await
             .map_err(|e| TransportError::Http(e.to_string()))?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(TransportError::Server(format!("{status}: {text}")));
+            let detail = read_bounded(&mut resp, 1024).await.unwrap_or_default();
+            return Err(TransportError::Server(format!("{status}: {}", String::from_utf8_lossy(&detail))));
         }
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| TransportError::Http(e.to_string()))?;
-        let text = if text.is_empty() { "null".into() } else { text };
-        serde_json::from_str(&text).map_err(|e| TransportError::Decode(e.to_string()))
+        let body = read_bounded(&mut resp, cap).await.map_err(TransportError::Http)?;
+        serde_json::from_slice(if body.is_empty() { b"null" } else { &body })
+            .map_err(|e| TransportError::Decode(e.to_string()))
     }
 
     /// `challenge` → XEdDSA-sign it with the X25519 secret → `login`, caching the token.
@@ -212,7 +238,7 @@ impl FrostdTransport {
         let me = self.me.0;
         let token = self.run(async move {
             let ch: ChallengeOut =
-                Self::post(&client, format!("{base}/challenge"), None, json!({})).await?;
+                Self::post(&client, format!("{base}/challenge"), None, json!({}), CONTROL_CAP).await?;
             let signing = xeddsa::xed25519::PrivateKey::from(&*secret);
             // xeddsa 1.1.0's `CryptoRng` is the rand 0.10 trait shape; `rand_zp::rng()`
             // (the OS-seeded ThreadRng, a `CryptoRng`) satisfies it. core aliases rand 0.10
@@ -228,6 +254,7 @@ impl FrostdTransport {
                     "pubkey": hex::encode(me),
                     "signature": hex::encode(sig),
                 }),
+                CONTROL_CAP,
             )
             .await?;
             Ok::<_, TransportError>(out.access_token)
@@ -245,6 +272,7 @@ impl FrostdTransport {
             format!("{}/list_sessions", self.base_url),
             self.token,
             json!({}),
+            LIST_CAP,
         ))?;
         Ok(out.session_ids)
     }
@@ -261,16 +289,29 @@ impl FrostdTransport {
             format!("{}/get_session_info", self.base_url),
             self.token,
             json!({ "session_id": session }),
+            INFO_CAP,
         ))?;
-        let owner = out.coordinator_pubkey.map(|k| k.0.try_into().map_err(|_| TransportError::Decode("coordinator key length".into()))).transpose()?;
-        let participants = out.pubkeys
-            .into_iter()
-            .map(|k| {
-                k.0.try_into()
-                    .map_err(|_| TransportError::Decode("session pubkey length".into()))
-            })
-            .collect::<Result<_, _>>()?;
-        Ok((participants, owner))
+        Ok((out.pubkeys.into_iter().map(|k| k.0).collect(), out.coordinator_pubkey.map(|k| k.0)))
+    }
+
+    pub(crate) fn recv_control_bounded(&self, session: Uuid, timeout: Duration) -> Result<Vec<Incoming>, TransportError> {
+        self.receive(session, false, timeout)
+    }
+
+    fn receive(&self, session: Uuid, as_coordinator: bool, timeout: Duration) -> Result<Vec<Incoming>, TransportError> {
+        let out: ReceiveOut = self.run(async {
+            tokio::time::timeout(timeout, Self::post(
+                &self.client,
+                format!("{}/receive", self.base_url),
+                self.token,
+                json!({ "session_id": session, "as_coordinator": as_coordinator }),
+                RECEIVE_CAP,
+            )).await.map_err(|_| TransportError::Http("relay receive timed out".into()))?
+        })?;
+        if out.msgs.len() > MAX_RECEIVE_MESSAGES {
+            return Err(TransportError::Decode("too many relay messages".into()));
+        }
+        Ok(out.msgs.into_iter().map(|m| Incoming { from: Peer(m.sender.0), message: m.msg }).collect())
     }
 }
 
@@ -288,6 +329,7 @@ impl Transport for FrostdTransport {
             format!("{base}/create_new_session"),
             token,
             json!({ "pubkeys": pubkeys, "message_count": message_count }),
+            CONTROL_CAP,
         ))?;
         Ok(FrostdChannel {
             session: out.session_id,
@@ -306,6 +348,9 @@ impl Transport for FrostdTransport {
 
     fn send(&self, channel: &FrostdChannel, to: &[Peer], message: &Outbound) -> Result<(), TransportError> {
         let message = message.to_bytes()?;
+        if message.len() > MAX_MSG_SIZE {
+            return Err(TransportError::Decode("relay message too large".into()));
+        }
         let base = self.base_url.clone();
         let client = self.client.clone();
         let token = self.token;
@@ -319,34 +364,13 @@ impl Transport for FrostdTransport {
                 "recipients": recipients,
                 "msg": hex::encode(message),
             }),
+            CONTROL_CAP,
         ))?;
         Ok(())
     }
 
     fn recv(&self, channel: &FrostdChannel, as_coordinator: bool) -> Result<Vec<Incoming>, TransportError> {
-        let base = self.base_url.clone();
-        let client = self.client.clone();
-        let token = self.token;
-        let out: ReceiveOut = self.run(Self::post(
-            &client,
-            format!("{base}/receive"),
-            token,
-            json!({ "session_id": channel.session, "as_coordinator": as_coordinator }),
-        ))?;
-        out.msgs
-            .into_iter()
-            .map(|m| {
-                let key: [u8; 32] = m
-                    .sender
-                    .0
-                    .try_into()
-                    .map_err(|_| TransportError::Decode("sender pubkey length".into()))?;
-                Ok(Incoming {
-                    from: Peer(key),
-                    message: m.msg,
-                })
-            })
-            .collect()
+        self.receive(channel.session, as_coordinator, Duration::from_secs(30))
     }
 
     fn close(&self, channel: FrostdChannel) -> Result<(), TransportError> {
@@ -358,6 +382,7 @@ impl Transport for FrostdTransport {
             format!("{base}/close_session"),
             token,
             json!({ "session_id": channel.session }),
+            CONTROL_CAP,
         ))?;
         Ok(())
     }

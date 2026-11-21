@@ -1,8 +1,10 @@
 mod support;
+use ed25519_dalek::{Signer, SigningKey};
 use loki_relay_protocol::{
     envelope,
     http::{encode_creation, encode_setup_control},
-    types::{Creation, Object},
+    nonce::{self, ClaimProof, Claimant},
+    types::{Creation, Object, RelayPin},
 };
 use loki_relay_server::{
     capability::{provisioning_verifier, verifier},
@@ -75,23 +77,35 @@ fn setup_expiry_retains_active_data_then_removes_only_setup_objects_and_never_re
     store
         .put(payment, &payment_obj, &Capability::new([3; 32]))
         .unwrap();
+    let key = SigningKey::from_bytes(&[2; 32]);
+    let who = Claimant {
+        vault: [9; 32],
+        slot: 1,
+        key: key.verifying_key().to_bytes(),
+    };
+    let pin = RelayPin {
+        key: store.public_key(),
+        run: store.run_id(),
+    };
+    let proof = |mailbox| ClaimProof {
+        claimant: who,
+        signature: key
+            .sign(&nonce::claim_input(
+                who,
+                &pin,
+                mailbox,
+                [10; 32],
+                [11; 32],
+                &[1, 2, 3],
+            ))
+            .to_bytes(),
+    };
+    store.enroll_nonce_claimant(payment, who, 2048).unwrap();
     store
-        .claim_nonce(
-            payment,
-            [10; 32],
-            [11; 32],
-            &[1, 2, 3],
-            &Capability::new([2; 32]),
-        )
+        .claim_nonce(payment, [10; 32], [11; 32], &[1, 2, 3], &proof(payment))
         .unwrap();
     assert_eq!(
-        store.claim_nonce(
-            setup,
-            [10; 32],
-            [11; 32],
-            &[1, 2, 3],
-            &Capability::new([2; 32])
-        ),
+        store.claim_nonce(setup, [10; 32], [11; 32], &[1, 2, 3], &proof(setup)),
         Err(RelayError::Capability)
     );
     assert_eq!(store.cleanup_setup(deadline - 1).unwrap(), 0);
@@ -125,12 +139,16 @@ fn setup_expiry_retains_active_data_then_removes_only_setup_objects_and_never_re
     assert!(store
         .setup_control(setup, &control, &Capability::new([8; 32]))
         .is_err());
+    let (fresh, _) = store
+        .claim_nonce(payment, [10; 32], [11; 32], &[1, 2, 3], &proof(payment))
+        .unwrap();
+    assert!(!fresh, "the payment claim survived cleanup and reopening");
     let db = rusqlite::Connection::open(root.path().join("relay.sqlite3")).unwrap();
     assert_eq!(
-        db.query_row("SELECT count(*) FROM nonce_uses", [], |r| r
+        db.query_row("SELECT used_bytes FROM nonce_claimants", [], |r| r
             .get::<_, u64>(0))
             .unwrap(),
-        1
+        515
     );
     assert_eq!(
         db.query_row(
@@ -139,7 +157,7 @@ fn setup_expiry_retains_active_data_then_removes_only_setup_objects_and_never_re
             |r| r.get::<_, u64>(0)
         )
         .unwrap(),
-        1027
+        1024
     );
 }
 #[test]

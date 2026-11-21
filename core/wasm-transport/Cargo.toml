@@ -1,7 +1,7 @@
 # W3 browser transport to frostd. A standalone crate (NOT a member of the core
 # workspace) so it compiles to wasm32-unknown-unknown on its own: the big `loki-poc`
 # crate pulls orchard/tonic/rusqlite and cannot target wasm, but the wire to frostd
-# only needs reqwest's fetch backend + the login signature. Integrates into the signer
+# only needs Fetch + the login signature. Integrates into the signer
 # core (W1) once that compiles to wasm; see src/lib.rs.
 [package]
 name = "loki-wasm-transport"
@@ -19,15 +19,14 @@ crate-type = ["cdylib", "rlib"]
 [workspace]
 
 [dependencies]
-# reqwest on wasm32 compiles to the browser Fetch API (async, no tokio runtime); on
-# native it is the same client over http. Same crate/version core already uses.
+# Build the same requests as core. In the browser we send them with Fetch directly
+# because reqwest's wasm backend does not expose redirect policy.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # No `v4`: this crate only parses/echoes session ids, never mints them (so no wasm RNG dep).
 uuid = { version = "1", features = ["serde"] }
 hex = "0.4"
-zeroize = "1"
 # Login challenge signature — exactly what frostd verifies (xed25519 over the challenge).
 xeddsa = "1"
 # RNG for the XEdDSA signature nonce. rand 0.10 == core's `rand_zp`.
@@ -40,12 +39,13 @@ wasm-bindgen = "0.2"
 loki-relay-protocol = { path = "../../communication/protocol" }
 ed25519-dalek = "2"
 sha2 = "0.10"
-base64 = "0.22"
 
 # getrandom (via rand 0.10 → rand_core 0.10) needs the browser entropy backend on wasm.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.4", features = ["wasm_js"] }
+js-sys = "0.3"
 wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["AbortController", "AbortSignal", "Headers", "ReadableStream", "ReadableStreamDefaultReader", "Request", "RequestInit", "RequestRedirect", "Response", "WorkerGlobalScope"] }
 
 [dev-dependencies]
 # Native-only: drive the async methods in the round-trip test against a live frostd,

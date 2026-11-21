@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { api, pairDevice, PairingSlotTaken, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
+import { api, pairDevice, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
 import * as members from '../src/lib/members.ts';
 
 test('a tab paired with a native member routes member calls to it, with its capability', async () => {
@@ -52,6 +53,10 @@ test('the wallet asks for a pairing link, then for the same slot again only once
   const dir = mkdtempSync(join(tmpdir(), 'loki-wallet-pairing-'));
   process.env.LOKI_REGISTRY = join(dir, 'roster.json');
   const origin = 'http://localhost:3001';
+  const grant = '1a'.repeat(32);
+  const otherGrant = '2b'.repeat(32);
+  const digest = (token) => createHash('sha256').update(token).digest('hex');
+  process.env.LOKI_ONBOARDING_GRANTS = JSON.stringify({ [digest(grant)]: null, [digest(otherGrant)]: null });
   const bodies = [];
   let reply = null; // replaces the real coordinator for one request
   const originalFetch = globalThis.fetch;
@@ -65,24 +70,27 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     catch (e) { return Response.json({ error: e.message }, { status: 400 }); }
   };
   const originalWindow = globalThis.window;
-  globalThis.window = { location: { origin } };
+  const location = { origin, pathname: '/', search: '', hash: `#onboarding=${grant}` };
+  globalThis.window = { location, history: { replaceState: () => { location.hash = ''; } } };
   try {
     const first = await requestPairingLink();
-    assert.deepEqual(bodies[0], {}, 'the first link lets the coordinator pick the slot');
+    assert.deepEqual(bodies[0], { onboarding_grant: grant }, 'the first link lets the coordinator pick the slot');
     assert.equal(first.slot, 1);
     assert(first.url.startsWith('loki://pair?') && first.expires > Date.now());
     // Another member's link takes the next slot, so a request without a slot no longer returns 1.
-    assert.equal((await members.issuePairingChallenge({}, origin)).slot, 2);
+    assert.equal((await members.issuePairingChallenge({ onboarding_grant: otherGrant }, origin)).slot, 2);
 
-    // While the link is live its slot is reserved; the member reads a sentence, not the coordinator's,
-    // and the page learns that the next link must take another slot.
-    await assert.rejects(requestPairingLink(first.slot), (e) => e instanceof PairingSlotTaken && /^Slot 1 was taken, possibly by another member\. .*another slot\.$/.test(e.message));
+    // While the link is live its owner receives the same claim, not a new reservation.
+    assert.equal((await requestPairingLink(first.slot)).url, first.url);
 
     // Once it expired, a new link is for slot 1 again, with a new claim.
-    const file = process.env.LOKI_REGISTRY + '.challenges';
-    writeFileSync(file, JSON.stringify(JSON.parse(readFileSync(file)).map((c) => c.pairing_slot === 1 ? { ...c, expires: 0 } : c)));
+    const file = process.env.LOKI_REGISTRY;
+    const snapshot = JSON.parse(readFileSync(file));
+    snapshot.challenges = snapshot.challenges.map((c) => c.pairing_slot === 1 ? { ...c, expires: 0 } : c);
+    snapshot.grants[digest(grant)].retry_after = 0;
+    writeFileSync(file, JSON.stringify(snapshot));
     const again = await requestPairingLink(first.slot);
-    assert.deepEqual(bodies.at(-1), { slot: 1 });
+    assert.deepEqual(bodies.at(-1), { slot: 1, onboarding_grant: grant });
     assert.equal(again.slot, 1);
     assert.notEqual(new URL(again.url).searchParams.get('challenge'), new URL(first.url).searchParams.get('challenge'));
 
@@ -147,6 +155,6 @@ test('the wallet asks for a pairing link, then for the same slot again only once
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.window = originalWindow;
-    rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY;
+    rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; delete process.env.LOKI_ONBOARDING_GRANTS;
   }
 });

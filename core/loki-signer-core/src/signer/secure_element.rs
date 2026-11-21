@@ -302,7 +302,7 @@ impl SealedShare {
         let backup_epoch = u64::from_be_bytes(raw[8..16].try_into().unwrap());
         let dek_len = u32::from_be_bytes(raw[16..20].try_into().unwrap()) as usize;
         let mut at = 20;
-        if at + dek_len + 24 > raw.len() {
+        if raw.len() < at + 24 || dek_len > raw.len() - at - 24 {
             return Err("truncated sealed share blob".into());
         }
         let wrapped_dek = WrappedDek(raw[at..at + dek_len].to_vec());

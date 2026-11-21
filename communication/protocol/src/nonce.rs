@@ -4,9 +4,74 @@ use crate::{
     types::{Id32, RelayPin},
     WireError, WireResult,
 };
+use sha2::{Digest, Sha256};
 
 pub const SIGNATURE_DOMAIN: &[u8] = b"Loki_Relay_Nonce_v1\0";
 pub const MAX_RECORD: usize = 65_536;
+pub const CLAIM_SCHEME: &str = "LokiNonce ";
+pub const CLAIM_PROOF_LEN: usize = 130;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Claimant {
+    pub vault: Id32,
+    pub slot: u16,
+    pub key: Id32,
+}
+
+pub struct ClaimProof {
+    pub claimant: Claimant,
+    pub signature: [u8; 64],
+}
+
+impl ClaimProof {
+    pub fn to_bytes(&self) -> [u8; CLAIM_PROOF_LEN] {
+        let mut raw = [0; CLAIM_PROOF_LEN];
+        raw[..32].copy_from_slice(&self.claimant.vault);
+        raw[32..34].copy_from_slice(&self.claimant.slot.to_be_bytes());
+        raw[34..66].copy_from_slice(&self.claimant.key);
+        raw[66..].copy_from_slice(&self.signature);
+        raw
+    }
+
+    pub fn from_bytes(raw: [u8; CLAIM_PROOF_LEN]) -> Self {
+        Self {
+            claimant: Claimant {
+                vault: raw[..32].try_into().unwrap(),
+                slot: u16::from_be_bytes(raw[32..34].try_into().unwrap()),
+                key: raw[34..66].try_into().unwrap(),
+            },
+            signature: raw[66..].try_into().unwrap(),
+        }
+    }
+}
+
+/// This authorization is usable only for this enrolled vault slot, witness, and exact claim.
+/// CID binds the public FROST commitment; the relay keeps authenticated CIDs slot-scoped
+/// so another enrolled signer cannot consume one by submitting the same opaque ID.
+pub fn claim_input(
+    who: Claimant,
+    pin: &RelayPin,
+    mailbox: Id32,
+    cid: Id32,
+    challenge: Id32,
+    record: &[u8],
+) -> Vec<u8> {
+    let mut input = b"Loki_Relay_NonceClaim_v1\0".to_vec();
+    input.extend_from_slice(&who.slot.to_be_bytes());
+    for field in [
+        who.vault,
+        who.key,
+        pin.key,
+        pin.run,
+        mailbox,
+        cid,
+        challenge,
+        Sha256::digest(record).into(),
+    ] {
+        input.extend_from_slice(&field);
+    }
+    input
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NonceReceipt {

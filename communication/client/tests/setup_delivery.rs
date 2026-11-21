@@ -1235,7 +1235,7 @@ fn setup_store_migrates_only_the_exact_legacy_catalog() {
         let sql = rusqlite::Connection::open(path.join("setup.sqlite3")).unwrap();
         // The oldest catalog: no `deferred` table and recipients bounded at 4.
         let version: i64 = sql.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
-        sql.execute_batch("DROP TABLE deferred; PRAGMA writable_schema=ON;").unwrap();
+        sql.execute_batch("DROP TABLE pending_roots; DROP TABLE deferred; PRAGMA writable_schema=ON;").unwrap();
         sql.execute(
             "UPDATE sqlite_master SET sql=replace(sql,'recipient BETWEEN 1 AND 16)','recipient BETWEEN 1 AND 4)') WHERE type='table'",
             [],

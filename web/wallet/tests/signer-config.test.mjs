@@ -29,7 +29,7 @@ test('the coordinator serves the signer origin\'s configuration to LokiSigner, a
     assert.deepEqual(ok.body, {
       network: 'testnet', frostdUrl: 'https://frostd.example', lightwalletdUrl: 'https://lwd.example:443',
       nonceWitnesses: [1, 5].map((n, i) => ({ endpoint: `https://w${i + 1}.example`, key: Array(32).fill(n),
-        run: Array(32).fill(n + 1), mailbox: Array(32).fill(n + 2), read: Array(32).fill(n + 3) })),
+        run: Array(32).fill(n + 1), mailbox: Array(32).fill(n + 2) })),
     });
     reply = (res) => res.end(JSON.stringify({ ...served(), lightwalletdUrl: '' }));
     assert.equal((await get()).body.lightwalletdUrl, null, 'an unset lightwalletd is absent, not invented');
@@ -46,7 +46,7 @@ test('the coordinator serves the signer origin\'s configuration to LokiSigner, a
     }
     await refused((res) => res.writeHead(302, { Location: '/elsewhere' }).end(), /answered 302/);
     await refused((res) => res.end(JSON.stringify({ ...served(), nonceWitnesses: [served().nonceWitnesses[0]] })), /nonce witness list/);
-    await refused((res) => res.end(JSON.stringify({ ...served(), nonceWitnesses: [witness(1, 'https://w1.example'), { ...witness(5, 'https://w2.example'), read: 'zz' }] })), /nonce witness read/);
+    await refused((res) => res.end(JSON.stringify({ ...served(), nonceWitnesses: [witness(1, 'https://w1.example'), { ...witness(5, 'https://w2.example'), mailbox: 'zz' }] })), /nonce witness mailbox/);
     await refused((res) => res.end(JSON.stringify({ ...served(), frostdUrl: '' })), /frostd URL/);
     await refused((res) => res.end('not json'), /invalid configuration/);
   } finally {

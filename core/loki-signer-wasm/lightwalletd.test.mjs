@@ -18,11 +18,11 @@ test("requests are gRPC-web protobuf and heights decode", async () => {
   globalThis.fetch = async (url, init) => {
     seen.push([url, [...init.body], init.headers["content-type"]]);
     // BlockID { height = 4639094 } -> 08 f6 92 9b 02
-    const body = url.endsWith("GetLatestBlock") ? frame(0, [0x08, 0xf6, 0x92, 0x9b, 0x02]) : frame(0, [7]);
+    const body = url.endsWith("GetLatestBlock") ? frame(0, [0x08, 0xf6, 0x92, 0x9b, 0x02]) : [0x8c, 0x8d, 0x8e].flatMap((lo) => frame(0, [0x10, lo, 0x92, 0x9b, 0x02]));
     return new Response(Uint8Array.from([...body, ...trailer("grpc-status:0\r\n")]), { status: 200 });
   };
   assert.equal(await latestHeight("http://lwd/"), 4639094);
-  assert.equal((await blockRange("http://lwd", 4638988, 4638990)).length, 1);
+  assert.equal((await blockRange("http://lwd", 4638988, 4638990)).length, 3);
   assert.equal(seen[0][0], "http://lwd/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock");
   assert.deepEqual(seen[0][1], [0, 0, 0, 0, 0]);
   assert.equal(seen[1][2], "application/grpc-web+proto");

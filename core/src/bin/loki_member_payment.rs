@@ -11,7 +11,7 @@ use std::{
 };
 
 #[cfg(feature = "relay-communication")]
-use loki_poc::signing_session::{NonceWitness, ReviewedPackage};
+use loki_poc::signing_session::{NonceWitness, ReviewedPackage, WitnessPins};
 use loki_poc::tx_finalize::finalized_sighash;
 use loki_poc::{
     candidate::{alpha_from_canonical_bytes, build_candidate, quote_fee, CandidateInputs},
@@ -21,6 +21,7 @@ use loki_poc::{
     payment_manifest::{validate_roster, MAX_INPUTS},
     rpc::Rpc,
     scan,
+    state::MemberDir,
     wallet_store::{lightwalletd_url, sync_member_wallet, VaultWallet},
     signing_session::{
         aggregate_and_apply, commitments_from_message, AttemptId, Mailbox, MessageKind,
@@ -36,7 +37,7 @@ use reddsa_frost::frost::redpallas as frost;
 use serde_json::json;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use zcash_client_backend::proto::service::{BlockId, Empty, RawTransaction};
+use zcash_client_backend::proto::service::{BlockId, Empty, RawTransaction, TxFilter};
 use zcash_primitives::transaction::TxId;
 use zcash_client_backend::wallet::LockOwner;
 use zcash_protocol::consensus::BlockHeight;
@@ -638,7 +639,7 @@ fn commit(args: &[String]) -> Result<(), String> {
     let own = member.identity.public().id;
     let identity =
         loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
-    let relays = two_relays(args)?;
+    let relays = two_relays(args, None)?;
     let session = SigningSession::begin_sealed(
         &owner.join("signing"),
         context.clone(),
@@ -664,23 +665,11 @@ fn commit(args: &[String]) -> Result<(), String> {
 
 #[cfg(feature = "relay-communication")]
 fn reopen_signer(
-    args: &[String],
-) -> Result<
-    (
-        MemberState,
-        PathBuf,
-        Zeroizing<String>,
-        SessionContext,
-        Intent,
-        Mailbox,
-        SigningSession,
-    ),
-    String,
-> {
-    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
+    member: &MemberState, owner: &Path, pass: &str, context: &SessionContext, intent: &Intent,
+) -> Result<SigningSession, String> {
     let identity =
         loki_poc::setup_transport::Identity::from_secret_bytes(&member.identity.to_secret_bytes())?;
-    let session = SigningSession::reopen_sealed(
+    SigningSession::reopen_sealed(
         &owner.join("signing"),
         context.clone(),
         &member.vault,
@@ -689,9 +678,8 @@ fn reopen_signer(
         member.key.clone(),
         member.public.clone(),
         member.fvk.clone(),
-        &pass,
-    )?;
-    Ok((member, owner, pass, context, intent, mailbox, session))
+        pass,
+    )
 }
 
 fn next_message(
@@ -710,10 +698,20 @@ fn next_message(
 
 #[cfg(feature = "relay-communication")]
 fn package(args: &[String]) -> Result<(), String> {
-    let (member, owner, pass, context, intent, mailbox, session) = reopen_signer(args)?;
+    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
     let own = member.identity.public().id;
     if own != context.signers[0] {
         return Err("only the selected proposer builds this package".into());
+    }
+    if SigningSession::republish_saved_package(&owner.join("signing"), &context, own, &pass, &mailbox)? {
+        println!("payment package published; members may review");
+        return Ok(());
+    }
+    let session = reopen_signer(&member, &owner, &pass, &context, &intent)?;
+    // Another process may have saved the package before we acquired the signing lock.
+    if SigningSession::republish_saved_package(&owner.join("signing"), &context, own, &pass, &mailbox)? {
+        println!("payment package published; members may review");
+        return Ok(());
     }
     let mut peers = BTreeMap::new();
     for &peer_id in context.signers.iter().filter(|id| **id != own) {
@@ -729,6 +727,8 @@ fn package(args: &[String]) -> Result<(), String> {
 #[cfg(feature = "relay-communication")]
 struct TwoRelays {
     own: Vec<OwnerInbox>,
+    identity: loki_relay_client::CommIdentity,
+    vault: [u8; 32],
     http: RelayHttp,
     runtime: RelayRuntime,
 }
@@ -754,7 +754,9 @@ impl NonceWitness for TwoRelays {
         for inbox in &self.own[..2] {
             let created = self
                 .runtime
-                .block_on(self.http.claim_nonce(&inbox.route, &inbox.read, cid, wire))
+                .block_on(self.http.claim_nonce(&inbox.route, cid, wire, |challenge| {
+                    self.identity.nonce_claim_proof(self.vault, &inbox.route, cid, challenge, wire)
+                }))
                 .map_err(|e| format!("nonce relay claim: {e}"))?;
             if !created {
                 return Err("nonce already claimed; start a new signing attempt".into());
@@ -765,7 +767,7 @@ impl NonceWitness for TwoRelays {
 }
 
 #[cfg(feature = "relay-communication")]
-fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
+fn two_relays(args: &[String], original: Option<WitnessPins>) -> Result<TwoRelays, String> {
     let root = Path::new(&args[0]);
     let loaded = loki_poc::relay_member::load(root, Path::new(&args[1]), Path::new(&args[2]))
         .map_err(|e| e.to_string())?;
@@ -777,10 +779,20 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
         loaded.identity.public().id,
     )
     .map_err(|e| e.to_string())?;
-    let configured = config_store
+    let mut configured = config_store
         .routing(&db, &loaded)
         .map_err(|e| e.to_string())?
         .own;
+    if let Some(pins) = original {
+        let mut exact = Vec::with_capacity(2);
+        for (key, run, mailbox) in pins {
+            let index = configured.iter().position(|inbox| {
+                inbox.route.pin.key == key && inbox.route.pin.run == run && inbox.route.mailbox == mailbox
+            }).ok_or("an original nonce witness is no longer configured; start a new signing attempt")?;
+            exact.push(configured.swap_remove(index));
+        }
+        configured = exact;
+    }
     let http = RelayHttp::new().map_err(|e| e.to_string())?;
     let runtime = RelayRuntime::new().map_err(|e| e.to_string())?;
     let mut own: Vec<OwnerInbox> = Vec::new();
@@ -788,6 +800,9 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
         match runtime.block_on(http.authenticate_endpoint(&inbox.route.pin, &inbox.route.endpoint))
         {
             Ok(()) => own.push(inbox),
+            Err(error) if original.is_some() => return Err(format!(
+                "original nonce witness unavailable: {error}; start a new signing attempt"
+            )),
             Err(loki_relay_client::ClientError::Transport) => continue,
             Err(error) => return Err(format!("nonce relay identity: {error}")),
         }
@@ -801,7 +816,7 @@ fn two_relays(args: &[String]) -> Result<TwoRelays, String> {
     {
         return Err("two distinct reachable configured relays required for nonce safety".into());
     }
-    Ok(TwoRelays { own, http, runtime })
+    Ok(TwoRelays { own, identity: loaded.identity, vault: loaded.roster.vault, http, runtime })
 }
 
 #[cfg(feature = "relay-communication")]
@@ -818,7 +833,8 @@ fn reviewed_signer(
     ),
     String,
 > {
-    let (member, owner, pass, context, _intent, mailbox, session) = reopen_signer(args)?;
+    let (member, owner, pass, context, intent, mailbox) = signing_inputs(args)?;
+    let session = reopen_signer(&member, &owner, &pass, &context, &intent)?;
     let own = member.identity.public().id;
     let peer_id = if own == context.signers[0] { context.signers[1] } else { context.signers[0] };
     let peer = member.roster.members[&peer_id].clone();
@@ -890,7 +906,8 @@ fn approve(args: &[String], reviewed_token: bool) -> Result<(), String> {
         let (_, intent) = manifest(&Path::new(&args[3]).join("payment.json"), member.network)?;
         confirm(&intent, reviewed.summary(), member.network)?;
     }
-    let mut relays = two_relays(args)?;
+    let original = session.witness_pins().ok_or("missing original witnesses; start a new signing attempt")?;
+    let mut relays = two_relays(args, Some(original))?;
     session.publish_approved_secured_to_roster(
         reviewed,
         &peer,
@@ -918,64 +935,80 @@ fn resend(args: &[String]) -> Result<(), String> {
     }
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let root = owner.join("signing");
-    if own == context.signers[0] {
-        for wire in SigningSession::saved_package_wires(&root, &context, own, &pass)? {
-            mailbox.append(&wire).map_err(|e| e.to_string())?;
-        }
-    }
-    SigningSession::recover_share(&root, &context, own, &pass, &mailbox)?;
-    println!(
-        "resent exact saved approval for payment {}",
-        hex::encode(context.payment)
-    );
+    let package = own == context.signers[0]
+        && SigningSession::republish_saved_package(&root, &context, own, &pass, &mailbox)?;
+    let what = if SigningSession::recover_share_if_saved(&root, &context, own, &pass, &mailbox)? {
+        "approval"
+    } else if package {
+        "package"
+    } else {
+        return Err("no saved package or approval to resend".into());
+    };
+    println!("resent exact saved {what} for payment {}", hex::encode(context.payment));
     Ok(())
 }
 
 use loki_poc::tx_finalize::prove;
 
-fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
-    if args.len() != 4 && !(broadcast && args.len() == 5) {
-        return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [lightwalletd-url]".into());
+fn final_transaction_record(context: &SessionContext) -> (String, [u8; 32]) {
+    let mut hash = blake3::Hasher::new_derive_key("loki standalone finalized transaction v1");
+    hash.update(&context.vault).update(&context.payment).update(&context.attempt.0);
+    for id in &context.signers {
+        hash.update(&id.to_be_bytes());
     }
-    let (member, owner, pass) = state(args)?;
-    let url = args.get(4).cloned().or_else(|| lightwalletd_url(member.network));
-    if broadcast && member.network == VaultNetwork::Testnet && url.is_none() {
-        return Err("Testnet finish requires a lightwalletd URL".into());
+    (format!("final-{}.sealed", hex::encode(context.attempt.0)), *hash.finalize().as_bytes())
+}
+
+fn read_final_transaction(
+    owner: &Path, context: &SessionContext, pass: &str,
+) -> Result<Option<(Vec<u8>, TxId)>, String> {
+    let (file, binding) = final_transaction_record(context);
+    let body = match MemberDir::open(owner, "").read_sealed(&file, pass) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read saved transaction: {e}")),
+    };
+    if body.len() <= 64 || body[..32] != binding {
+        return Err("saved transaction differs from the payment attempt".into());
     }
-    let work = Path::new(&args[3]);
-    private_work(work)?;
-    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
-    check_manifest_roster(&member.roster, &context, &intent)?;
+    let txid = TxId::from_bytes(body[32..64].try_into().unwrap());
+    Ok(Some((body[64..].to_vec(), txid)))
+}
+
+fn collect_signed_candidate(
+    member: &MemberState, owner: &Path, pass: &str, work: &Path,
+    context: &SessionContext, intent: &Intent, wait: bool,
+) -> Result<(pczt::Pczt, [u8; 32], Vec<usize>), String> {
     let mailbox = Mailbox::new(&work.join("mailbox")).map_err(|e| e.to_string())?;
     let own = member.identity.public().id;
     let peer = context.signers.contains(&own).then(||
         context.signers.iter().copied().find(|id| *id != own).unwrap());
     let read_message = |kind, sender| {
-        if broadcast {
-            wait_message(&mailbox, &member, &context, kind, sender)
+        if wait {
+            wait_message(&mailbox, member, context, kind, sender)
         } else {
-            next_message(&mailbox, &member, &context, kind, sender)
+            next_message(&mailbox, member, context, kind, sender)
         }
     };
     let package = if own == context.signers[0] {
         let wires =
-            SigningSession::saved_package_wires(&owner.join("signing"), &context, own, &pass)?;
+            SigningSession::saved_package_wires(&owner.join("signing"), context, own, pass)?;
         member.identity.open_sent_session(
             &member.roster.members[&peer.unwrap()],
-            &context,
+            context,
             &wires[0],
         )?
     } else {
         read_message(MessageKind::Package, context.signers[0])?
     };
-    let payload = PackagePayload::decode(&context, package.body())?;
+    let payload = PackagePayload::decode(context, package.body())?;
     let mut shares = Vec::new();
     if let Some(peer_id) = peer {
         let wires =
-            SigningSession::saved_share_wires(&owner.join("signing"), &context, own, &pass)?;
+            SigningSession::saved_share_wires(&owner.join("signing"), context, own, pass)?;
         let own_share = member.identity.open_sent_session(
             &member.roster.members[&peer_id],
-            &context,
+            context,
             &wires[0],
         )?;
         shares.push(own_share);
@@ -985,16 +1018,29 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
             shares.push(read_message(MessageKind::Share, id)?);
         }
     }
-    let (signed, sighash, indices) = aggregate_and_apply(
-        &context,
-        &intent,
+    aggregate_and_apply(
+        context,
+        intent,
         &member.vault,
         &member.public,
         &member.fvk,
         &payload,
         &shares,
-    )?;
+    )
+}
+
+fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
+    if args.len() != 4 && !(broadcast && args.len() == 5) {
+        return Err("finish <member-dir> <passphrase-file> <roster.json> <work-dir> [lightwalletd-url]".into());
+    }
+    let (member, owner, pass) = state(args)?;
+    let url = args.get(4).cloned().or_else(|| lightwalletd_url(member.network));
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
     if !broadcast {
+        let (_, sighash, _) = collect_signed_candidate(&member, &owner, &pass, work, &context, &intent, false)?;
         println!(
             "aggregate verified payment={} sighash={}",
             hex::encode(context.payment),
@@ -1002,6 +1048,15 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
         );
         return Ok(());
     }
+    if member.network == VaultNetwork::Testnet && url.is_none() {
+        return Err("Testnet finish requires a lightwalletd URL".into());
+    }
+    let saved = read_final_transaction(&owner, &context, &pass)?;
+    let candidate = if saved.is_none() {
+        Some(collect_signed_candidate(&member, &owner, &pass, work, &context, &intent, true)?)
+    } else {
+        None
+    };
     let (mut wallet, height, frontier, lightwalletd) = match member.network {
         VaultNetwork::Regtest => {
             let (wallet, height, frontier) = synced_wallet(&member, &owner, &pass, &Rpc::regtest())?;
@@ -1032,35 +1087,56 @@ fn finish(args: &[String], broadcast: bool) -> Result<(), String> {
             (wallet, height, frontier, Some((runtime, client)))
         }
     };
-    let anchor = frontier.root(None).to_bytes();
-    let witnesses = indices
-        .iter()
-        .copied()
-        .zip(
-            wallet
-                .ironwood_inputs_at(BlockHeight::from_u32(height), frontier, &intent.input_nullifiers)?
-                .into_iter()
-                .map(|(_, path)| path),
-        )
-        .collect();
-    let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
-    // A draft reservation this device holds passes to the broadcast transaction.
-    wallet.release_inputs(LockOwner::new(context.attempt.0), &intent.input_nullifiers)?;
-    // shortcut: ambiguous broadcast failures keep inputs locked until expiry; add mempool reconciliation for early release.
-    wallet.reserve_inputs(txid.into(), &intent.input_nullifiers, intent.expiry_height)?;
-    if let Some((runtime, mut client)) = lightwalletd {
-        let sent = runtime.block_on(client.send_transaction(RawTransaction {
-            data: raw.clone(), height: 0,
-        })).map_err(|e| format!("lightwalletd send transaction: {e}"))?.into_inner();
-        if sent.error_code != 0 {
-            wallet.release_inputs(txid.into(), &intent.input_nullifiers)?;
-            return Err(format!("lightwalletd rejected transaction ({}): {}", sent.error_code, sent.error_message));
+    let (raw, txid) = if let Some((signed, sighash, indices)) = candidate {
+        let anchor = frontier.root(None).to_bytes();
+        let witnesses = indices.into_iter().zip(
+            wallet.ironwood_inputs_at(BlockHeight::from_u32(height), frontier, &intent.input_nullifiers)?
+                .into_iter().map(|(_, path)| path),
+        ).collect();
+        let (raw, txid) = prove(signed, sighash, witnesses, anchor)?;
+        let (file, binding) = final_transaction_record(&context);
+        let record = [&binding[..], txid.as_ref(), &raw].concat();
+        // A concurrent finisher cannot replace the first complete record.
+        match MemberDir::open(&owner, "").write_sealed(&file, &record, &pass) {
+            Ok(()) => (raw, txid),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                read_final_transaction(&owner, &context, &pass)?.ok_or("saved transaction disappeared")?
+            }
+            Err(e) => return Err(format!("save finalized transaction: {e}")),
         }
     } else {
-        let sent = Rpc::regtest().json("sendrawtransaction", &format!("[\"{}\"]", hex::encode(&raw)))?;
-        if sent.as_str() != Some(txid.to_string().as_str()) {
-            return Err(format!("node returned a different txid: {sent}"));
-        }
+        saved.unwrap()
+    };
+    // Sync the directory also when retrying a write interrupted just after publication.
+    #[cfg(unix)]
+    fs::File::open(&owner).and_then(|dir| dir.sync_all()).map_err(|e| e.to_string())?;
+    if wallet.mined_height(txid)?.is_none() {
+        wallet.reserve_broadcast_inputs(
+            LockOwner::new(context.attempt.0), txid, &intent.input_nullifiers, intent.expiry_height,
+        )?;
+        let sent = if let Some((runtime, mut client)) = lightwalletd {
+            let result = runtime.block_on(client.send_transaction(RawTransaction {
+                data: raw.clone(), height: 0,
+            })).map_err(|e| format!("lightwalletd send transaction: {e}")).and_then(|reply| {
+                let reply = reply.into_inner();
+                if reply.error_code == 0 { return Ok(()); }
+                Err(format!("lightwalletd rejected transaction ({}): {}", reply.error_code, reply.error_message))
+            });
+            if result.is_err() && runtime.block_on(client.get_transaction(TxFilter {
+                hash: txid.as_ref().to_vec(), ..Default::default()
+            })).is_ok_and(|reply| reply.into_inner().data == raw) { Ok(()) } else { result }
+        } else {
+            let rpc = Rpc::regtest();
+            let raw_hex = hex::encode(&raw);
+            let result = rpc.json("sendrawtransaction", &format!("[\"{raw_hex}\"]")).and_then(|reply| {
+                if reply.as_str() == Some(txid.to_string().as_str()) { Ok(()) }
+                else { Err(format!("node returned a different txid: {reply}")) }
+            });
+            if result.is_err() && rpc.json("getrawtransaction", &format!("[\"{txid}\",0]"))
+                .is_ok_and(|reply| reply.as_str() == Some(&raw_hex)) { Ok(()) } else { result }
+        };
+        // A rejection can follow an accepted send. Only a scan or expiry frees the inputs.
+        sent.map_err(|e| format!("{e}; transaction {txid} saved, rerun finish to retry"))?;
     }
     let txid = txid.to_string();
     fs::write(work.join("final.hex"), hex::encode(&raw)).map_err(|e| e.to_string())?;
@@ -1260,12 +1336,23 @@ fn confirm_mined(args: &[String]) -> Result<(), String> {
     if member.network != VaultNetwork::Testnet {
         return Err("confirm-mined requires a Testnet wallet".into());
     }
-    let mut bytes: [u8; 32] = hex::decode(&args[4]).map_err(|_| "invalid txid")?
-        .try_into().map_err(|_| "txid must be 32 bytes")?;
-    bytes.reverse();
-    let txid = TxId::from_bytes(bytes);
-    let wallet = wallet(&member, &owner, &pass)?;
+    let requested = TxId::from_hex(&args[4]).ok_or("invalid txid")?;
+    let work = Path::new(&args[3]);
+    private_work(work)?;
+    let (context, intent) = manifest(&work.join("payment.json"), member.network)?;
+    check_manifest_roster(&member.roster, &context, &intent)?;
+    let (_, txid) = read_final_transaction(&owner, &context, &pass)?
+        .ok_or("no sealed finalized transaction for this attempt; use verify for a discovered spend")?;
+    if requested != txid {
+        return Err("txid differs from the sealed finalized transaction".into());
+    }
+    let mut wallet = wallet(&member, &owner, &pass)?;
     let height = wallet.mined_height(txid)?.ok_or("transaction is not mined in this wallet")?;
+    for input in &intent.input_nullifiers {
+        if wallet.mined_spend(input)? != Some(txid) {
+            return Err("the sealed transaction did not spend this payment's inputs on the scanned chain".into());
+        }
+    }
     let tip = wallet.scanned_height()?.ok_or("wallet has not scanned any blocks")?;
     let confirmations = tip.checked_sub(u32::from(height))
         .ok_or("wallet scan is behind the mined transaction")? + 1;

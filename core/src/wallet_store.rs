@@ -4,6 +4,7 @@ use std::{
     fs, io,
     path::Path,
     sync::Mutex,
+    time::Duration,
 };
 
 use argon2::Argon2;
@@ -19,10 +20,11 @@ use rusqlite::{Connection, OptionalExtension};
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
-        AccountBirthday, AccountPurpose, MaxSpendMode, OutputLockStore, WalletRead, WalletWrite,
+        AccountBirthday, AccountPurpose, MaxSpendMode, OutputLockStore, WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{
             BlockCache, BlockSource, ChainState, error::Error as ScanError, scan_cached_blocks,
         },
+        error::Error as FundingError,
         scanning::ScanRange,
         wallet::{
             ConfirmationsPolicy, propose_send_max_transfer, propose_transfer,
@@ -37,15 +39,21 @@ use zcash_client_sqlite::{
     ReceivedNoteId, WalletDb, util::SystemClock, wallet::init::init_wallet_db,
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_primitives::block::BlockHash;
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{PoolType, ShieldedPool, memo::MemoBytes, value::Zatoshis};
 use zeroize::Zeroizing;
 use zip321::{Payment, TransactionRequest};
 
-use crate::{member_state::MemberState, network::VaultNetwork};
-use zcash_client_backend::proto::service::{BlockId, Empty};
+use loki_signer_core::chain_scan::{checked_next_tree_sizes, tree_sizes};
+use zcash_client_backend::proto::service::{BlockId, ChainSpec, Empty, ShieldedProtocol};
 use zcash_protocol::consensus::Parameters;
+
+use crate::{member_state::MemberState, network::VaultNetwork};
+
+mod lightwalletd;
+pub use lightwalletd::Lightwalletd;
 
 type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng>>;
 
@@ -201,7 +209,24 @@ pub fn lightwalletd_endpoint(url: &str) -> Result<tonic::transport::Endpoint, St
     Ok(endpoint)
 }
 
-pub type Lightwalletd = zcash_client_backend::proto::service::compact_tx_streamer_client::CompactTxStreamerClient<tonic::transport::Channel>;
+/// Agreement with the configured lightwalletd is not independent chain verification.
+pub const PROVIDER_REPORTED: &str = "provider_reported";
+
+async fn provider_tip(client: &mut Lightwalletd) -> Result<BlockHeight, String> {
+    let tip = tokio::time::timeout(Duration::from_secs(30), client.get_latest_block(ChainSpec {}))
+        .await.map_err(|_| "lightwalletd latest block deadline exceeded")?
+        .map_err(|e| format!("lightwalletd latest block: {e}"))?
+        .into_inner().height;
+    if tip >= u64::from(u32::MAX) {
+        return Err("lightwalletd tip height out of range".into());
+    }
+    Ok(BlockHeight::from_u32(tip as u32))
+}
+
+async fn provider_block_hash(client: &Lightwalletd, height: BlockHeight) -> Result<BlockHash, String> {
+    let blocks = client.blocks(height, height).await?;
+    Ok(blocks[0].hash())
+}
 
 /// The lightwalletd a member syncs from: `LOKI_LIGHTWALLETD`, or on regtest the one THS runs
 /// beside the `LOKI_RPC` node (THS shifts RPC 18232 and lightwalletd 9067 by one offset).
@@ -264,22 +289,70 @@ pub async fn sync_member_wallet(
         &birthday,
         passphrase,
     )?;
-    wallet.sync(&mut client).await?;
+    wallet.sync_from_provider(&mut client, &birthday, url).await?;
     Ok((wallet, client))
 }
 
 impl VaultWallet {
-    pub async fn sync(&mut self, client: &mut Lightwalletd) -> Result<(), String> {
-        zcash_client_backend::sync::run(
-            client,
-            &self.network,
-            &DownloadedBlocks::default(),
-            &mut self.db,
-            100,
-        )
-        .await
-        .map_err(|e| format!("sync wallet: {e}"))?;
-        self.release_confirmed_reservations()
+    async fn sync(&mut self, client: &mut Lightwalletd, tip: BlockHeight) -> Result<(), String> {
+        let deadline = Duration::from_secs(30);
+        self.db.put_sapling_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Sapling, tip).await?)
+            .map_err(|e| format!("save Sapling roots: {e}"))?;
+        self.db.put_orchard_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Orchard, tip).await?)
+            .map_err(|e| format!("save Orchard roots: {e}"))?;
+        self.db.put_ironwood_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Ironwood, tip).await?)
+            .map_err(|e| format!("save Ironwood roots: {e}"))?;
+        self.db.update_chain_tip(tip).map_err(|e| format!("save chain tip: {e}"))?;
+
+        // Follow Zakura's scan priorities, but finish and validate a bounded page before
+        // passing it to the scanner. Re-read the queue after commits or a rewind.
+        let mut last_page = None;
+        let mut last_rewind = None;
+        while let Some(range) = self.db.suggest_scan_ranges().map_err(|e| e.to_string())?
+            .into_iter().find(|range| !range.is_empty())
+        {
+            let start = range.block_range().start;
+            let end = range.block_range().end.min(BlockHeight::from_u32(u32::from(start).saturating_add(100)));
+            let page = ScanRange::from_parts(start..end, range.priority());
+            if last_page.as_ref() == Some(&page) {
+                return Err("wallet scan range did not advance".into());
+            }
+            let blocks = client.blocks(start, end - 1).await?;
+            let previous = start - 1;
+            let state = tokio::time::timeout(deadline, client.get_tree_state(BlockId { height: previous.into(), hash: vec![] }))
+                .await.map_err(|_| "lightwalletd tree state deadline exceeded")?
+                .map_err(|e| format!("lightwalletd tree state: {e}"))?.into_inner().to_chain_state()
+                .map_err(|e| format!("parse lightwalletd tree state: {e}"))?;
+            if state.block_height() != previous || blocks[0].prev_hash != state.block_hash().0 {
+                return Err("lightwalletd tree state does not match the requested block range".into());
+            }
+            let prior = self.db.block_metadata(previous).map_err(|e| e.to_string())?
+                .filter(|m| m.block_hash() == state.block_hash());
+            let checkpoint_sizes = [state.final_sapling_tree().tree_size(), state.final_orchard_tree().tree_size(), state.final_ironwood_tree().tree_size()];
+            if checkpoint_sizes.iter().any(|&size| size > u64::from(u32::MAX)) {
+                return Err("lightwalletd checkpoint tree size out of range".into());
+            }
+            let mut sizes = prior.as_ref().map_or(checkpoint_sizes.map(|size| Some(size as u32)), tree_sizes);
+            for block in &blocks {
+                sizes = checked_next_tree_sizes(block, sizes)?;
+            }
+            let cache = DownloadedBlocks::default();
+            cache.insert(blocks).await.map_err(|e| e.to_string())?;
+            match scan_cached_blocks(&self.network, &cache, &mut self.db, start, &state, page.len()) {
+                Ok(_) => last_page = Some(page),
+                Err(ScanError::Scan(zcash_client_backend::scanning::ScanError::PrevHashMismatch { at_height })) => {
+                    let rewind = at_height.saturating_sub(10);
+                    if last_rewind.is_some_and(|last| rewind >= last) {
+                        return Err("wallet scan did not progress after rewinding".into());
+                    }
+                    self.db.truncate_to_height(rewind).map_err(|e| format!("rewind wallet: {e}"))?;
+                    last_rewind = Some(rewind);
+                    last_page = None;
+                }
+                Err(e) => return Err(format!("sync wallet: {e}")),
+            }
+        }
+        Ok(())
     }
 
     pub fn open(
@@ -351,6 +424,12 @@ impl VaultWallet {
         })
         .optional()
         .map_err(|e| format!("wrong wallet passphrase or damaged database: {e}"))?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ext_loki_chain_source (
+                id INTEGER PRIMARY KEY CHECK (id = 0), fingerprint TEXT NOT NULL
+            )",
+        )
+        .map_err(|e| format!("initialize wallet chain source: {e}"))?;
         rusqlite::vtab::array::load_module(&conn)
             .map_err(|e| format!("initialize wallet array queries: {e}"))?;
 
@@ -469,6 +548,66 @@ impl VaultWallet {
             .ok_or_else(|| "wallet has no hash for its scanned height".into())
     }
 
+    pub async fn sync_from_provider(
+        &mut self,
+        client: &mut Lightwalletd,
+        birthday: &AccountBirthday,
+        url: &str,
+    ) -> Result<(), String> {
+        let tip = provider_tip(client).await?;
+        if tip < birthday.height() {
+            return Err("lightwalletd tip is below this vault's birth".into());
+        }
+        let source = blake3::hash(url.as_bytes()).to_hex().to_string();
+        let matches_source = self.db.transactionally_with_extension(|_, ext| {
+            let saved = ext.query_row(
+                "SELECT fingerprint FROM ext_loki_chain_source WHERE id = 0",
+                [],
+                |row| row.get::<_, String>(0),
+            ).optional()?;
+            Ok::<_, rusqlite::Error>(saved.as_deref() == Some(source.as_str()))
+        }).map_err(|e| format!("read wallet chain source: {e}"))?;
+
+        let saved = self.db.get_max_height_hash()
+            .map_err(|e| format!("read wallet scan checkpoint: {e}"))?;
+        let rewind = match saved {
+            // Legacy or different provider: matching block hashes would not vouch for the
+            // compact transactions the old provider supplied. Rescan from the vault birth.
+            Some(_) if !matches_source => true,
+            Some((height, _)) if height > tip => true,
+            Some((height, hash)) => provider_block_hash(client, height).await? != hash,
+            None => false,
+        };
+        if rewind || !matches_source {
+            use zcash_client_sqlite::error::SqliteClientError;
+            self.db.transactionally_with_extension(|db, ext| {
+                if rewind {
+                    db.truncate_to_chain_state(birthday.prior_chain_state().clone())?;
+                }
+                ext.execute(
+                    "INSERT OR REPLACE INTO ext_loki_chain_source (id, fingerprint) VALUES (0, ?1)",
+                    [&source],
+                )?;
+                Ok::<_, SqliteClientError>(())
+            }).map_err(|e| format!("prepare wallet rescan without replacing the database: {e}"))?;
+        }
+
+        self.sync(client, tip).await?;
+        let scanned = self.db.block_fully_scanned()
+            .map_err(|e| format!("read fully scanned block: {e}"))?
+            .ok_or("wallet did not scan any blocks")?;
+        let height = scanned.block_height();
+        if height != tip {
+            return Err("wallet has not fully scanned the reported chain tip".into());
+        }
+        if height > provider_tip(client).await?
+            || provider_block_hash(client, height).await? != scanned.block_hash()
+        {
+            return Err("lightwalletd chain changed during the scan; retry sync".into());
+        }
+        self.release_confirmed_reservations()
+    }
+
     pub fn mined_height(&self, txid: TxId) -> Result<Option<BlockHeight>, String> {
         self.db.get_tx_height(txid)
             .map_err(|e| format!("read indexed transaction height: {e}"))
@@ -556,6 +695,16 @@ impl VaultWallet {
         amount: Option<Zatoshis>,
         memo: MemoBytes,
     ) -> Result<Funding, String> {
+        self.propose_with_confirmation_wait(recipient, amount, memo, false)
+    }
+
+    pub(crate) fn propose_with_confirmation_wait(
+        &mut self,
+        recipient: orchard::Address,
+        amount: Option<Zatoshis>,
+        memo: MemoBytes,
+        explain_wait: bool,
+    ) -> Result<Funding, String> {
         let account = self.account()?;
         let recipient = ZcashAddress::try_from_encoded(&crate::vault::unified_receiver(
             recipient.to_raw_address_bytes(),
@@ -567,26 +716,48 @@ impl VaultWallet {
             Some(amount) => {
                 let payment = Payment::new(recipient, Some(amount), Some(memo), None, None, vec![])
                     .map_err(|e| format!("payment request: {e:?}"))?;
-                propose_transfer::<_, _, _, _, Infallible>(
-                    &mut self.db,
-                    &self.network,
-                    account,
-                    &GreedyInputSelector::new(),
-                    &SingleOutputChangeStrategy::new(
-                        StandardFeeRule::Zip317,
+                let request = TransactionRequest::new(vec![payment])
+                    .map_err(|e| format!("payment request: {e:?}"))?;
+                let network = &self.network;
+                let propose = |db: &mut Database, policy, selection| {
+                    propose_transfer::<_, _, _, _, Infallible>(
+                        db,
+                        network,
+                        account,
+                        &GreedyInputSelector::new(),
+                        &SingleOutputChangeStrategy::new(
+                            StandardFeeRule::Zip317,
+                            None,
+                            ShieldedPool::Ironwood,
+                            DustOutputPolicy::default(),
+                        ),
+                        request.clone(),
+                        policy,
+                        &SpendPolicy::shielded_pools([ShieldedPool::Ironwood])
+                            .with_note_selection(selection),
                         None,
-                        ShieldedPool::Ironwood,
-                        DustOutputPolicy::default(),
-                    ),
-                    TransactionRequest::new(vec![payment])
-                        .map_err(|e| format!("payment request: {e:?}"))?,
-                    confirmations,
-                    &SpendPolicy::shielded_pools([ShieldedPool::Ironwood])
-                        .with_note_selection(NoteSelection::PreferConsolidation),
-                    None,
-                    None,
-                )
-                .map_err(|e| format!("fund payment: {e}"))?
+                        None,
+                    )
+                };
+                propose(&mut self.db, confirmations, NoteSelection::PreferConsolidation)
+                    .map_err(|error| {
+                        // The native host can sign only one input. Check whether lowering just
+                        // the confirmation depths would fund it, without reserving any notes.
+                        let covers_one_note = |db: &mut Database, policy| {
+                            propose(db, policy, NoteSelection::PreferSingle).is_ok_and(|proposal| {
+                                proposal.steps().first().shielded_inputs()
+                                    .is_some_and(|inputs| inputs.notes().len() == 1)
+                            })
+                        };
+                        if explain_wait && matches!(error, FundingError::InsufficientFunds { .. })
+                            && covers_one_note(&mut self.db, ConfirmationsPolicy::MIN)
+                            && !covers_one_note(&mut self.db, confirmations)
+                        {
+                            format!("Funds for this payment are waiting for confirmations. Incoming deposits need {} confirmations before they can be spent.", confirmations.untrusted())
+                        } else {
+                            format!("fund payment: {error}")
+                        }
+                    })?
             }
             None => propose_send_max_transfer::<_, _, _, Infallible>(
                 &mut self.db,
@@ -663,6 +834,39 @@ impl VaultWallet {
             .lock_outputs(&outputs, owner, BlockHeight::from_u32(expiry_height))
             .map_err(|e| format!("reserve payment inputs: {e:?}"))?;
         Ok(())
+    }
+
+    /// Transfer a draft's locks to its finalized transaction as one write. Finishers can also
+    /// acquire unreserved inputs, and retries can renew locks already owned by this txid.
+    pub fn reserve_broadcast_inputs(
+        &mut self,
+        attempt: LockOwner,
+        txid: TxId,
+        nullifiers: &[[u8; 32]],
+        expiry_height: u32,
+    ) -> Result<(), String> {
+        let outputs = self.input_refs(nullifiers)?;
+        let account = self.account()?;
+        self.db
+            .transactionally_with_extension(|db, _| {
+                let tip = db.block_fully_scanned()?.ok_or("wallet has not scanned any blocks")?;
+                if outputs.is_empty() || expiry_height <= u32::from(tip.block_height()) {
+                    return Err("payment has no inputs or has expired".into());
+                }
+                let notes = db.get_unspent_ironwood_notes_at_historical_height(account, tip.block_height())?;
+                for output in &outputs {
+                    if !notes.iter().any(|note| {
+                        note.txid() == output.txid() && u32::from(note.output_index()) == output.output_index()
+                    }) {
+                        return Err("payment input is no longer unspent".into());
+                    }
+                    db.unlock_output(output, attempt)?;
+                }
+                db.lock_outputs(&outputs, txid.into(), BlockHeight::from_u32(expiry_height))
+                    .map_err(|e| io::Error::other(format!("reserve payment inputs: {e:?}")))?;
+                Ok::<(), Box<dyn std::error::Error>>(())
+            })
+            .map_err(|e| e.to_string())
     }
 
     /// Releases `owner`'s reservation of a payment's still-unspent inputs.

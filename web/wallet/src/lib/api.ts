@@ -7,7 +7,7 @@
 // A tab paired with a native member routes every member call there; otherwise to the browser
 // signer. Only coordinator calls (/api/members, /api/fund) go to this origin.
 // Explicit .ts extension so Node's test loader resolves the chained import.
-import { signer, ApiError, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
+import { signer, ApiError, onboardingGrant, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
 export { ApiError };
 export type { CustodyMethod, CreateSignerOpts, EnrolledMember, UnlockOpts } from "./signer";
@@ -18,12 +18,21 @@ export function enroll(coordinatorOrigin?: string): Promise<EnrolledMember> { re
 
 // ─── native member (paired tab) ──────────────────────────────────────────────
 type Pairing = { endpoint: string; capability: string; lokisigner?: true };
-const PAIRING = "loki_device_session"; // sessionStorage: this tab's native member + capability
+const PAIRING = "loki_device_session"; // sessionStorage: headless paste flow only
 const LOKISIGNER_SLOT = "loki_lokisigner_slot"; // public reconnect hint, not authorization
+// Browsers can copy sessionStorage to a new tab; keep an approved grant in this page only.
+let lokiSignerSession: Pairing | null = null;
 function paired(): Pairing | null {
   if (typeof window === "undefined") return null;
-  try { const raw = sessionStorage.getItem(PAIRING); return raw ? JSON.parse(raw) as Pairing : null; }
-  catch { return null; }
+  if (lokiSignerSession) return lokiSignerSession;
+  try {
+    const raw = sessionStorage.getItem(PAIRING);
+    const stored = raw ? JSON.parse(raw) as Pairing : null;
+    if (!stored?.lokisigner) return stored;
+    // Older wallets stored LokiSigner grants here. Never use a copy from storage.
+    sessionStorage.removeItem(PAIRING);
+  } catch {}
+  return null;
 }
 /** Which signer this tab drives. */
 export function signerKind(): "native" | "browser" { return paired() ? "native" : "browser"; }
@@ -53,23 +62,33 @@ async function nativeApi<T>(session: Pairing, path: string, body?: unknown, sign
 
 /** Pair this tab with a native member from the link it printed (`http://127.0.0.1:<port>/#<capability>`).
  *  The member's identity must be the one the public roster lists for its slot. */
-export async function pairDevice(link: string, signal?: AbortSignal): Promise<Slot> {
+export async function pairDevice(link: string, cancel?: AbortSignal): Promise<Slot> {
   const url = new URL(link.trim());
   if (url.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(url.hostname)
     || !url.port || Number(url.port) < 1024 || url.pathname !== "/" || url.search || url.username || url.password
     || !/^#[A-Za-z0-9_-]{43}$/.test(url.hash)) throw new Error("Paste the local pairing link printed by your member process");
   const session = { endpoint: url.origin, capability: url.hash.slice(1) };
-  const member = await nativeApi<Slot>(session, "registration", undefined, signal);
-  const roster = await listSlots(signal);
-  if (!roster.some((m) => m.slot === member.slot && m.signing_pubkey === member.signing_pubkey && m.relay_pubkey === member.relay_pubkey && m.advertise_url === member.advertise_url)) {
-    throw new Error("Device identity does not match the public roster; register the device first");
+  const timeout = AbortSignal.timeout(30_000);
+  const signal = cancel ? AbortSignal.any([cancel, timeout]) : timeout;
+  let member: Slot;
+  try {
+    member = await nativeApi<Slot>(session, "registration", undefined, signal);
+    const roster = await listSlots(signal);
+    if (!roster.some((m) => m.slot === member.slot && m.signing_pubkey === member.signing_pubkey && m.relay_pubkey === member.relay_pubkey && m.advertise_url === member.advertise_url)) {
+      throw new Error("Device identity does not match the public roster; register the device first");
+    }
+    const status = await nativeApi<{ phase: string }>(session, "status", undefined, signal);
+    if (status.phase !== "home") throw new Error("Unlock the profile locally on your device, then pair again");
+    signal.throwIfAborted();
+  } catch (error) {
+    cancel?.throwIfAborted();
+    if (timeout.aborted) throw new Error("Pairing timed out. Check that your member app is still running and try again.");
+    throw error;
   }
-  const status = await nativeApi<{ phase: string }>(session, "status", undefined, signal);
-  if (status.phase !== "home") throw new Error("Unlock the profile locally on your device, then pair again");
-  signal?.throwIfAborted();
   sessionStorage.setItem(PAIRING, JSON.stringify(session));
   sessionStorage.setItem("loki_me", JSON.stringify({ slot: member.slot }));
   sessionStorage.removeItem(LOKISIGNER_SLOT);
+  lokiSignerSession = null;
   return member;
 }
 
@@ -97,27 +116,29 @@ export async function connectLokiSigner(slot: number, show: (progress: ConnectPr
       if (member && endpoint) {
         const { signing_pubkey, relay_pubkey } = member;
         const stalled = new AbortController();
+        const responseSignal = AbortSignal.any([discovery, stalled.signal]);
         const timer = setTimeout(() => stalled.abort(), 15_000);
         const res = await fetch(`${endpoint}/api/connect`, {
           method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ slot, signing_pubkey, relay_pubkey }),
-          signal: AbortSignal.any([discovery, stalled.signal]), credentials: "omit", redirect: "error", cache: "no-store",
+          signal: responseSignal, credentials: "omit", redirect: "error", cache: "no-store",
         }).catch(() => null).finally(() => clearTimeout(timer));
         discovery.throwIfAborted();
         if (res?.ok) {
-          // A response with a dialog gets the app's full decision deadline, not the startup budget.
           clearTimeout(deadline);
-          const capability = await readConnectDecision(res, show);
-          signal.throwIfAborted();
-          const session: Pairing = { endpoint, capability, lokisigner: true };
+          // The native app can wait 110 seconds for Allow. Bound the entire body, including EOF.
+          const decision = setTimeout(() => stalled.abort(new Error("LokiSigner connection timed out. Try again.")), 120_000);
+          const capability = await readConnectDecision(res, show, responseSignal).finally(() => clearTimeout(decision));
+          responseSignal.throwIfAborted();
           sessionStorage.setItem(LOKISIGNER_SLOT, String(slot));
           sessionStorage.setItem("loki_me", JSON.stringify({ slot }));
-          sessionStorage.setItem(PAIRING, JSON.stringify(session));
+          sessionStorage.removeItem(PAIRING);
+          lokiSignerSession = { endpoint, capability, lokisigner: true };
           return;
         }
         if (res && ![404, 405, 425].includes(res.status)) {
           throw new Error(res.status === 429
-            ? "LokiSigner is showing another connection request. If you did not start it, choose Refuse in LokiSigner."
+            ? "LokiSigner is showing another connection request or waiting before it can show a new one. Refuse any request you did not start, then try again in a few seconds."
             : "LokiSigner did not allow this connection.");
         }
       }
@@ -131,17 +152,21 @@ export async function connectLokiSigner(slot: number, show: (progress: ConnectPr
   } finally { clearTimeout(deadline); }
 }
 
-async function readConnectDecision(res: Response, show: (progress: ConnectProgress) => void): Promise<string> {
+async function readConnectDecision(res: Response, show: (progress: ConnectProgress) => void, signal: AbortSignal): Promise<string> {
   const refused = () => new Error("LokiSigner did not allow this connection.");
   if (res.headers.get("content-type") !== "application/x-ndjson" || !res.body) {
     void res.body?.cancel().catch(() => {});
     throw refused();
   }
   const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal.addEventListener("abort", cancel, { once: true });
   let partial = "", code = "", token = "", received = 0;
   try {
+    signal.throwIfAborted();
     while (true) {
       const { done, value } = await reader.read();
+      signal.throwIfAborted();
       if (done) break;
       received += value.length;
       if (received > 1024) throw refused();
@@ -159,8 +184,8 @@ async function readConnectDecision(res: Response, show: (progress: ConnectProgre
     }
     if (!token || partial) throw refused();
     return token;
-  } catch { throw refused(); }
-  finally { await reader.cancel().catch(() => {}); }
+  } catch { signal.throwIfAborted(); throw refused(); }
+  finally { signal.removeEventListener("abort", cancel); cancel(); }
 }
 
 /** A pairing link LokiSigner opens; the coordinator reserves its slot until `expires`, in this
@@ -173,6 +198,8 @@ export class PairingSlotTaken extends Error {}
 const PAIRING_LINK = /^loki:\/\/pair\?[A-Za-z0-9%*._+=&-]+$/;
 const PAIRING_TTL_MS = 120_000;
 const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
+  ["a valid onboarding grant is required", () => "Open the onboarding link from your coordinator operator to pair a new signer."],
+  ["onboarding grant already used", () => "This onboarding link has already been used. Ask your coordinator operator for a new one."],
   ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
   ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
   ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
@@ -183,7 +210,7 @@ const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
 export async function requestPairingLink(slot?: number): Promise<PairingLink> {
   const res = await fetch("/api/members/pairing", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(slot === undefined ? {} : { slot }), cache: "no-store",
+    body: JSON.stringify({ slot, onboarding_grant: onboardingGrant() }), cache: "no-store",
   });
   const now = Date.now();
   const data = await res.json().catch(() => ({}));
@@ -256,11 +283,12 @@ export async function unlock(opts: UnlockOpts): Promise<SignerSession> {
   const s = await signer.unlock(opts);
   // The browser signer returns no slot. If it registered before this reload, its roster entry
   // is the one carrying its signing key, which is its profile id.
-  const slot = s.slot ?? (await listSlots().catch(() => [])).find((m) => m.signing_pubkey === s.profile.id)?.slot;
+  const slot = s.slot ?? (await listSlots(AbortSignal.timeout(15_000)).catch(() => [])).find((m) => m.signing_pubkey === s.profile.id)?.slot;
   rememberMe({ ...s, slot });
   return s;
 }
 export function forgetSession(): void {
+  lokiSignerSession = null;
   try { sessionStorage.removeItem("loki_me"); sessionStorage.removeItem(PAIRING); } catch {}
 }
 export async function logout(): Promise<boolean> {
@@ -271,15 +299,14 @@ export async function logout(): Promise<boolean> {
 }
 
 /** Development faucet accepts only a public regtest address. */
-export async function fund(address: string): Promise<void> {
+export async function fund(address: string): Promise<{ mined: boolean }> {
   const res = await fetch("/api/fund", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address }) });
   if (!res.ok) throw new Error((await res.json()).error ?? "could not request funds");
+  return { mined: res.status === 200 };
 }
 export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: boolean; recovery_in_app?: boolean };
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
-export function recoveryBackup(vault: string): Promise<{ vault: string; backup: string }> { return api(`recovery-backup?vault=${vault}`); }
-export function recoverySetup(): Promise<{ words: string }> { return api("recovery-setup", {}); }
-export function recoveryRestore(vault: string, words: string): Promise<{ restored: boolean }> { return api("recovery-restore", { vault, words }); }
+export function recoveryBackup(vault: string): Promise<{ vault: string; backup: string; fingerprint?: string }> { return api(`recovery-backup?vault=${vault}`); }
 
 // The in-browser signer's recovery. The words are shown, re-typed and entered only on the
 // signer page; the wallet sees public results and the opaque backup ciphertext.
@@ -293,11 +320,12 @@ export async function exportRecoveryBackup(vault: string): Promise<{ backup: str
 /** Fresh browser: restore a vault member from its words (typed on the signer page) and its backup:
  *  the file the member picks there, or `backup` (hex ciphertext) + `vault` the wallet already holds. */
 export async function restoreSigner(opts: CreateSignerOpts & { vault?: string; backup?: string }): Promise<SignerSession> { browserOnly(); return signer.request("restore", opts); }
-/** Delete this browser's signer after the member confirms the backups are exported. */
-export async function removeBrowserSigner(): Promise<void> {
+/** Open signer controls and report whether the member removed custody in the signer tab. */
+export async function manageBrowserCustody(): Promise<boolean> {
   browserOnly();
-  await signer.request("remove", {});
-  forgetSession();
+  const removed = await signer.request<boolean>("manage-custody");
+  if (removed) forgetSession();
+  return removed;
 }
 export type PendingApproval = { attempt: string; amount_zat: string; recipient: string; proposer: number; replaces?: { attempt: string; cancel: boolean } | null };
 export function pendingApprovals(vault: string): Promise<{ pending: PendingApproval[] }> { return api(`pending?vault=${vault}`); }

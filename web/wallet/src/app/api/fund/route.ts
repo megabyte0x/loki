@@ -29,14 +29,24 @@ export async function POST(req: Request) {
       body: JSON.stringify({ address, amount_zatoshi: 500000000 }),
     });
     if (!faucet.ok) return Response.json({ error: "faucet declined" }, { status: 502 });
-    // Confirm the note: regtest mines on demand.
-    await fetch(RPC, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: RPC_AUTH },
-      body: JSON.stringify({ jsonrpc: "1.0", id: 1, method: "generate", params: [12] }),
-    });
   } catch (e) {
     return Response.json({ error: `funding failed: ${(e as Error).message}` }, { status: 502 });
   }
-  return Response.json({ ok: true });
+
+  // The transfer was accepted; a mining failure must not turn it into a failed transfer.
+  let mined = false;
+  try {
+    const blocks = 12;
+    const mining = await fetch(RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: RPC_AUTH },
+      body: JSON.stringify({ jsonrpc: "1.0", id: 1, method: "generate", params: [blocks] }),
+    });
+    if (mining.ok) {
+      const reply = await mining.json();
+      mined = reply?.error == null && Array.isArray(reply?.result) && reply.result.length === blocks
+        && reply.result.every((hash: unknown) => typeof hash === "string" && /^[0-9a-f]{64}$/i.test(hash));
+    }
+  } catch { /* Mining could not be verified. */ }
+  return Response.json({ ok: true, mined }, { status: mined ? 200 : 202 });
 }

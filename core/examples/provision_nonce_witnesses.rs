@@ -5,7 +5,7 @@ use loki_relay_protocol::{http::encode_creation, types::{Creation, RelayPin, Rel
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use std::{fs::{self, File, OpenOptions}, io::{Read, Write}, path::{Path, PathBuf}};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const QUOTA: u64 = 64 * 1024 * 1024;
@@ -19,8 +19,20 @@ This uses Loki's /v1/mailboxes API, not the frostd session API.";
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Pending {
-    witnesses: [WitnessConfig; 2],
+    witnesses: [ProvisionedWitness; 2],
     requests: [Vec<u8>; 2],
+}
+
+// The provisioning tool alone keeps the read capability to verify an existing mailbox.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProvisionedWitness {
+    #[serde(flatten)]
+    config: WitnessConfig,
+    read: [u8; 32],
+}
+
+impl Drop for ProvisionedWitness {
+    fn drop(&mut self) { self.read.zeroize(); }
 }
 
 fn read_private(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
@@ -80,9 +92,11 @@ fn fresh(routes: &[RelayRoute; 2]) -> Result<Pending> {
             append_verifier: verifier(mailbox, 2, &append),
             admin_verifier: verifier(mailbox, 3, &admin), quota: QUOTA,
         })?);
-        witnesses.push(WitnessConfig {
-            endpoint: route.endpoint.clone(), key: route.pin.key, run: route.pin.run,
-            mailbox, read: *read,
+        witnesses.push(ProvisionedWitness {
+            config: WitnessConfig {
+                endpoint: route.endpoint.clone(), key: route.pin.key, run: route.pin.run, mailbox,
+            },
+            read: *read,
         });
     }
     Ok(Pending {
@@ -91,11 +105,11 @@ fn fresh(routes: &[RelayRoute; 2]) -> Result<Pending> {
     })
 }
 
-fn bind(routes: &mut [RelayRoute; 2], witnesses: &[WitnessConfig; 2]) -> Result<()> {
-    if witnesses[0].mailbox == witnesses[1].mailbox { return Err("distinct mailboxes required".into()); }
-    for (route, witness) in routes.iter_mut().zip(witnesses) {
+fn bind(routes: &mut [RelayRoute; 2], witnesses: &[ProvisionedWitness; 2]) -> Result<()> {
+    if witnesses[0].config.mailbox == witnesses[1].config.mailbox { return Err("distinct mailboxes required".into()); }
+    for (route, ProvisionedWitness { config: witness, read }) in routes.iter_mut().zip(witnesses) {
         if witness.endpoint != route.endpoint || witness.key != route.pin.key || witness.run != route.pin.run
-            || witness.mailbox == [0; 32] || witness.read == [0; 32]
+            || witness.mailbox == [0; 32] || *read == [0; 32]
         {
             return Err("saved witnesses do not match relay roots; refusing to replace pins".into());
         }
@@ -145,7 +159,7 @@ async fn main() -> Result<()> {
     let http = if development { RelayHttp::new()? } else { RelayHttp::hosted()? };
     for route in &routes { http.authenticate_endpoint(&route.pin, &route.endpoint).await?; }
     if output.try_exists()? {
-        let witnesses: [WitnessConfig; 2] = serde_json::from_slice(&read_private(&output)?)?;
+        let witnesses: [ProvisionedWitness; 2] = serde_json::from_slice(&read_private(&output)?)?;
         bind(&mut routes, &witnesses)?;
         for (route, witness) in routes.iter().zip(&witnesses) {
             http.entries(route, &Secret32::from_bytes(witness.read), 0, Some(1)).await?;
@@ -191,7 +205,7 @@ mod tests {
         for (witness, request) in saved.witnesses.iter().zip(&saved.requests) {
             let creation = loki_relay_protocol::http::decode_creation(request).unwrap();
             let mut input = b"Loki_Relay_Capability_v1\0\x01".to_vec();
-            input.extend_from_slice(&witness.mailbox);
+            input.extend_from_slice(&witness.config.mailbox);
             input.extend_from_slice(&witness.read);
             assert_eq!(creation.read_verifier, <[u8; 32]>::from(Sha256::digest(input)));
         }

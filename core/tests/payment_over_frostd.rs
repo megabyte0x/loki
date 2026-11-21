@@ -91,7 +91,7 @@ fn vault_note(fvk: &FullViewingKey) -> orchard::Note {
 fn two_of_three_payment_pczt_verifies_over_frostd() {
     let url = std::env::var("FROSTD_URL").expect("set FROSTD_URL to the running frostd relay");
     roundtrip(
-        Identity::new(9),
+        Identity::new(0),
         VaultNetwork::Regtest,
         |identity| {
             let secret: [u8; 32] = identity.to_secret_bytes()[34..].try_into().unwrap();
@@ -106,7 +106,7 @@ fn two_of_three_payment_pczt_verifies_over_frostd() {
 fn two_of_three_payment_pczt_verifies_in_memory() {
     let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
     let relayed = Arc::new(Mutex::new(Vec::new()));
-    let coordinator = Identity::new(9);
+    let coordinator = Identity::new(0);
     let coordinator_peer = Peer(coordinator.public().encryption);
     let fvk = roundtrip(
         coordinator,
@@ -119,7 +119,7 @@ fn two_of_three_payment_pczt_verifies_in_memory() {
         },
         |channel| *channel,
     );
-    // The relay carried the commitments, the sealed candidate, packages, seeds and shares,
+    // The relay carried sealed commitments, candidates, packages, seeds and shares,
     // but never a readable candidate or the vault's viewing key.
     let fvk = fvk.to_bytes();
     let relayed = relayed.lock().unwrap();
@@ -136,7 +136,7 @@ fn two_of_three_payment_pczt_verifies_in_memory() {
 #[test]
 fn testnet_payment_uses_nu7_over_in_memory_transport() {
     let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
-    let coordinator = Identity::new(9);
+    let coordinator = Identity::new(0);
     let coordinator_peer = Peer(coordinator.public().encryption);
     roundtrip(
         coordinator,
@@ -217,13 +217,11 @@ where
         .iter()
         .copied()
         .zip(
-            identities
-                .iter()
-                .map(|identity| Peer(identity.public().encryption)),
+            publics.iter().cloned(),
         )
         .collect();
     let mut tx = make_transport(&coordinator);
-    let peers: Vec<_> = ids.iter().map(|id| peer_of[id].clone()).collect();
+    let peers: Vec<_> = ids.iter().map(|id| Peer(peer_of[id].encryption)).collect();
     let channel = tx.open(&peers, 4).unwrap();
     let session = session_id(&channel);
     let member_transports: Vec<_> = identities.iter().map(make_transport).collect();
@@ -244,6 +242,7 @@ where
                 let proposer_inputs = if id == ids[0] { Some(&params) } else { None };
                 let other_signers: Vec<_> = if proposer_inputs.is_some() { publics[1..].to_vec() } else { Vec::new() };
                 let proposer = publics[0].clone();
+                let coordinator = coordinator.public();
                 let context = context.clone();
                 let handoff = &handoff;
                 let request = &params;
@@ -265,7 +264,8 @@ where
                         &member_tx,
                         &channel,
                         &mut signer, &signer_session, &candidate, &signer_public, id,
-                        request, proposer_inputs.is_some(), &identity, &context, &proposer, &other_signers,
+                        request, &identity, &context, &proposer, &coordinator, &other_signers,
+                        &|| Ok(()),
                         &|| Ok(()),
                         &mut |bytes| {
                             if proposer_inputs.is_some() {
@@ -279,7 +279,7 @@ where
             })
             .collect();
         let signed =
-            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng, &hex::encode(candidate.attempt_id), &|| Ok(()), || {
+            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng, &coordinator, &context, &|| Ok(()), || {
                 Ok(handoff.lock().unwrap().clone())
             })
             .unwrap();

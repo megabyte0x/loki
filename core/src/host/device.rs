@@ -13,55 +13,95 @@
 //! a tampered `devices.json` cannot inject a device the recovery words never signed.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{self, Write};
+use std::path::Path;
 
-use axum::{extract::State, Json};
+use axum::{extract::State, http::HeaderMap, Json};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use super::routes::{err, ok, Reply};
 use super::state::Shared;
+use crate::signer::device_auth::{device_id, DeviceRegistry};
 use axum::http::StatusCode;
 
 /// One persisted enrolled device: its SEC1 P-256 public key, the recovery authorization that
 /// admitted it (re-verified on load), and whether it is still active.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StoredDevice {
     device_pub: String,
     authorization: String,
     active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    proof_generation: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    renewal_generation: Option<[u8; 32]>,
 }
 
-fn devices_file(data: &Path) -> PathBuf {
-    data.join("devices.json")
+pub(super) struct DeviceState {
+    registry: DeviceRegistry,
+    stored: Vec<StoredDevice>,
+    // A second member process must not cache an independent registry for this profile.
+    _lock: fs::File,
 }
 
-fn load_stored(data: &Path) -> Vec<StoredDevice> {
-    fs::read(devices_file(data))
-        .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
-        .unwrap_or_default()
+fn load_stored(data: &Path) -> Result<Vec<StoredDevice>, String> {
+    match fs::read(data.join("devices.json")) {
+        Ok(raw) => {
+            serde_json::from_slice(&raw).map_err(|e| format!("invalid device registry: {e}"))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("could not read device registry: {e}")),
+    }
 }
 
 fn save_stored(data: &Path, devices: &[StoredDevice]) -> Result<(), String> {
     let raw = serde_json::to_vec_pretty(devices).map_err(|e| e.to_string())?;
-    fs::write(devices_file(data), raw).map_err(|e| e.to_string())
+    let temp = data.join(format!(".devices.{}.tmp", uuid::Uuid::new_v4()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&temp).map_err(|e| e.to_string())?;
+    let result = file.write_all(&raw).and_then(|_| file.sync_all());
+    drop(file);
+    let result = result.and_then(|_| fs::rename(&temp, data.join("devices.json")));
+    #[cfg(unix)]
+    let result = result.and_then(|_| fs::File::open(data)?.sync_all());
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result.map_err(|e| e.to_string())
 }
 
 /// Rebuild the registry from disk: bind it to the recovery device-authorization key and
 /// re-enroll each persisted device (which re-verifies its authorization), then re-apply
 /// revocations. Errors if no recovery identity has been established yet.
-fn build_registry(data: &Path) -> Result<crate::signer::device_auth::DeviceRegistry, String> {
+fn build_registry(data: &Path, stored: &[StoredDevice]) -> Result<DeviceRegistry, String> {
     let authz = super::recovery::read_authz_pubkey(data)
         .ok_or("no recovery identity yet — run recovery setup first")?;
-    let mut registry = crate::signer::device_auth::DeviceRegistry::new(authz);
-    for d in load_stored(data) {
+    let mut registry = DeviceRegistry::new(authz);
+    let mut keys = std::collections::BTreeSet::new();
+    for d in stored {
         let device_pub = hex::decode(&d.device_pub).map_err(|e| e.to_string())?;
+        if !keys.insert(device_id(&device_pub)?) || (d.active && d.renewal_generation.is_some()) {
+            return Err("inconsistent device registry".into());
+        }
         let authorization: [u8; 64] = hex::decode(&d.authorization)
             .map_err(|e| e.to_string())?
             .try_into()
             .map_err(|_| "stored authorization is not 64 bytes")?;
-        registry.enroll(&device_pub, &authorization)?;
+        match d.proof_generation {
+            Some(generation) => {
+                registry.enroll_renewal(&device_pub, &generation, &authorization)?
+            }
+            None => registry.enroll(&device_pub, &authorization)?,
+        }
         if !d.active {
             registry.revoke(&device_pub);
         }
@@ -69,11 +109,40 @@ fn build_registry(data: &Path) -> Result<crate::signer::device_auth::DeviceRegis
     Ok(registry)
 }
 
+impl DeviceState {
+    fn open(data: &Path) -> Result<Self, String> {
+        let lock = fs::File::open(data).map_err(|e| e.to_string())?;
+        lock.try_lock().map_err(|e| e.to_string())?;
+        let stored = load_stored(data)?;
+        let registry = build_registry(data, &stored)?;
+        Ok(Self {
+            registry,
+            stored,
+            _lock: lock,
+        })
+    }
+
+    fn find(&self, device: &[u8]) -> Option<usize> {
+        self.stored.iter().position(|d| {
+            hex::decode(&d.device_pub)
+                .ok()
+                .and_then(|pubkey| device_id(&pubkey).ok())
+                .as_deref()
+                == Some(device)
+        })
+    }
+}
+
 fn hex_field(body: &Value, name: &str) -> Result<Vec<u8>, Reply> {
     body.get(name)
         .and_then(Value::as_str)
         .and_then(|s| hex::decode(s).ok())
-        .ok_or_else(|| err(StatusCode::BAD_REQUEST, format!("missing or invalid hex {name}")))
+        .ok_or_else(|| {
+            err(
+                StatusCode::BAD_REQUEST,
+                format!("missing or invalid hex {name}"),
+            )
+        })
 }
 
 /// Run `f` against the in-process registry, lazily building it from disk on first use. The
@@ -81,16 +150,22 @@ fn hex_field(body: &Value, name: &str) -> Result<Vec<u8>, Reply> {
 /// worker across a yield point.
 fn with_registry<F>(st: &Shared, f: F) -> Reply
 where
-    F: FnOnce(&mut crate::signer::device_auth::DeviceRegistry) -> Reply,
+    F: FnOnce(&mut DeviceState) -> Reply,
 {
     let mut guard = st.device_auth.lock().unwrap();
     if guard.is_none() {
-        match build_registry(&st.config.data) {
+        match DeviceState::open(&st.config.data) {
             Ok(r) => *guard = Some(r),
             Err(e) => return err(StatusCode::CONFLICT, e),
         }
     }
-    f(guard.as_mut().unwrap())
+    let reply = f(guard.as_mut().unwrap());
+    // A post-rename sync failure may leave the new snapshot visible. Never keep serving a
+    // cached version after an ambiguous write; the next request reloads disk under the lock.
+    if reply.0 == StatusCode::INTERNAL_SERVER_ERROR {
+        *guard = None;
+    }
+    reply
 }
 
 /// POST /api/device-enroll { device_pub, authorization } — enroll a recovery-authorized device.
@@ -104,32 +179,111 @@ pub(super) async fn enroll(State(st): State<Shared>, Json(body): Json<Value>) ->
         Ok(Err(_)) => return err(StatusCode::BAD_REQUEST, "authorization must be 64 bytes"),
         Err(e) => return e,
     };
-    let reply = with_registry(&st, |registry| match registry.enroll(&device_pub, &authorization) {
-        Ok(()) => ok(json!({ "enrolled": true })),
-        Err(e) => err(StatusCode::BAD_REQUEST, e),
-    });
-    if reply.0 != StatusCode::OK {
-        return reply;
-    }
-    // Persist for restart (dedupe on device_pub; mark active).
-    let mut stored = load_stored(&st.config.data);
-    let hexpub = hex::encode(&device_pub);
-    stored.retain(|d| d.device_pub != hexpub);
-    stored.push(StoredDevice {
-        device_pub: hexpub,
-        authorization: hex::encode(authorization),
-        active: true,
-    });
-    if let Err(e) = save_stored(&st.config.data, &stored) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    reply
+    let id = match device_id(&device_pub) {
+        Ok(id) => id,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    with_registry(&st, |state| {
+        let index = state.find(&id);
+        let device_hex = hex::encode(&device_pub);
+        let proof_hex = hex::encode(authorization);
+        let mut registry = state.registry.clone();
+        let generation = match index.map(|i| &state.stored[i]) {
+            Some(d) if d.active => {
+                if (d.device_pub != device_hex || d.authorization != proof_hex)
+                    && registry.enroll(&device_pub, &authorization).is_err()
+                {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        "device authorization does not verify",
+                    );
+                }
+                return ok(json!({ "enrolled": true }));
+            }
+            Some(d) => match d.renewal_generation {
+                Some(generation) => Some(generation),
+                None => {
+                    return err(
+                        StatusCode::CONFLICT,
+                        "request the current device renewal generation first",
+                    )
+                }
+            },
+            None => None,
+        };
+        let result = match generation {
+            Some(generation) => registry.enroll_renewal(&device_pub, &generation, &authorization),
+            None => registry.enroll(&device_pub, &authorization),
+        };
+        if let Err(e) = result {
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+        let row = StoredDevice {
+            device_pub: device_hex,
+            authorization: proof_hex,
+            active: true,
+            proof_generation: generation,
+            renewal_generation: None,
+        };
+        let mut stored = state.stored.clone();
+        if let Some(i) = index {
+            stored[i] = row;
+        } else {
+            stored.push(row);
+        }
+        if let Err(e) = save_stored(&st.config.data, &stored) {
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+        state.stored = stored;
+        state.registry = registry;
+        ok(json!({ "enrolled": true }))
+    })
+}
+
+/// POST /api/device-renewal { device_pub } — get the current generation for a revoked key.
+pub(super) async fn renewal(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+    let id = match hex_field(&body, "device_pub") {
+        Ok(v) => match device_id(&v) {
+            Ok(id) => id,
+            Err(e) => return err(StatusCode::BAD_REQUEST, e),
+        },
+        Err(e) => return e,
+    };
+    with_registry(&st, |state| {
+        let Some(i) = state.find(&id).filter(|&i| !state.stored[i].active) else {
+            return err(StatusCode::CONFLICT, "device is not revoked");
+        };
+        let generation = match state.stored[i].renewal_generation {
+            Some(g) => g,
+            None => {
+                // A legacy revoked record has no renewal generation until its first request.
+                let mut generation = [0; 32];
+                OsRng.fill_bytes(&mut generation);
+                let mut stored = state.stored.clone();
+                stored[i].renewal_generation = Some(generation);
+                if let Err(e) = save_stored(&st.config.data, &stored) {
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+                }
+                state.stored = stored;
+                generation
+            }
+        };
+        ok(json!({ "generation": hex::encode(generation) }))
+    })
 }
 
 /// GET /api/device-challenge — issue a one-time random login challenge.
-pub(super) async fn challenge(State(st): State<Shared>) -> Reply {
-    with_registry(&st, |registry| {
-        ok(json!({ "challenge": hex::encode(registry.issue_challenge()) }))
+pub(super) async fn challenge(State(st): State<Shared>, headers: HeaderMap) -> Reply {
+    let Some(token) = headers.get("x-loki-token") else {
+        return err(StatusCode::UNAUTHORIZED, "missing device grant");
+    };
+    let grant = *blake3::hash(token.as_bytes()).as_bytes();
+    with_registry(&st, |state| match state.registry.issue_challenge(grant) {
+        Some(challenge) => ok(json!({ "challenge": hex::encode(challenge) })),
+        None => err(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many device challenges; retry in two minutes",
+        ),
     })
 }
 
@@ -147,8 +301,11 @@ pub(super) async fn login(State(st): State<Shared>, Json(body): Json<Value>) -> 
         Ok(c) => c,
         Err(_) => return err(StatusCode::BAD_REQUEST, "challenge must be 32 bytes"),
     };
-    with_registry(&st, |registry| {
-        match registry.verify_login(&device_pub, &challenge, &signature) {
+    with_registry(&st, |state| {
+        match state
+            .registry
+            .verify_login(&device_pub, &challenge, &signature)
+        {
             Ok(()) => ok(json!({ "logged_in": true })),
             Err(e) => err(StatusCode::UNAUTHORIZED, e),
         }
@@ -161,23 +318,25 @@ pub(super) async fn revoke(State(st): State<Shared>, Json(body): Json<Value>) ->
         Ok(v) => v,
         Err(e) => return e,
     };
-    let reply = with_registry(&st, |registry| {
-        registry.revoke(&device_pub);
+    let id = match device_id(&device_pub) {
+        Ok(id) => id,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
+    with_registry(&st, |state| {
+        if let Some(i) = state.find(&id).filter(|&i| state.stored[i].active) {
+            let mut generation = [0; 32];
+            OsRng.fill_bytes(&mut generation);
+            let mut stored = state.stored.clone();
+            stored[i].active = false;
+            stored[i].renewal_generation = Some(generation);
+            if let Err(e) = save_stored(&st.config.data, &stored) {
+                return err(StatusCode::INTERNAL_SERVER_ERROR, e);
+            }
+            state.stored = stored;
+            state.registry.revoke(&device_pub);
+        }
         ok(json!({ "revoked": true }))
-    });
-    if reply.0 != StatusCode::OK {
-        return reply;
-    }
-    // Persist the revocation so it survives a restart.
-    let mut stored = load_stored(&st.config.data);
-    let hexpub = hex::encode(&device_pub);
-    for d in stored.iter_mut().filter(|d| d.device_pub == hexpub) {
-        d.active = false;
-    }
-    if let Err(e) = save_stored(&st.config.data, &stored) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, e);
-    }
-    reply
+    })
 }
 
 #[cfg(test)]
@@ -185,6 +344,7 @@ mod tests {
     use super::*;
     use crate::signer::recovery::RecoveryKey;
     use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+    use std::path::PathBuf;
 
     fn tempdir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -213,7 +373,11 @@ mod tests {
 
         // Enroll a device: persist its recovery authorization.
         let sk = SigningKey::random(&mut rand_core::OsRng);
-        let device_pub = sk.verifying_key().to_encoded_point(false).as_bytes().to_vec();
+        let device_pub = sk
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
         let authorization = recovery.authorize_device(&device_pub);
         save_stored(
             &data,
@@ -221,17 +385,21 @@ mod tests {
                 device_pub: hex::encode(&device_pub),
                 authorization: hex::encode(authorization),
                 active: true,
+                proof_generation: None,
+                renewal_generation: None,
             }],
         )
         .unwrap();
 
         // Rebuild from disk (restart): the device logs in.
-        let mut registry = build_registry(&data).unwrap();
-        let challenge = registry.issue_challenge();
+        let mut state = DeviceState::open(&data).unwrap();
+        let challenge = state.registry.issue_challenge([0; 32]).unwrap();
         let sig: Signature = sk.sign(&challenge);
-        registry
+        state
+            .registry
             .verify_login(&device_pub, &challenge, &sig.to_der().as_bytes().to_vec())
             .expect("reloaded device logs in");
+        drop(state);
 
         // A tampered devices.json whose authorization is for a DIFFERENT recovery key is
         // refused on rebuild (re-verification), so it cannot inject an unauthorized device.
@@ -242,10 +410,15 @@ mod tests {
                 device_pub: hex::encode(&device_pub),
                 authorization: hex::encode(other.authorize_device(&device_pub)),
                 active: true,
+                proof_generation: None,
+                renewal_generation: None,
             }],
         )
         .unwrap();
-        assert!(build_registry(&data).is_err(), "forged authorization is rejected on reload");
+        assert!(
+            DeviceState::open(&data).is_err(),
+            "forged authorization is rejected on reload"
+        );
 
         // A revoked device stays revoked across a rebuild.
         save_stored(
@@ -254,14 +427,17 @@ mod tests {
                 device_pub: hex::encode(&device_pub),
                 authorization: hex::encode(authorization),
                 active: false,
+                proof_generation: None,
+                renewal_generation: None,
             }],
         )
         .unwrap();
-        let mut registry = build_registry(&data).unwrap();
-        let challenge = registry.issue_challenge();
+        let mut state = DeviceState::open(&data).unwrap();
+        let challenge = state.registry.issue_challenge([0; 32]).unwrap();
         let sig: Signature = sk.sign(&challenge);
         assert!(
-            registry
+            state
+                .registry
                 .verify_login(&device_pub, &challenge, &sig.to_der().as_bytes().to_vec())
                 .is_err(),
             "a revoked device must not log in after reload"

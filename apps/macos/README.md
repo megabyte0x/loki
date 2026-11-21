@@ -30,7 +30,7 @@ open "$app"
 
 For a provisioned Release build, prepare with `flutter build macos --release --config-only`, then use `-configuration Release` in the Xcode command and `Build/Products/Release` for the app path. Do not pass the ad-hoc signing or visual-only overrides below to a provisioned build.
 
-Pair using a plain HTTPS coordinator origin, for example `https://wallet.example` without a path, trailing slash or credentials. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the existing Secure Enclave/Touch ID policy. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items.
+Pair with the one-use `loki://pair` link the coordinator's wallet issues for your member slot. Paste it in **Pair this Mac**; LokiSigner checks the whole link without a network request and shows its coordinator origin and slot before it contacts anything. A bare origin admits no one. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the existing Secure Enclave/Touch ID policy. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items. An existing profile unlocks and reconnects without a new link.
 
 The workspace footer shows the active signer's pinned origin as **Paired coordinator**. It is read-only and does not indicate whether the coordinator is reachable.
 

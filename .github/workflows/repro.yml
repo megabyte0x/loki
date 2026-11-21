@@ -1,7 +1,7 @@
 name: repro
 
 # Build the native and wasm signers twice, from two checkouts at different paths, and fail
-# if any artifact hash differs. See docs/product/AUDIT_SCOPE.md §3.
+# if the native hash or the signer server's complete bundle manifest differs.
 on:
   pull_request:
   push:
@@ -21,8 +21,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           path: b
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 24
       - run: rustup toolchain install 1.95.0 --profile minimal --target wasm32-unknown-unknown
       - run: cargo +1.95.0 install wasm-pack --version 0.15.1 --locked
-      - run: a/core/scripts/repro-build.sh > a.sha256
-      - run: b/core/scripts/repro-build.sh > b.sha256
-      - run: cat a.sha256 && diff a.sha256 b.sha256
+      - run: a/core/scripts/repro-build.sh > a.manifest
+      - run: b/core/scripts/repro-build.sh > b.manifest
+      - run: cat a.manifest && diff -u a.manifest b.manifest

@@ -72,7 +72,7 @@ impl SessionContext {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum MessageKind {
     Invite = 1,
     Commitment = 2,
@@ -86,6 +86,11 @@ pub enum MessageKind {
     /// A hosted member's authenticated request for a payment intent, and its reply.
     PeerRequest = 9,
     PeerReply = 10,
+    HostedCommitment = 11,
+    HostedAlpha = 12,
+    HostedPackage = 13,
+    HostedSeed = 14,
+    HostedShare = 15,
 }
 
 impl TryFrom<u8> for MessageKind {
@@ -102,12 +107,52 @@ impl TryFrom<u8> for MessageKind {
             8 => Ok(Self::Candidate),
             9 => Ok(Self::PeerRequest),
             10 => Ok(Self::PeerReply),
+            11 => Ok(Self::HostedCommitment),
+            12 => Ok(Self::HostedAlpha),
+            13 => Ok(Self::HostedPackage),
+            14 => Ok(Self::HostedSeed),
+            15 => Ok(Self::HostedShare),
             _ => Err("unknown signing message type".into()),
         }
     }
 }
 
 impl MessageKind {
+    pub(crate) fn permits(self, context: &SessionContext, sender: u16, recipient: u16) -> bool {
+        if sender == recipient {
+            return false;
+        }
+        let selected = |id| context.signers.contains(&id);
+        let selected_member = |id| (1..=crate::member_state::MAX_MEMBERS).contains(&id) && selected(id);
+        match self {
+            Self::HostedCommitment | Self::HostedShare => selected_member(sender) && recipient == 0,
+            Self::HostedAlpha | Self::HostedPackage | Self::HostedSeed => sender == 0 && selected_member(recipient),
+            _ => selected(sender)
+                && (1..=crate::member_state::MAX_MEMBERS).contains(&recipient)
+                && (selected(recipient) || matches!(self, Self::Package | Self::Share)),
+        }
+    }
+
+    /// Check the encoding before a hosted message counts toward round progress.
+    pub fn valid_hosted_body(self, context: &SessionContext, body: &[u8]) -> bool {
+        match self {
+            Self::HostedCommitment => frost::round1::SigningCommitments::deserialize(body).is_ok(),
+            Self::HostedAlpha => <&[u8; 32]>::try_from(body).is_ok_and(|alpha| {
+                crate::candidate::alpha_from_canonical_bytes(alpha).is_some()
+            }),
+            Self::HostedSeed => body.len() == 32,
+            Self::HostedPackage => frost::SigningPackage::deserialize(body).is_ok_and(|package| {
+                let commitments = package.signing_commitments();
+                commitments.len() == context.signers.len() && context.signers.iter().all(|slot| {
+                    frost::Identifier::try_from(*slot).is_ok_and(|id| commitments.contains_key(&id))
+                })
+            }),
+            Self::HostedShare => frost::round2::SignatureShare::deserialize(body).is_ok(),
+            Self::Candidate => pczt::Pczt::parse(body).is_ok(),
+            _ => false,
+        }
+    }
+
     pub fn max_body(self) -> usize {
         match self {
             Self::Package | Self::Candidate => 4 * 1024 * 1024,
@@ -115,6 +160,8 @@ impl MessageKind {
                 64 * 1024
             }
             Self::Receipt | Self::Abort | Self::PeerRequest => 1024,
+            Self::HostedCommitment | Self::HostedPackage => 64 * 1024,
+            Self::HostedAlpha | Self::HostedSeed | Self::HostedShare => 32,
         }
     }
 }
@@ -824,6 +871,20 @@ pub fn valid_witness_pins(pins: WitnessPins) -> bool {
             .all(|(key, run, mailbox)| *key != [0; 32] && *run != [0; 32] && *mailbox != [0; 32])
 }
 
+/// Operator-verifiable fingerprint of the exact ordered witness identities, not their URLs
+/// or access credentials. This stays stable when a route changes without replacing a witness.
+pub fn witness_fingerprint(pins: WitnessPins) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"Loki_nonce_witness_pins_v1\0");
+    for (key, run, mailbox) in pins {
+        hash.update(key);
+        hash.update(run);
+        hash.update(mailbox);
+    }
+    hash.finalize().into()
+}
+
 /// The witness claim ID of one member's nonce: bound to the vault, the member and the
 /// nonce's public commitment, so each nonce can be claimed exactly once.
 pub fn nonce_claim_id(
@@ -978,6 +1039,11 @@ impl SigningSession {
 
     pub fn commitments(&self) -> &[frost::round1::SigningCommitments] {
         self.live.commitments()
+    }
+
+    /// The original pair authenticated by the sealed nonce record.
+    pub fn witness_pins(&self) -> Option<WitnessPins> {
+        self.witness_pins
     }
 
     /// Save one exact ciphertext for each other roster member before delivery.
@@ -1333,6 +1399,41 @@ impl SigningSession {
         self.store.abort()
     }
 
+    /// Replay the original package without reopening (or needing) the signer's nonce.
+    pub fn republish_saved_package(
+        root: &Path,
+        context: &SessionContext,
+        own: u16,
+        passphrase: &str,
+        mailbox: &Mailbox,
+    ) -> Result<bool, String> {
+        let store = AttemptStore::reopen(root, context, own)?;
+        if !store.dir.path().join("package.sealed").try_exists().map_err(|e| e.to_string())? {
+            return Ok(false);
+        }
+        let (_, wires) = store.resend_package(passphrase)?;
+        for wire in wires {
+            mailbox.append(&wire).map_err(|e| e.to_string())?;
+        }
+        Ok(true)
+    }
+
+    /// A durable package can exist before the approval decision or share does.
+    pub fn recover_share_if_saved(
+        root: &Path,
+        context: &SessionContext,
+        own: u16,
+        passphrase: &str,
+        mailbox: &Mailbox,
+    ) -> Result<bool, String> {
+        let store = AttemptStore::reopen(root, context, own)?;
+        if !store.dir.path().join("share.sealed").try_exists().map_err(|e| e.to_string())? {
+            return Ok(false);
+        }
+        store.publish(mailbox, passphrase)?;
+        Ok(true)
+    }
+
     pub fn recover_share(
         root: &Path,
         context: &SessionContext,
@@ -1555,7 +1656,7 @@ impl AttemptStore {
         pins: WitnessPins,
     ) -> Result<(), String> {
         let mut raw = zeroize::Zeroizing::new(Vec::new());
-        raw.push(2);
+        raw.push(3);
         for (key, run, mailbox) in pins {
             raw.extend_from_slice(&key);
             raw.extend_from_slice(&run);
@@ -1568,6 +1669,7 @@ impl AttemptStore {
             raw.extend_from_slice(&length.to_be_bytes());
             raw.extend_from_slice(&serialized);
         }
+        raw.extend_from_slice(&Self::nonce_context(&live.context, &live.own_id));
         self.dir
             .write_sealed("nonces.sealed", &raw, passphrase)
             .map_err(|e| e.to_string())
@@ -1584,10 +1686,13 @@ impl AttemptStore {
                 .read_sealed("nonces.sealed", passphrase)
                 .map_err(|e| e.to_string())?,
         );
-        // v1 omitted mailbox IDs; reopening those nonce records could reuse a CID on
-        // a newly provisioned mailbox. Discard the attempt and start with fresh nonces.
-        if raw.len() < 195 || raw[0] != 2 {
+        // Older records are not bound to their exact signing context.
+        if raw.len() < 195 + 32 || raw[0] != 3 {
             return Err("invalid sealed nonce record".into());
+        }
+        let (raw, binding) = raw.split_at(raw.len() - 32);
+        if binding != Self::nonce_context(context, key.identifier()) {
+            return Err("sealed nonce belongs to another context; start a new signing attempt".into());
         }
         let pins = [
             (
@@ -1646,6 +1751,18 @@ impl AttemptStore {
             },
             pins,
         ))
+    }
+
+    fn nonce_context(context: &SessionContext, member: &frost::Identifier) -> [u8; 32] {
+        let mut binding = blake3::Hasher::new_derive_key("loki standalone signing nonce v3");
+        binding.update(&context.vault);
+        binding.update(&context.payment);
+        binding.update(&context.attempt.0);
+        binding.update(&member.serialize());
+        for id in &context.signers {
+            binding.update(&id.to_be_bytes());
+        }
+        *binding.finalize().as_bytes()
     }
 
     fn remove_nonces(&self) -> Result<(), String> {

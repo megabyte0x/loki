@@ -7,9 +7,8 @@
 # <slot>` on their own machines. This is the "nobody hosts anything but the one shared
 # coordinator" path; selfcustody-testnet.sh is the all-on-one-host loopback TEST.
 #
-# The coordinator runs with HOSTNAME set to the tunnel host so Next derives the public
-# request origin — self-registration signs over the coordinator origin, and a wrong
-# HOSTNAME makes "device signature does not verify".
+# Set PUBLIC_ORIGIN to the tunnel URL so Next verifies self-registration against the
+# public HTTPS origin, not the coordinator's private loopback listener.
 #
 # Env:
 #   FROSTD_URL   frostd loopback url       (default http://127.0.0.1:2744)
@@ -60,8 +59,8 @@ else
   echo "frostd reachable via tunnel"
 fi
 
-echo "== cloudflared quick tunnel -> :$web_port =="
-"$cloudflared" tunnel --url "http://localhost:$web_port" >"$root/cloudflared.log" 2>&1 &
+echo "== cloudflared quick tunnel -> 127.0.0.1:$web_port =="
+"$cloudflared" tunnel --url "http://127.0.0.1:$web_port" >"$root/cloudflared.log" 2>&1 &
 echo $! >> "$root/pids"
 coordinator=""
 for _ in {1..80}; do
@@ -71,12 +70,12 @@ done
 [[ -n $coordinator ]] || { echo "tunnel never came up; see $root/cloudflared.log" >&2; exit 1; }
 echo "coordinator public URL: $coordinator"
 
-echo "== coordinator (node server.js) HOSTNAME=${coordinator#https://} =="
-( cd "$web" && export HOSTNAME="${coordinator#https://}" PORT="$web_port" PUBLIC_PORT=443 LOKI_REGISTRY="$root/registry.json" \
+echo "== coordinator (node server.js) PUBLIC_ORIGIN=$coordinator =="
+( cd "$web" && export PUBLIC_ORIGIN="$coordinator" PORT="$web_port" LOKI_REGISTRY="$root/registry.json" \
   && exec node server.js >"$root/coordinator.log" 2>&1 ) &
 echo $! >> "$root/pids"
-for _ in {1..75}; do curl -sf --max-time 1 "http://localhost:$web_port/api/members" >/dev/null && break; sleep 0.2; done
-curl -sf --max-time 2 "http://localhost:$web_port/api/members" >/dev/null \
+for _ in {1..75}; do curl -sf --max-time 1 "http://127.0.0.1:$web_port/api/members" >/dev/null && break; sleep 0.2; done
+curl -sf --max-time 2 "http://127.0.0.1:$web_port/api/members" >/dev/null \
   || { echo "coordinator did not start; see $root/coordinator.log" >&2; exit 1; }
 # Confirm it is actually served over the tunnel too (trycloudflare edge can take ~30-60s).
 for _ in {1..120}; do curl -sf --max-time 5 "$coordinator/api/members" >/dev/null && break; sleep 1; done

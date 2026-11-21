@@ -73,8 +73,8 @@ final class WalletChannel {
             if profile["profile"] is String { result(profile) }
             else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
         case "unlock", "pair", "restore", "recoverWalletKey":
-            let origin = args?["origin"] as? String
-            guard call.method == "pair" ? (origin != nil && args?.count == 1) : noArgs else { result(invalid); return }
+            let link = args?["link"] as? String
+            guard call.method == "pair" ? (link != nil && args?.count == 1) : noArgs else { result(invalid); return }
             guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
             #if LOKI_VISUAL_ONLY
             result(failure(403, "This visual-only build cannot unlock, pair or restore a signer."))
@@ -85,7 +85,7 @@ final class WalletChannel {
                     result(self.failure(status, error.message))
                 } else { result(nil) }
             }) else { result(busy); return }
-            if let origin { signer.pairWallet(origin: origin.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            if let link { signer.pairWallet(link: link.trimmingCharacters(in: .whitespacesAndNewlines)) }
             else if call.method == "restore" { signer.restoreWallet() }
             else if call.method == "recoverWalletKey" { signer.recoverWalletKey() }
             else { signer.unlockWallet() }

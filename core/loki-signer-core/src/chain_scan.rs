@@ -1,5 +1,5 @@
-//! The vault's Ironwood balance and history from lightwalletd compact blocks, for a signer with
-//! no wallet database (the in-browser signer). Trial decryption is zcash_client_backend's
+//! The vault's Ironwood balance and history as reported by lightwalletd compact blocks, for a
+//! signer with no wallet database (the in-browser signer). Trial decryption is zcash_client_backend's
 //! `scan_block`, the scanner the native wallet runs through `scan_cached_blocks`. Spends are
 //! found by matching every compact action's nullifier against the vault's own notes, so the
 //! scan state is just those notes plus the last block scanned.
@@ -15,9 +15,75 @@ use zcash_client_backend::{
     scanning::{scan_block, Nullifiers, ScanningKeys},
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_primitives::block::BlockHash;
+use zcash_primitives::block::{BlockHash, BlockHeader};
 
 use crate::network::VaultNetwork;
+
+/// Validate the fields Zakura's scanner reads through infallible accessors. If a header
+/// was supplied, normalize to its hashes so all later checks use the same representation.
+pub fn validate_compact_block(block: &mut CompactBlock) -> Result<(), String> {
+    if block.height >= u64::from(u32::MAX) {
+        return Err("compact block height out of range".into());
+    }
+    if !block.header.is_empty() {
+        let mut bytes = block.header.as_slice();
+        let header = BlockHeader::read(&mut bytes).map_err(|e| format!("compact block header: {e}"))?;
+        let hash = header.hash().0;
+        if !bytes.is_empty()
+            || (!block.hash.is_empty() && block.hash != hash)
+            || (!block.prev_hash.is_empty() && block.prev_hash != header.prev_block.0)
+        {
+            return Err("compact block header disagrees with its hashes".into());
+        }
+        block.hash = hash.to_vec();
+        block.prev_hash = header.prev_block.0.to_vec();
+        block.header.clear();
+    }
+    if block.hash.len() != 32 || block.prev_hash.len() != 32 {
+        return Err("compact block has an invalid hash or parent hash".into());
+    }
+    if block.vtx.iter().any(|tx| tx.txid.len() != 32 || u16::try_from(tx.index).is_err())
+        || block.vtx.windows(2).any(|tx| tx[0].index >= tx[1].index)
+    {
+        return Err("compact block has invalid transaction IDs or indices".into());
+    }
+    if block.vtx.iter().flat_map(|tx| &tx.spends).any(|spend| spend.nf.len() != 32) {
+        return Err("compact block has an invalid Sapling nullifier".into());
+    }
+    Ok(())
+}
+
+/// Check commitment-tree arithmetic before invoking the underlying scanner.
+pub fn tree_sizes(prior: &BlockMetadata) -> [Option<u32>; 3] {
+    [prior.sapling_tree_size(), prior.orchard_tree_size(), prior.ironwood_tree_size()]
+}
+
+pub fn checked_next_tree_sizes(block: &CompactBlock, sizes: [Option<u32>; 3]) -> Result<[Option<u32>; 3], String> {
+    let mut counts = [0u64; 3];
+    for tx in &block.vtx {
+        counts[0] += tx.outputs.len() as u64;
+        counts[1] += tx.actions.len() as u64;
+        counts[2] += tx.ironwood_actions.len() as u64;
+    }
+    let reported = block.chain_metadata.as_ref().map(|m| [m.sapling_commitment_tree_size, m.orchard_commitment_tree_size, m.ironwood_commitment_tree_size]);
+    let mut next = [None; 3];
+    for i in 0..3 {
+        let end = match (sizes[i], reported) {
+            (Some(start), reported) => {
+                let end = u32::try_from(u64::from(start) + counts[i]).map_err(|_| "compact block tree size overflow")?;
+                if reported.is_some_and(|r| r[i] != end) {
+                    return Err("compact block has inconsistent tree sizes".into());
+                }
+                end
+            }
+            (None, Some(reported)) if u64::from(reported[i]) >= counts[i] => reported[i],
+            (None, Some(_)) => return Err("compact block has inconsistent tree sizes".into()),
+            (None, None) => u32::try_from(counts[i]).map_err(|_| "compact block tree size overflow")?,
+        };
+        next[i] = Some(end);
+    }
+    Ok(next)
+}
 
 /// One note the vault received.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,12 +118,28 @@ pub struct ChainScan {
     prior: Option<BlockMetadata>,
     /// Where a fresh scan starts: the vault's birth height.
     birth: u32,
+    source: Option<String>,
 }
 
 impl ChainScan {
     pub fn new(network: VaultNetwork, fvk: &FullViewingKey, birth: u32) -> Result<Self, String> {
         let ufvk = UnifiedFullViewingKey::from_orchard_fvk(fvk.clone()).map_err(|e| format!("vault viewing key: {e:?}"))?;
-        Ok(Self { network, keys: ScanningKeys::from_account_ufvks([(0u32, ufvk)]), notes: BTreeMap::new(), prior: None, birth })
+        Ok(Self { network, keys: ScanningKeys::from_account_ufvks([(0u32, ufvk)]), notes: BTreeMap::new(), prior: None, birth, source: None })
+    }
+
+    /// A new provider cannot vouch for compact transactions scanned from the old one,
+    /// even if both providers report identical block hashes.
+    pub fn use_source(&mut self, source: &str, birth: u32) {
+        if self.source.as_deref() != Some(source) || self.birth != birth {
+            self.reset();
+            self.birth = birth;
+            self.source = Some(source.to_owned());
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.prior = None;
+        self.notes.clear();
     }
 
     /// The last block scanned, if any.
@@ -67,43 +149,87 @@ impl ChainScan {
 
     /// The height of the next block to scan.
     pub fn next_height(&self) -> u32 {
-        self.height().map_or(self.birth, |h| h + 1)
+        self.height().map_or(self.birth, |h| h.saturating_add(1))
+    }
+
+    /// Check the provider's block at the persisted height without accepting any transaction data.
+    pub fn matches_checkpoint(&self, bytes: &[u8]) -> Result<bool, String> {
+        let prior = self.prior.as_ref().ok_or("no scanned block to check")?;
+        let mut block = CompactBlock::decode(bytes).map_err(|e| format!("checkpoint block: {e}"))?;
+        if block.height != u64::from(prior.block_height()) {
+            return Err("lightwalletd returned an invalid scan checkpoint".into());
+        }
+        validate_compact_block(&mut block)?;
+        Ok(block.hash() == prior.block_hash())
     }
 
     /// Scan the next compact block (protobuf bytes, as lightwalletd streams it). Blocks must
     /// come in order; one that does not extend the last block scanned is refused.
     pub fn scan(&mut self, block: &[u8]) -> Result<(), String> {
-        let block = CompactBlock::decode(block).map_err(|e| format!("compact block: {e}"))?;
-        let at = u32::try_from(block.height).map_err(|_| "block height out of range")?;
-        if at != self.next_height() {
-            return Err(format!("expected block {}, got {at}", self.next_height()));
-        }
-        let spent: Vec<([u8; 32], String)> = block.vtx.iter().flat_map(|tx| {
-            let txid = tx_id(&tx.txid);
-            tx.ironwood_actions.iter().filter_map(move |a| Some((a.nullifier.as_slice().try_into().ok()?, txid.clone())))
-        }).collect();
-        let scanned = scan_block(&self.network, block, &self.keys, &Nullifiers::empty(), self.prior.as_ref())
-            .map_err(|e| format!("scan block: {e}"))?;
-        let height: u32 = scanned.height().into();
-        for tx in scanned.transactions() {
-            for out in tx.ironwood_outputs() {
-                let nf = out.nf().ok_or("received note without a nullifier")?.to_bytes();
-                self.notes.insert(nf, Received {
-                    height,
-                    txid: tx.txid().to_string(),
-                    value_zat: out.note().0.value().inner(),
-                    // By scope: the library's own change flag needs the spends it was not given.
-                    change: out.recipient_key_scope() == Some(zip32::Scope::Internal),
-                    spent_in: None,
-                });
+        self.scan_batch([block])
+    }
+
+    /// Accept the page atomically without copying the entire saved note history.
+    pub fn scan_batch(&mut self, blocks: impl IntoIterator<Item = impl AsRef<[u8]>>) -> Result<(), String> {
+        let mut prior = self.prior;
+        let start = self.next_height();
+        let mut next = start;
+        let mut forked = false;
+        let mut changes = BTreeMap::new();
+        for bytes in blocks {
+            let mut block = CompactBlock::decode(bytes.as_ref()).map_err(|e| format!("compact block: {e}"))?;
+            validate_compact_block(&mut block)?;
+            if block.height != u64::from(next) {
+                return Err(format!("wrong compact block height: requested {next}, got {}", block.height));
             }
-        }
-        for (nf, txid) in spent {
-            if let Some(note) = self.notes.get_mut(&nf) {
-                note.spent_in.get_or_insert((txid, at));
+            if prior.as_ref().is_some_and(|m| block.prev_hash != m.block_hash().0) {
+                if next != start {
+                    return Err("compact block stream has inconsistent parent hashes".into());
+                }
+                // Finish validating the page before asking the caller to reconcile a fork.
+                forked = true;
+                prior = None;
             }
+            checked_next_tree_sizes(&block, prior.as_ref().map_or([None; 3], tree_sizes))?;
+            let spent: Vec<([u8; 32], String)> = block.vtx.iter().flat_map(|tx| {
+                let txid = tx_id(&tx.txid);
+                tx.ironwood_actions.iter().filter_map(move |a| Some((a.nullifier.as_slice().try_into().ok()?, txid.clone())))
+            }).collect();
+            let scanned = scan_block(&self.network, block, &self.keys, &Nullifiers::empty(), prior.as_ref())
+                .map_err(|e| format!("scan block: {e}"))?;
+            for tx in scanned.transactions() {
+                for out in tx.ironwood_outputs() {
+                    let nf = out.nf().ok_or("received note without a nullifier")?.to_bytes();
+                    changes.insert(nf, Received {
+                        height: next,
+                        txid: tx.txid().to_string(),
+                        value_zat: out.note().0.value().inner(),
+                        // By scope: the library's own change flag needs the spends it was not given.
+                        change: out.recipient_key_scope() == Some(zip32::Scope::Internal),
+                        spent_in: None,
+                    });
+                }
+            }
+            for (nf, txid) in spent {
+                if let Some(note) = changes.get_mut(&nf) {
+                    note.spent_in.get_or_insert((txid, next));
+                } else if let Some(note) = self.notes.get(&nf) {
+                    let mut note = note.clone();
+                    note.spent_in.get_or_insert((txid, next));
+                    changes.insert(nf, note);
+                }
+            }
+            prior = Some(scanned.to_block_metadata());
+            next += 1;
         }
-        self.prior = Some(scanned.to_block_metadata());
+        if next == start {
+            return Err("compact block stream made no progress".into());
+        }
+        if forked {
+            return Err("block does not extend the saved scan tip".into());
+        }
+        self.notes.append(&mut changes);
+        self.prior = prior;
         Ok(())
     }
 
@@ -118,7 +244,7 @@ impl ChainScan {
             ironwood: m.ironwood_tree_size(),
         });
         let notes = self.notes.iter().map(|(nf, n)| (hex::encode(nf), n.clone())).collect();
-        serde_json::to_vec(&Saved { version: 1, birth: self.birth, tip, notes }).expect("scan state serializes")
+        serde_json::to_vec(&Saved { version: 1, birth: self.birth, tip, notes, source: self.source.clone() }).expect("scan state serializes")
     }
 
     /// Resume from [`Self::to_bytes`].
@@ -128,6 +254,7 @@ impl ChainScan {
             return Err(format!("scan state version {} is not supported", saved.version));
         }
         let mut scan = Self::new(network, fvk, saved.birth)?;
+        scan.source = saved.source;
         scan.prior = saved.tip.map(|t| -> Result<_, String> {
             let hash: [u8; 32] = hex::decode(&t.hash).ok().and_then(|h| h.try_into().ok()).ok_or("scan state: bad block hash")?;
             Ok(BlockMetadata::from_parts(t.height.into(), BlockHash(hash), t.sapling, t.orchard, t.ironwood))
@@ -178,7 +305,7 @@ impl ChainScan {
 struct Tip { height: u32, hash: String, sapling: Option<u32>, orchard: Option<u32>, ironwood: Option<u32> }
 
 #[derive(Serialize, Deserialize)]
-struct Saved { version: u8, birth: u32, tip: Option<Tip>, notes: Vec<(String, Received)> }
+struct Saved { version: u8, birth: u32, tip: Option<Tip>, notes: Vec<(String, Received)>, source: Option<String> }
 
 /// A compact transaction id as explorers show it (byte-reversed hex).
 fn tx_id(bytes: &[u8]) -> String {

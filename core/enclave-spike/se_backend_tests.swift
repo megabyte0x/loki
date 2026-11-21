@@ -180,12 +180,28 @@ enum BackendTests {
         }, create: { _ in fatalError("a payment cannot create a key") },
            prove: { _ in fatalError("a payment cannot ask for an ECDSA proof") },
            biometry: { fatalError("a cancellation must not be reclassified") },
-           authorizePayment: { _, context, text in
+           authorizePayment: { _, context, operation, text in
+               precondition(operation == .useKeyKeyExchange, "ECIES needs key exchange, not decrypt")
                precondition(text == reason && !context.interactionNotAllowed)
                precondition(!contexts.contains { $0 === context })
                contexts.append(context)
                return cancel ? -11 : 0
            })
+
+        func sign(_ handle: UInt64) -> Int {
+            var output = [UInt8](repeating: 0, count: 128)
+            return [UInt8(42)].withUnsafeBufferPointer { msg in
+                output.withUnsafeMutableBufferPointer { sig in
+                    se_sign(handle, msg.baseAddress!, msg.count, sig.baseAddress!, sig.count)
+                }
+            }
+        }
+        var unscoped: UInt64 = 0
+        precondition([UInt8(1)].withUnsafeBufferPointer { tag in
+            se_open_persistent(tag.baseAddress!, tag.count, 0, nil, &unscoped)
+        } == 0)
+        precondition(sign(unscoped) > 0, "the stand-in key can sign without a scope")
+        se_close(unscoped)
 
         for expected in [0, 0, -11] {
             cancel = expected != 0
@@ -196,7 +212,10 @@ enum BackendTests {
                 }
             }
             precondition(rc == expected && (handle != 0) == !cancel)
-            if handle != 0 { se_close(handle) }
+            if handle != 0 {
+                precondition(sign(handle) == -8, "a scoped unwrap handle must never sign a login challenge")
+                se_close(handle)
+            }
             var error: NSError?
             precondition(!contexts.last!.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &error))
             precondition(error?.code == LAError.Code.invalidContext.rawValue)

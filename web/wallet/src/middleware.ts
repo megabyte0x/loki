@@ -1,4 +1,4 @@
-import { NextResponse } from "next/server";
+import { NextResponse, type NextRequest } from "next/server";
 
 /**
  * Force the HTML shell and all app/API responses to `no-store` so a deploy is reflected on the
@@ -9,7 +9,13 @@ import { NextResponse } from "next/server";
  * `/_next/static` is intentionally excluded: those chunks are content-addressed and safe to cache
  * long-term; the fresh shell always references the current build's chunk URLs.
  */
-export function middleware() {
+export function middleware(req: NextRequest) {
+  if (req.nextUrl.pathname === "/" && req.nextUrl.searchParams.has("invite")) {
+    return new Response("This kind of invite link is no longer accepted. Ask the vault creator for a new invite.", {
+      status: 410,
+      headers: { "Cache-Control": "no-store", "Referrer-Policy": "no-referrer", "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
   const res = NextResponse.next();
   res.headers.set("Cache-Control", "no-store, must-revalidate");
   return res;

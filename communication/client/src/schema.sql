@@ -496,3 +496,20 @@ WHEN (SELECT count(*) FROM quarantine_samples) + (SELECT count(*) FROM page_diag
         + (SELECT coalesce(sum(length(sample)), 0) FROM page_diagnostics)
         + length(NEW.sample) > 8388608
 BEGIN SELECT RAISE(ABORT, 'diagnostic sample bound'); END;
+CREATE TABLE incomplete_leases (
+    group_id BLOB PRIMARY KEY NOT NULL REFERENCES transfer_groups(group_id),
+    sender INTEGER NOT NULL CHECK (sender BETWEEN 1 AND 3),
+    expires_ms INTEGER NOT NULL CHECK (expires_ms > 0)
+) STRICT;
+CREATE INDEX staged_by_group ON staged_sources(group_id);
+CREATE INDEX staged_by_requirement ON staged_requirements(hash);
+CREATE INDEX received_by_target ON incoming_dependencies(vault,roster,prerequisite_sender,prerequisite,prerequisite_digest,sender,message_id);
+CREATE TABLE received_work (
+    incoming INTEGER NOT NULL CHECK (incoming IN (0,1)),
+    source INTEGER NOT NULL CHECK (source > 0),
+    PRIMARY KEY (incoming, source)
+) STRICT;
+CREATE TRIGGER received_incoming_work AFTER INSERT ON incoming_originals
+WHEN NEW.kind=2 BEGIN INSERT INTO received_work(incoming,source) VALUES(1,NEW.rowid); END;
+CREATE TRIGGER received_local_work AFTER INSERT ON ack_links
+BEGIN INSERT INTO received_work(incoming,source) VALUES(0,NEW.rowid); END;

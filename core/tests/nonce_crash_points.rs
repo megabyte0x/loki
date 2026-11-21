@@ -44,7 +44,7 @@ impl Drill {
 
     /// The process after a restart: a fresh store on the same directory, same device element.
     fn restart(&self) -> (NonceStore, SoftwareSecureElement) {
-        (NonceStore::open(&self.dir).unwrap(), SoftwareSecureElement::from_kek([7; 32]))
+        (NonceStore::open(&self.dir, [1; 32], 1).unwrap(), SoftwareSecureElement::from_kek([7; 32]))
     }
 
     fn package(&self, own: frost::round1::SigningCommitments, msg: u8) -> frost::SigningPackage {
@@ -57,7 +57,7 @@ impl Drill {
 
     fn sign(&self, store: &NonceStore, se: &SoftwareSecureElement, own: frost::round1::SigningCommitments, msg: u8)
         -> Result<frost::round2::SignatureShare, NonceError> {
-        store.sign_and_burn("n", se, &self.package(own, msg), &self.key, &[9; 32], &|| false)
+        store.sign_and_burn("n", se, &self.package(own, msg), &self.key, &[9; 32], None, &|| false)
     }
 }
 
@@ -76,7 +76,7 @@ fn crash_while_persisting_the_nonce_leaves_no_usable_nonce() {
     fs::write(d.dir.join(".n.nonce.tmp"), b"torn write").unwrap();
     let (store, se) = d.restart();
     assert_eq!(store.state("n"), NonceState::Fresh);
-    let own = store.commit("n", &se, d.key.signing_share()).unwrap();
+    let own = store.commit("n", &se, d.key.signing_share(), None).unwrap();
     d.sign(&store, &se, own, 1).unwrap();
     assert_eq!(d.sign(&store, &se, own, 2).unwrap_err(), NonceError::Reuse);
 }
@@ -87,11 +87,11 @@ fn crash_while_persisting_the_nonce_leaves_no_usable_nonce() {
 fn crash_after_persist_before_emit_recovers_the_same_commitment() {
     let d = Drill::new();
     let (store, se) = d.restart();
-    let first = store.commit("n", &se, d.key.signing_share()).unwrap();
+    let first = store.commit("n", &se, d.key.signing_share(), None).unwrap();
     drop((store, se));
     let (store, se) = d.restart();
     assert_eq!(store.state("n"), NonceState::Committed);
-    let again = store.commit("n", &se, d.key.signing_share()).unwrap();
+    let again = store.commit("n", &se, d.key.signing_share(), None).unwrap();
     assert_eq!(again.serialize().unwrap(), first.serialize().unwrap());
     let share = d.sign(&store, &se, first, 1).unwrap();
     assert_eq!(d.sign(&store, &se, first, 2).unwrap_err(), NonceError::Reuse);
@@ -105,7 +105,7 @@ fn crash_after_persist_before_emit_recovers_the_same_commitment() {
 fn crash_before_burn_is_durable_signs_at_most_one_message() {
     let d = Drill::new();
     let (store, se) = d.restart();
-    let own = store.commit("n", &se, d.key.signing_share()).unwrap();
+    let own = store.commit("n", &se, d.key.signing_share(), None).unwrap();
     drop((store, se));
     fs::write(d.dir.join(".n.burn.tmp"), b"torn burn").unwrap();
     let (store, se) = d.restart();
@@ -123,13 +123,13 @@ fn crash_before_burn_is_durable_signs_at_most_one_message() {
 fn crash_after_burn_then_a_different_message_is_refused() {
     let d = Drill::new();
     let (store, se) = d.restart();
-    let own = store.commit("n", &se, d.key.signing_share()).unwrap();
-    let crashed = store.sign_and_burn("n", &se, &d.package(own, 1), &d.key, &[9; 32], &|| true);
+    let own = store.commit("n", &se, d.key.signing_share(), None).unwrap();
+    let crashed = store.sign_and_burn("n", &se, &d.package(own, 1), &d.key, &[9; 32], None, &|| true);
     assert!(crashed.is_err());
     drop((store, se));
     let (store, se) = d.restart();
     assert!(d.dir.join("n.nonce").exists(), "the crash left the nonce file behind");
     assert_eq!(store.state("n"), NonceState::Burned);
     assert_eq!(d.sign(&store, &se, own, 2).unwrap_err(), NonceError::Reuse);
-    assert_eq!(store.commit("n", &se, d.key.signing_share()).unwrap_err(), NonceError::Other("nonce id already burned".into()));
+    assert_eq!(store.commit("n", &se, d.key.signing_share(), None).unwrap_err(), NonceError::Other("nonce id already burned".into()));
 }

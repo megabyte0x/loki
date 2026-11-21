@@ -22,7 +22,7 @@ import {
   opfsCloseAll,
 } from "./pkg/snippets/loki-signer-core-8724841f4db15c9f/js/opfs_fs.js";
 import { blockRange, latestHeight } from "./lightwalletd.js";
-import { controlInbox, endsRequest, idbStore } from "./control-inbox.js";
+import { controlInbox, endsRequest, idbStore, MAX_CONTROL_SESSIONS } from "./control-inbox.js";
 import { vaultSummary, saveVaultName, readVaultName } from "./vault-list.js";
 
 // Ops run concurrently (a status read during a join), and two pre-opens of one path racing
@@ -65,11 +65,18 @@ async function loadFrostd() {
 // Claim this signature's nonce at BOTH external witnesses (fresh, pinned-key receipts verified
 // in wasm-transport), then tell the signer; the core's witness check in signApprove accepts
 // only that claim. A duplicate at either relay (a nonce already used) refuses the signature.
-async function claimAtWitnesses(signer, witnesses, packageHex, seedHex, sighashHex) {
-  const { cid, record } = JSON.parse(signer.nonceClaim(packageHex, seedHex, sighashHex));
+async function claimAtWitnesses(signer, witnesses, attemptHex, packageHex, seedHex, sighashHex) {
+  const { cid, record, pins } = JSON.parse(signer.nonceClaim(attemptHex, packageHex, seedHex, sighashHex));
+  const routes = pins.map((pin) => witnesses.find((w) =>
+    ["key", "run", "mailbox"].every((field) => w[field].toLowerCase() === pin[field])));
+  if (routes.some((w) => !w)) throw new Error("An original nonce witness is missing; start a new signing attempt");
   const { claimNonce } = await loadTransport();
-  for (const w of witnesses) {
-    if (!await claimNonce(w.endpoint, w.key, w.run, w.mailbox, w.read, cid, record)) {
+  for (const w of routes) {
+    const challenge = toHex(crypto.getRandomValues(new Uint8Array(32)));
+    const proof = signer.nonceClaimProof(w.key, w.run, w.mailbox, cid, record, challenge);
+    const created = await claimNonce(w.endpoint, w.key, w.run, w.mailbox, cid, record, challenge, proof)
+      .catch(() => { throw new Error("An original nonce witness is unavailable; start a new signing attempt"); });
+    if (!created) {
       throw new Error("This nonce was already claimed at a nonce witness; start a new signing attempt");
     }
   }
@@ -118,10 +125,36 @@ async function poll(fn, p) {
   throw lastErr ?? new Error("ceremony step timed out");
 }
 
-// Decode a creator invite and run the native joiner dance against the creator's member app
+// One join request to the creator over frostd, as native joiners send it (ceremony.rs
+// `relay_request`): a session of this member and the creator, the request sealed to the creator
+// in wasm (the invite token never crosses the relay in the clear), and the creator's sealed reply.
+async function relayRequest(signer, fc, invite, op) {
+  const { vault, slot, token, creator } = invite;
+  const creatorJson = JSON.stringify(creator);
+  const sessionId = await fc.openSession([signer.frostdPubkey(), creator.encryption]);
+  try {
+    await fc.sendToPeer(creator.encryption, signer.joinSeal(vault, sessionId, slot, creatorJson, JSON.stringify({ op, vault, slot, token })));
+    for (let i = 0; i < 40; i++) {
+      await sleep(250);
+      for (const m of JSON.parse(await fc.recv())) {
+        if (m.from !== creator.encryption) continue;
+        let reply;
+        try { reply = JSON.parse(signer.joinOpen(vault, sessionId, slot, creatorJson, m.message)); } catch { continue; }
+        if (reply.error) throw new Error(reply.error);
+        return reply;
+      }
+    }
+    throw new Error("the creator did not answer over frostd");
+  } finally {
+    await fc.close().catch(() => {});
+  }
+}
+
+// Decode a creator invite and run the native joiner dance with the creator's member app
 // (core/src/host/ceremony.rs: enroll → poll roster → agree → poll session), then hand the
-// assembled DKG params to driveDkg. The four endpoints are token-authenticated member-to-member
-// calls the creator CORS-opens for browser joiners (routes.rs `browser_origin`). The setup
+// assembled DKG params to driveDkg. An invite naming the creator's identity goes over frostd
+// (relayRequest); an older one POSTs the token-authenticated endpoints the creator CORS-opens
+// for browser joiners (routes.rs `browser_origin`). The setup
 // document the creator feeds its own dkg_begin is rebuilt here from the polled roster — the
 // roster fingerprint is over PARSED content (member_state::Roster::fingerprint), so field/byte
 // order is irrelevant and only the values must match.
@@ -135,11 +168,16 @@ async function joinCeremony(signer, p) {
   // restamp only overwrites the id bytes) stamped with the slot id. Needs the signer unlocked.
   const material = JSON.parse(signer.enrollMaterial());
   const identity = { id: slot, signing: material.signing_pubkey, encryption: material.relay_pubkey };
-  await postJson(`${base}/api/enroll`, { vault, slot, token, identity });
+  const auth = { vault, slot, token };
+  const frostdUrl = p.frostdUrl ?? invite.frostd_url;
+  const fc = invite.creator ? await frostdClient(signer, { frostdUrl }) : null;
+  const request = (op) => fc
+    ? relayRequest(signer, fc, invite, op)
+    : postJson(`${base}/api/${op}`, op === "enroll" ? { ...auth, identity } : auth);
+  await request("enroll");
 
   // Poll until the full roster is published (fingerprint present).
-  const auth = { vault, slot, token };
-  const rosterResp = await poll(() => postJson(`${base}/api/roster`, auth), p);
+  const rosterResp = await poll(() => request("roster"), p);
   const roster = rosterResp.roster;
 
   // The creator must not have swapped our slot's identity.
@@ -166,10 +204,10 @@ async function joinCeremony(signer, p) {
   }
 
   // Agree, then poll for the creator's frostd session + coordinator relay peer (+ birth_height).
-  await postJson(`${base}/api/agreed`, auth);
+  await request("agreed");
   const session = await poll(
     () =>
-      postJson(`${base}/api/session`, auth).then((s) =>
+      request("session").then((s) =>
         s.session_id && s.coordinator_peer && (network !== "testnet" || s.birth_height != null)
           ? s
           : Promise.reject(new Error("session pending"))),
@@ -197,7 +235,7 @@ async function joinCeremony(signer, p) {
     network,
     rosterHex,
     birthHeight: doc.birth_height,
-    frostdUrl: p.frostdUrl,
+    frostdUrl,
     sessionId: session.session_id,
     coordinatorPeer: session.coordinator_peer,
     pollMs: p.pollMs,
@@ -211,7 +249,8 @@ async function joinCeremony(signer, p) {
 // (a roster member running the frostd relay) forwards each member's wires to its peers; this
 // member only ever sends to the coordinator and keeps the coordinator's relayed wires.
 async function driveDkg(signer, p) {
-  const { vaultHex, slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
+  const { slot, label, network, rosterHex, frostdUrl, coordinatorPeer, sessionId } = p;
+  const vaultHex = await vaultPathId(p.vaultHex);
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
   // The backup also seals to the recovery public key; without one vaultJoin refuses.
   await opfsPreopenRead(JSON.parse(devicePaths()).recovery);
@@ -253,50 +292,117 @@ async function openVault(signer, vaultHex) {
   return vault;
 }
 async function openVaultAny(signer, vaultHex) {
-  if (!/^[0-9a-f]{64}$/.test(vaultHex ?? "")) throw new Error("invalid vault id");
+  vaultHex = await vaultPathId(vaultHex);
   for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
   return JSON.parse(signer.vaultOpen(vaultHex));
 }
 
-// The vault's balance and history from the chain itself: lightwalletd compact blocks from the
-// vault's birth (or the last block this Worker scanned) to the tip, trial-decrypted in wasm
-// (loki-signer-core chain_scan.rs). Nothing here comes from other members.
+async function vaultPathId(id) {
+  if (!/^[0-9a-f]{64}$/i.test(id ?? "")) throw new Error("invalid vault id");
+  const canonical = id.toLowerCase();
+  const root = await navigator.storage.getDirectory();
+  let dir;
+  try { dir = await (await root.getDirectoryHandle("loki")).getDirectoryHandle("vaults"); }
+  catch (e) { if (e.name === "NotFoundError") return canonical; throw e; }
+  let existing;
+  for await (const [name] of dir.entries()) {
+    if (name.toLowerCase() !== canonical) continue;
+    if (existing) throw new Error("Multiple local vault directories match; keep both backups and resolve the conflict before restoring.");
+    existing = name;
+  }
+  return existing ?? canonical;
+}
+
+// Trial decryption and checkpoint matching only establish what the configured provider reported.
 async function chainScan(signer, p) {
-  if (!p.lightwalletdGrpcWeb) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
+  const source = p.lightwalletdGrpcWeb;
+  if (!source) throw new Error("This signer has no lightwalletd gRPC-web endpoint configured, so it cannot read the chain");
   await openVault(signer, p.vaultHex);
-  const tip = await latestHeight(p.lightwalletdGrpcWeb);
-  // Resumes from the sealed state the last scan saved (scanSave after each batch). A block that
-  // does not extend the saved tip means the chain reorganized: rescan once from the vault birth.
-  // ponytail: full rescan on any reorg; roll back a few blocks if vaults get old.
+  const tip = await latestHeight(source);
+  const matchesCheckpoint = async (height) => {
+    const [block] = await blockRange(source, height, height);
+    return signer.scanMatchesCheckpoint(block);
+  };
+  const saved = signer.scanStart(source);
+  let checkedTip = false;
+  if (saved != null) {
+    if (saved > tip || !(await matchesCheckpoint(saved))) signer.scanReset();
+    else checkedTip = saved === tip;
+  }
+  // A reorg may also happen after the checkpoint read. Retry once from vault birth.
   for (let rescanned = false; ;) {
     try {
       for (let next = signer.scanNext(); next <= tip; next = signer.scanNext()) {
-        for (const block of await blockRange(p.lightwalletdGrpcWeb, next, Math.min(tip, next + 499))) signer.scanBlock(block);
+        const end = Math.min(tip, next + 499);
+        signer.scanBlocks(next, end, await blockRange(source, next, end));
         signer.scanSave();
       }
       break;
     } catch (e) {
-      if (rescanned || !/extend|expected block/.test(String(e?.message ?? e))) throw e;
+      if (rescanned || !String(e?.message ?? e).includes("block does not extend the saved scan tip")) throw e;
       rescanned = true;
       signer.scanReset();
     }
   }
-  return { tip, ...JSON.parse(signer.scanResult()) };
+  const result = JSON.parse(signer.scanResult());
+  if (result.height !== tip || (!checkedTip && !(await matchesCheckpoint(tip)))) {
+    throw new Error("lightwalletd did not provide a consistent scan through its reported tip; retry sync");
+  }
+  return { tip, ...result, chain_trust: "provider_reported" };
 }
 
-// A payment's status for the wallet: its terms and signing group from the proposer's notices,
-// and whether the chain scan saw its one input note spent (and in which transaction).
+// Local decisions and checked effects, never the proposer's claimed approval or txid.
+let paymentRecords;
+async function paymentRecord(key, record) {
+  paymentRecords ??= new Promise((resolve, reject) => {
+    const req = indexedDB.open("loki_payment_records", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("attempts");
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  const tx = (await paymentRecords).transaction("attempts", record ? "readwrite" : "readonly", { durability: "strict" });
+  const store = tx.objectStore("attempts");
+  const req = record ? store.put(record, key) : store.get(key);
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve(req.result ?? {});
+    tx.onabort = () => reject(tx.error ?? new Error("could not save payment verification"));
+  });
+}
+async function paymentKey(signer, notice) {
+  const scope = JSON.stringify([signer.frostdPubkey(), notice.hash, notice.termsKey]);
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(scope)));
+  return btoa(String.fromCharCode(...hash));
+}
+// paymentCheck only accepts an Ironwood-only v6 candidate. Its shielded sighash is its
+// effects txid in wire byte order (ZIP 233); the display txid reverses those bytes.
+const reviewedTxid = (review) => review.sighash.match(/../g).reverse().join("");
+
+// A payment's status for the wallet: relay terms, this member's own decision, and the
+// chain's spend as separate facts. Only matching checked effects identify the attempt.
 async function paymentStatus(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
-  const terms = notices[notices.length - 1].intent;
-  checkTerms(terms);
-  const ended = notices.find((n) => n.kind === "cancelled" || n.kind === "failed")?.kind ?? null;
-  const signers = notices.find((n) => n.kind === "start" && n.intent.signers?.length)?.intent.signers ?? [];
-  await chainScan(signer, p);
+  const { notice, start, signed } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const terms = notice.intent;
+  const ended = notice.kind === "cancelled" || notice.kind === "failed" ? notice.kind : null;
+  const signers = start?.intent.signers ?? [];
+  const key = await paymentKey(signer, notice);
+  const record = await paymentRecord(key);
+  const { chain_trust } = await chainScan(signer, p);
   const spent = JSON.parse(signer.scanSpentBy(terms.note_selection[0]));
-  return { terms, signers, ended, spent };
+  let txid = record.txid ?? null;
+  if (spent && !txid && signed) {
+    // An authenticated copy supplies candidate effects, not proof of a broadcast or approval.
+    try {
+      const review = JSON.parse(signer.paymentCheck(signed.pczt, JSON.stringify({ ...terms, tx_expiry: signed.intent.signing_expiry })));
+      if (reviewedTxid(review) === spent.txid) txid = spent.txid;
+    } catch { /* An unchecked copy cannot identify the spend. */ }
+    if (txid) {
+      await paymentRecord(key, { ...record, txid });
+    }
+  }
+  const closed = endsRequest(notice, vault.slot);
+  return { terms, signers, ended, closed, spent, txid, approved: record.approved === true, slot: vault.slot, chain_trust };
 }
 
 // The terms a proposer announced for this payment, read-only: nothing is approved or sent.
@@ -304,9 +410,7 @@ async function paymentStatus(signer, p) {
 async function paymentTerms(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notices } = await findPayment(signer, control, vault, p.attemptHex, p);
-  const t = notices[notices.length - 1].intent;
-  checkTerms(t);
+  const { notice: { intent: t } } = await findPayment(signer, control, vault, p.attemptHex, p);
   return { review_token: p.attemptHex, recipient: t.recipient, amount_zat: String(t.amount_zat), fee_zat: String(t.fee_zat), memo: t.memo };
 }
 
@@ -320,57 +424,179 @@ async function frostdClient(signer, p) {
   return fc;
 }
 
-// Drain this member's inbox on a payment control session and open each sealed message under
-// the confirmed roster. Anything that does not open (a non-member, another session) is dropped.
-// Returns every message opened on that session so far (control-inbox.js), not just new ones.
 const controlHistory = controlInbox(idbStore());
-async function readControl(signer, control, sessionId) {
-  const raw = await controlHistory(sessionId, async () => {
+// These are control states, not evidence of a finalized or mined transaction.
+const noticeOrder = ["intent", "start", "signed", "broadcast", "confirmed", "failed", "cancelled"];
+// PeerReply permits a 64 KiB body, which can round up to a 128 KiB sealed bucket.
+const MAX_CONTROL_WIRE = 2 * (128 * 1024 + 53);
+const MAX_CONTROL_BATCH = 256;
+const hex32 = (s) => typeof s === "string" && /^[0-9a-f]{64}$/.test(s);
+const uuid = (s) => typeof s === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(s);
+const txHex = (s) => typeof s === "string" && s.length % 2 === 0 && /^[0-9a-f]+$/.test(s);
+
+function openNotice(signer, vault, sessionId, owner, wire) {
+  try {
+    const { from, body } = JSON.parse(signer.openControl(sessionId, wire.from, wire.message));
+    const { kind, hash, intent: i, txid, pczt, raw_tx } = JSON.parse(body);
+    if (from !== owner.id || !noticeOrder.includes(kind) || !hex32(hash)
+      || (kind !== "signed" && wire.message.length > 16 * 1024)
+      || !i || i.proposer !== from || i.vault !== vault.vault_id || !hex32(i.attempt)
+      || i.control_session_id !== sessionId || !uuid(i.session_id) || i.session_id === sessionId
+      || typeof i.phase !== "string" || typeof i.recipient !== "string" || !i.recipient.length
+      || typeof i.memo !== "string" || new TextEncoder().encode(i.memo).length > 512
+      || ![i.amount_zat, i.fee_zat, i.change_zat].every((n) => Number.isSafeInteger(n) && n >= 0 && n <= 2_100_000_000_000_000)
+      || !i.amount_zat || ![i.target_height, i.expiry_height].every((h) => Number.isInteger(h) && h >= 0 && h <= 0xffffffff)
+      || i.expiry_height <= i.target_height || !Array.isArray(i.note_selection)
+      || i.note_selection.length !== 1 || !hex32(i.note_selection[0])) return null;
+    if (i.replaces !== undefined && (!hex32(i.replaces?.attempt) || typeof i.replaces.cancel !== "boolean")) return null;
+    const pin = i.coordinator;
+    if (pin !== undefined && (pin?.id !== 0 || !hex32(pin.signing) || !hex32(pin.encryption)
+      || vault.members.some((m) => m.signing === pin.signing || m.encryption === pin.encryption))) return null;
+    if (!Array.isArray(i.signers)) return null;
+    const validGroup = i.signers.length === vault.threshold
+      && i.signers[0] === from && new Set(i.signers).size === vault.threshold
+      && i.signers.every((slot) => vault.members.some((m) => m.id === slot));
+    // Older starts did not fix a separate expiry; they used the approved bound.
+    const fixesGroup = kind === "start" || kind === "signed";
+    const expiry = i.signing_expiry ?? (fixesGroup ? i.expiry_height : undefined);
+    if ((i.signers.length || fixesGroup) && !validGroup
+      || (expiry != null && (!Number.isInteger(expiry) || expiry <= i.target_height || expiry > i.expiry_height))) return null;
+    const sent = kind === "signed" || kind === "broadcast" || kind === "confirmed";
+    if ((sent || txid != null) && !hex32(txid)) return null;
+    if (kind === "signed" && (!txHex(pczt) || !txHex(raw_tx))) return null;
+    // This projection matches the native hash's immutable fields; phase, group and actual
+    // signing expiry are excluded. Compare the terms too, not just the proposer's hash label.
+    const intent = {
+      vault: i.vault, attempt: i.attempt, proposer: from, session_id: i.session_id, control_session_id: sessionId,
+      recipient: i.recipient, memo: i.memo, amount_zat: i.amount_zat, fee_zat: i.fee_zat, change_zat: i.change_zat,
+      target_height: i.target_height, expiry_height: i.expiry_height, note_selection: i.note_selection,
+      ...(i.replaces && { replaces: { attempt: i.replaces.attempt, cancel: i.replaces.cancel } }),
+      ...(pin && { coordinator: { id: 0, signing: pin.signing, encryption: pin.encryption } }),
+    };
+    return {
+      from, kind, hash, txid, ...(kind === "signed" && { pczt }),
+      termsKey: JSON.stringify(intent),
+      intent: { ...intent, phase: i.phase, signers: i.signers, signing_expiry: expiry },
+    };
+  } catch { return null; } // Authentication or decoding failed.
+}
+
+function selectNotices(signer, vault, sessionId, owner, wires) {
+  let notice, start, signed;
+  for (const wire of wires) {
+    const event = openNotice(signer, vault, sessionId, owner, wire);
+    if (!event || (notice && (event.hash !== notice.event.hash || event.termsKey !== notice.event.termsKey))) continue;
+    if (event.kind === "start" || event.kind === "signed") {
+      const fixed = (start ?? signed)?.event.intent;
+      if (fixed && (event.intent.signing_expiry !== fixed.signing_expiry
+        || String(event.intent.signers) !== String(fixed.signers))) continue;
+    }
+    const entry = { wire, event };
+    if (event.kind === "start") start ??= entry;
+    if (event.kind === "signed") signed ??= entry;
+    if (!notice || noticeOrder.indexOf(event.kind) > noticeOrder.indexOf(notice.event.kind)) notice = entry;
+  }
+  if (!notice) return null;
+  return {
+    notice: notice.event, start: start?.event, signed: signed?.event,
+    wires: [...new Set([start?.wire, signed?.wire, notice.wire].filter(Boolean))],
+  };
+}
+
+function controlOwner(vault, info) {
+  const participants = new Set(info.participants);
+  if (info.participants.length !== vault.members.length || !vault.members.every((m) => participants.has(m.encryption))) return null;
+  return vault.members.find((m) => m.id !== vault.slot && m.encryption === info.coordinator);
+}
+
+// Match the whole roster before draining. If two local vaults share a roster, try the other
+// vault before discarding its one-shot notice; the sealed envelope binds the actual vault.
+async function readControl(signer, control, vault, sessionId, owner, scope, info) {
+  let reduced = null;
+  await controlHistory([scope, sessionId], async (saved) => {
+    if (saved.blocked || saved.vault && saved.vault !== vault.vault_id || saved.wires.length > MAX_CONTROL_BATCH) return [];
     control.useSession(sessionId);
     return JSON.parse(await control.recv());
+  }, async (saved, fresh) => {
+    if (saved.vault && saved.vault !== vault.vault_id) return saved;
+    const unique = new Map();
+    let bytes = 0;
+    let blocked = saved.blocked ?? false;
+    for (const batch of [saved.wires, fresh]) {
+      if (batch.length > MAX_CONTROL_BATCH) blocked = true;
+      for (const wire of batch.slice(0, MAX_CONTROL_BATCH)) {
+        const msg = wire?.message;
+        if (wire?.from !== owner.encryption || typeof msg !== "string" || !msg.length
+          || msg.length > MAX_CONTROL_WIRE || unique.has(msg)) continue;
+        bytes += msg.length;
+        if (bytes > 4 * 1024 * 1024) { blocked = true; break; }
+        unique.set(msg, { from: owner.encryption, message: msg });
+      }
+    }
+    const wires = [...unique.values()];
+    const record = (name, state) => ({
+      vault: name, wires: state.wires, blocked,
+      // Don't discard legacy data if only a prefix could be checked.
+      migrated: !blocked && !saved.vault && saved.wires.some((w) => state.wires.some((m) => m.message === w?.message)),
+    });
+    reduced = selectNotices(signer, vault, sessionId, owner, wires);
+    if (!reduced && info && wires.length && !saved.vault) {
+      const dir = await vaultDirectory();
+      try {
+        if (dir) for await (const [name, h] of dir.entries()) {
+          if (name === vault.vault_id || h.kind !== "directory" || !hex32(name)) continue;
+          let other;
+          try { other = await openVault(signer, name); } catch { continue; }
+          const proposer = controlOwner(other, info);
+          if (!proposer) continue;
+          const match = selectNotices(signer, other, sessionId, proposer, wires);
+          if (match) return record(name, match);
+        }
+      } finally { await openVault(signer, vault.vault_id); }
+    }
+    if (!reduced) return saved;
+    // A destructive read went over budget. A dropped terminal event could make the
+    // retained start stale, so never authorize signing from this partial record.
+    reduced.blocked = blocked;
+    if (saved.vault && blocked === saved.blocked && reduced.wires.length === saved.wires.length
+      && reduced.wires.every((wire, i) => wire.message === saved.wires[i].message)) return saved;
+    return record(vault.vault_id, reduced);
   });
-  const out = [];
-  for (const m of raw) {
-    try {
-      const { from, body } = JSON.parse(signer.openControl(sessionId, m.from, m.message));
-      out.push({ from, ...JSON.parse(body) });
-    } catch { /* not a control message sealed to this member */ }
-  }
-  return out;
+  return reduced;
 }
 
-// A proposer notice about this payment: the sender is the proposer and the session ids match.
-function aboutPayment(msg, vault, attemptHex, controlSessionId) {
-  const i = msg.intent;
-  return i && msg.from === i.proposer && i.attempt === attemptHex && i.vault === vault.vault_id
-    && i.control_session_id === controlSessionId && i.session_id && i.session_id !== controlSessionId;
+const controlScope = (signer, p) => JSON.stringify([p.frostdUrl, signer.frostdPubkey()]);
+
+async function controlSessions(control, scope) {
+  const ids = await control.list_sessions();
+  if (ids.length > MAX_CONTROL_SESSIONS) throw new Error("too many relay sessions to check for payments");
+  const live = new Set(ids);
+  await controlHistory.prune(scope, live);
+  return live;
 }
 
-// Find the payment's control session the way native members do (payment.rs `sync_control`):
-// a session a vault member opened with every member as a participant, where that member sealed
-// a notice about this attempt. A signing session is opened by a one-shot coordinator key, so it
-// never matches. Notices already drained there are kept (readControl), and other payments'
-// sessions are read once and skipped.
+// A signing session has a one-shot coordinator, not a confirmed vault member.
 async function findPayment(signer, control, vault, attemptHex, p) {
-  const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
+  const scope = controlScope(signer, p);
   const skip = new Set();
   const pollMs = Number(p.findPollMs) || 2000;
   const maxTicks = Number(p.findMaxTicks) || 30;
   for (let tick = 0; tick < maxTicks; tick++) {
-    for (const sessionId of await control.list_sessions()) {
+    for (const sessionId of await controlSessions(control, scope)) {
       if (skip.has(sessionId)) continue;
       control.useSession(sessionId);
       const info = JSON.parse(await control.sessionInfo());
-      const owner = ids.get(info.coordinator);
-      if (owner === undefined || owner === vault.slot
-        || info.participants.length !== ids.size || !info.participants.every((k) => ids.has(k))) {
+      const owner = controlOwner(vault, info);
+      if (!owner) {
         skip.add(sessionId);
         continue;
       }
-      const msgs = await readControl(signer, control, sessionId);
-      const notices = msgs.filter((m) => m.from === owner && aboutPayment(m, vault, attemptHex, sessionId));
-      if (notices.length > 0) return { controlSessionId: sessionId, notices };
-      if (msgs.length > 0) skip.add(sessionId);
+      const state = await readControl(signer, control, vault, sessionId, owner, scope, info);
+      if (state?.notice.intent.attempt === attemptHex) {
+        if (state.blocked) throw new Error("this payment's notice history exceeded the inbox limit");
+        return { controlSessionId: sessionId, ...state };
+      }
+      if (state) skip.add(sessionId);
     }
     await sleep(pollMs);
   }
@@ -383,34 +609,41 @@ async function findPayment(signer, control, vault, attemptHex, p) {
 async function listPending(signer, vaultHex, p) {
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
-  const ids = new Map(vault.members.map((m) => [m.encryption, m.id]));
+  const scope = controlScope(signer, p);
   const pending = new Map();
-  for (const sessionId of await control.list_sessions()) {
+  for (const sessionId of await controlSessions(control, scope)) {
     control.useSession(sessionId);
     const info = JSON.parse(await control.sessionInfo());
-    const owner = ids.get(info.coordinator);
-    if (owner === undefined || owner === vault.slot
-      || info.participants.length !== ids.size || !info.participants.every((k) => ids.has(k))) continue;
-    for (const m of await readControl(signer, control, sessionId)) {
-      const i = m.intent;
-      if (m.from !== owner || !i || !/^[0-9a-f]{64}$/.test(i.attempt ?? "") || !aboutPayment(m, vault, i.attempt, sessionId)) continue;
-      if (endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
-      if (pending.get(i.attempt) === null) continue;
-      pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: i.proposer });
-    }
+    const owner = controlOwner(vault, info);
+    if (!owner) continue;
+    const state = await readControl(signer, control, vault, sessionId, owner, scope, info);
+    if (!state) continue;
+    const { notice: m } = state;
+    const i = m.intent;
+    if (state.blocked || endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
+    if (pending.get(i.attempt) === null) continue;
+    pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: m.from, note: i.note_selection[0] });
   }
-  return [...pending.values()].filter(Boolean);
+  const requests = [...pending.values()].filter(Boolean);
+  if (!requests.length) return [];
+  await chainScan(signer, p);
+  // A spent input ends this request's opportunity to sign, but doesn't identify the payment.
+  return requests.flatMap(({ note, ...request }) => JSON.parse(signer.scanSpentBy(note)) ? [] : [request]);
+}
+
+async function vaultDirectory() {
+  try {
+    return await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults");
+  } catch { return null; } // no vault yet
 }
 
 // Every vault this browser holds a signer for, from its own OPFS (loki/vaults/<id>/signer).
 async function listVaults(signer) {
-  let dir;
-  try {
-    dir = await (await (await navigator.storage.getDirectory()).getDirectoryHandle("loki")).getDirectoryHandle("vaults");
-  } catch { return []; } // no vault yet
+  const dir = await vaultDirectory();
+  if (!dir) return [];
   const out = [];
   for await (const [name, h] of dir.entries()) {
-    if (h.kind !== "directory" || !/^[0-9a-f]{64}$/.test(name)) continue;
+    if (h.kind !== "directory" || !/^[0-9a-f]{64}$/i.test(name)) continue;
     let v;
     try { v = await openVaultAny(signer, name); } catch { continue; } // setup never started
     out.push(vaultSummary(v, await readVaultName(h)));
@@ -418,18 +651,15 @@ async function listVaults(signer) {
   return out;
 }
 
-// The proposer's latest word on the signing group: `start` names it and fixes the signing
-// expiry (outside the intent hash, like the group), `cancelled` and `failed` end the request.
-// Plain `intent` re-announcements change nothing.
-function groupFrom(notices) {
-  for (const n of notices) {
-    if (n.kind === "cancelled") throw new Error("the proposer cancelled this payment");
-    if (n.kind === "failed") throw new Error("the proposer could not complete this payment");
-    if (n.kind === "start" && n.intent.signers?.length) {
-      return { signers: n.intent.signers, signingExpiry: n.intent.signing_expiry ?? null };
-    }
+function activeGroup({ notice, start, blocked }, slot) {
+  if (blocked) throw new Error("this payment's notice history exceeded the inbox limit");
+  if (endsRequest(notice, slot)) {
+    if (notice.kind === "cancelled") throw new Error("the proposer cancelled this payment");
+    if (notice.kind === "failed") throw new Error("the proposer could not complete this payment");
+    if (notice.kind === "start") throw new Error("enough members already approved this payment");
+    throw new Error("the proposer ended this signing request");
   }
-  return null;
+  return start?.intent;
 }
 
 // Drive this NON-proposer member through one payment signing attempt over frostd, mirroring
@@ -441,83 +671,90 @@ function groupFrom(notices) {
 // The request is open to every member: the proposer fixes the signing group from the first
 // approvals to arrive. So this member approves, waits for the group, and commits a nonce only
 // if the group includes it; a commitment from outside the group would fail the round.
-async function drivePayment(signer, p) {
+async function drivePayment(signer, p, witnessPinsPath) {
   const { vaultHex, attemptHex } = p;
   // Like a native member without --nonce-witnesses: no witnesses, no signing — refused before
   // anything is approved or committed.
   if (!Array.isArray(p.nonceWitnesses) || p.nonceWitnesses.length !== 2) {
     throw new Error("This signer has no nonce witnesses configured, so it cannot sign");
   }
-  signer.setNonceWitnesses(JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox }))));
+  const pins = JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox })));
+  await opfsPreopenRead(witnessPinsPath);
+  if (!signer.setNonceWitnesses(pins)) {
+    const consent = await ask("nonce-witnesses", p.nonceWitnesses.map((w) => w.endpoint));
+    signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
+    await opfsPreopenWrite(witnessPinsPath);
+    signer.setNonceWitnesses(pins, consent.fingerprint);
+  }
   const vault = await openVault(signer, vaultHex);
   const control = await frostdClient(signer, p);
-  const { controlSessionId, notices } = await findPayment(signer, control, vault, attemptHex, p);
-  const announced = notices[notices.length - 1];
+  const { controlSessionId, notice: announced, start } = await findPayment(signer, control, vault, attemptHex, p);
   const proposer = vault.members.find((m) => m.id === announced.from);
-
   const terms = announced.intent;
-  checkTerms(terms);
+  // Trust the key in the authenticated payment terms, never signing-session metadata.
+  const coordinator = terms.coordinator;
+  if (!coordinator) {
+    throw new Error("This payment has no sealed signing coordinator; ask the proposer to create a fresh payment");
+  }
+  const key = await paymentKey(signer, announced);
+  const record = await paymentRecord(key);
+  const scope = controlScope(signer, p);
+  const refresh = async () => {
+    const state = await readControl(signer, control, vault, controlSessionId, proposer, scope);
+    if (!state || state.notice.hash !== announced.hash || state.notice.termsKey !== announced.termsKey) {
+      throw new Error("the payment's approved terms are no longer available");
+    }
+    return activeGroup(state, vault.slot);
+  };
 
   // Approve on the control session: a sealed {kind:"approval"} for the terms the proposer
   // announced, which the proposer records (payment.rs `sync_control`). Durable at frostd. The
   // member sees those terms on the signer page first; declining sends nothing.
-  let group = groupFrom(notices);
-  if (group && !group.signers.includes(vault.slot)) throw new Error("enough members already approved this payment");
+  let group = activeGroup({ notice: announced, start }, vault.slot);
   if (!group) {
-    if (!await ask("payment-terms", terms)) throw new Error("You declined this payment request");
-    const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
-    await control.sendToPeer(proposer.encryption, signer.sealControl(controlSessionId, proposer.id, approval));
-    group = await waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposer.id, p);
+    if (!await ask("payment-terms", { ...terms, vaultHex, attemptHex })) throw new Error("You declined this payment request");
+    group = await refresh();
+    if (!group) {
+      const approval = JSON.stringify({ kind: "approval", hash: announced.hash, intent: terms, txid: null });
+      await control.sendToPeer(proposer.encryption, signer.sealControl(controlSessionId, proposer.id, approval));
+      group = await waitForSigningGroup(refresh, p);
+    }
   }
-  const { signers, signingExpiry } = group;
-  if (!signers.includes(vault.slot)) return { approved: true, signed: false };
-  // The transaction's real expiry is fixed by `start` (about seven days above the proposer's
-  // tip) and must lie above the anchor and no later than the approved bound (payment.rs
-  // `check_intent`). Without one, the approved bound is the expiry.
-  const expiry = signingExpiry ?? terms.expiry_height;
-  if (!Number.isSafeInteger(expiry) || expiry <= terms.target_height || expiry > terms.expiry_height) {
-    throw new Error("the proposer's signing expiry is outside the approved terms");
-  }
+  const { signers, signing_expiry: expiry } = group;
 
-  // The signing session's coordinator is the one-shot key that opened it.
   const fc = await frostdClient(signer, p);
-  const signingSessionId = announced.intent.session_id;
-  fc.useSession(signingSessionId);
-  const coordinatorPeer = JSON.parse(await fc.sessionInfo()).coordinator;
-  if (!coordinatorPeer || vault.members.some((m) => m.encryption === coordinatorPeer)) {
-    throw new Error("the payment's signing session has no coordinator");
-  }
+  fc.useSession(terms.session_id);
 
   // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
   // native host sets both to the attempt), so the synchronous commit/sign can persist.
   const nonceId = attemptHex + attemptHex;
-  const dir = `loki/vaults/${vaultHex}/signer`;
+  const dir = `loki/vaults/${await vaultPathId(vaultHex)}/signer`;
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.nonce`);
   await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
 
-  // Round 1: emit this member's public commitment to the coordinator.
-  await fc.sendToCoordinator(signer.signCommit(attemptHex));
-
-  // Collect the three inbound messages: the sealed candidate (from the proposer) and the
-  // signing package + 32-byte seed (from the coordinator). The 32-byte message is the seed;
-  // the longer coordinator message is the package.
   const signersCsv = signers.join(",");
-  let candidateHex = null, packageHex = null, seedHex = null;
+  const seal = (body, share) => signer.sealSigning(coordinator.signing, coordinator.encryption, signersCsv, attemptHex, body, share);
+  await refresh();
+  await fc.sendToCoordinator(seal(signer.signCommit(attemptHex), false));
+
+  // Accept one authenticated message of each expected kind, regardless of delivery order.
+  const received = new Map();
   const pollMs = Number(p.pollMs) || 200;
   const maxTicks = Number(p.maxTicks) || 1200;
   for (let tick = 0; tick < maxTicks; tick++) {
     for (const m of JSON.parse(await fc.recv())) {
-      if (m.from === proposer.encryption && candidateHex === null) {
-        candidateHex = signer.openCandidate(proposer.signing, proposer.encryption, proposer.id, signersCsv, attemptHex, m.message);
-      } else if (m.from === coordinatorPeer) {
-        if (m.message.length === 64) seedHex = m.message; // 32 bytes hex
-        else packageHex = m.message;
-      }
+      const sender = m.from === proposer.encryption ? proposer : m.from === coordinator.encryption ? coordinator : null;
+      if (!sender) continue;
+      try {
+        const { kind, body } = JSON.parse(signer.openSigning(sender.signing, sender.encryption, sender.id, signersCsv, attemptHex, m.message));
+        if (!received.has(kind)) received.set(kind, body);
+      } catch { /* not an authenticated round message for this attempt */ }
     }
-    if (candidateHex !== null && packageHex !== null && seedHex !== null) break;
+    if (received.size === 3) break;
     await sleep(pollMs);
   }
-  if (candidateHex === null || packageHex === null || seedHex === null) {
+  const candidateHex = received.get("candidate"), packageHex = received.get("package"), seedHex = received.get("seed");
+  if (!candidateHex || !packageHex || !seedHex) {
     throw new Error("payment signing messages did not arrive before the deadline");
   }
 
@@ -527,35 +764,29 @@ async function drivePayment(signer, p) {
   // with a fresh passkey assertion (or the passphrase again), and signApprove releases the
   // share only for the sighash the member confirmed.
   const review = JSON.parse(signer.paymentCheck(candidateHex, JSON.stringify({ ...terms, tx_expiry: expiry })));
-  const consent = await ask("payment-sign", review);
+  const txid = reviewedTxid(review);
+  if (record.txid && record.txid !== txid) throw new Error("this attempt already has different reviewed effects");
+  const consent = await ask("payment-sign", { ...review, vaultHex, attemptHex });
   if (!consent) throw new Error("You declined to sign this payment");
+  await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
-  await claimAtWitnesses(signer, p.nonceWitnesses, packageHex, seedHex, review.sighash);
+  await paymentRecord(key, { ...record, txid });
+  await claimAtWitnesses(signer, p.nonceWitnesses, attemptHex, packageHex, seedHex, review.sighash);
   const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
-  await fc.sendToCoordinator(share);
+  await fc.sendToCoordinator(seal(share, true));
+  // Keep a terms-only approval or an interrupted share send retryable in the wallet.
+  await paymentRecord(key, { approved: true, txid });
   return { approved: true, signed: true, review };
-}
-
-// The announced terms, shape-checked before they are shown (payment.rs `check_intent`). The
-// wasm `paymentCheck` re-checks every value against the candidate itself.
-function checkTerms(t) {
-  const ok = t && typeof t.recipient === "string" && typeof t.memo === "string"
-    && [t.amount_zat, t.fee_zat, t.change_zat, t.target_height, t.expiry_height].every(Number.isSafeInteger)
-    && t.amount_zat > 0 && t.expiry_height > t.target_height
-    && Array.isArray(t.note_selection) && t.note_selection.length === 1;
-  if (!ok) throw new Error("the proposer announced invalid payment terms");
 }
 
 // Wait on the control session until the proposer names the signing group. Nothing secret is
 // committed while waiting, so giving up here is safe: approving again resumes the wait.
-async function waitForSigningGroup(signer, control, vault, attemptHex, controlSessionId, proposerId, p) {
+async function waitForSigningGroup(refresh, p) {
   const pollMs = Number(p.groupPollMs) || 2000;
   const maxTicks = Number(p.groupMaxTicks) || 900; // 30 minutes at the default poll
   for (let tick = 0; tick < maxTicks; tick++) {
     await sleep(pollMs);
-    const notices = (await readControl(signer, control, controlSessionId))
-      .filter((m) => m.from === proposerId && aboutPayment(m, vault, attemptHex, controlSessionId));
-    const group = groupFrom(notices);
+    const group = await refresh();
     if (group) return group;
   }
   throw new Error("Your approval is recorded, but not enough members approved yet. Open this payment again later to sign.");
@@ -594,15 +825,15 @@ self.onmessage = async (e) => {
     if (a) e.data.ok ? a.resolve(e.data.value) : a.reject(new Error(e.data.error));
     return;
   }
-  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob } = e.data;
-  // The Signer holds ONE open vault, and these ops each reopen one. A join, payment, restore
-  // or removal holds it, so the quick reads are refused while one runs (the wallet polls
+  const { id, op, method, name, passphrase, prfSecret, join, payment, devicePubHex, vaultHex, words, blob, fingerprint } = e.data;
+  // The Signer holds ONE open vault, and these ops each reopen one. A join, payment or
+  // restore holds it, so the quick reads are refused while one runs (the wallet polls
   // again) and otherwise take turns, so no op swaps the vault under another mid-flight.
-  const holds = op === "join" || op === "payment-approve" || op === "restore" || op === "remove";
+  const holds = op === "join" || op === "payment-approve" || op === "restore";
   const reads = op === "payment-review" || op === "pending" || op === "vaults" || op === "address" || op === "recovery-backup" || op === "chain" || op === "payment-status";
   let release = () => {};
   try {
-    if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore", remove: "removal" }[busy]}; try again when it finishes`);
+    if (reads && busy) throw new Error(`the signer is busy with a ${{ join: "vault setup", "payment-approve": "payment", restore: "restore" }[busy]}; try again when it finishes`);
     if (holds) busy = op;
     if (reads || holds) {
       const prev = turn;
@@ -623,6 +854,16 @@ self.onmessage = async (e) => {
       case "authorize-device":
         result = signer.authorizeDevice(devicePubHex);
         break;
+      case "authorize-device-replacement": {
+        const { origin, challenge, generation } = e.data;
+        result = signer.authorizeDeviceReplacement(origin, devicePubHex, challenge, BigInt(generation));
+        break;
+      }
+      case "relay-registration-proof": {
+        const { origin, challenge, key } = e.data;
+        result = signer.relayRegistrationProof(origin, challenge, key);
+        break;
+      }
       case "join":
         result = await joinCeremony(signer, join);
         break;
@@ -642,12 +883,17 @@ self.onmessage = async (e) => {
       case "payment-status":
         result = await paymentStatus(signer, payment);
         break;
-      case "address":
-        await openVault(signer, payment.vaultHex);
-        result = signer.vaultAddress();
+      case "address": {
+        const vaultHex = await vaultPathId(payment.vaultHex);
+        // A receive-address lookup must not create files for a missing vault.
+        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenRead(path);
+        const vault = JSON.parse(signer.vaultOpen(vaultHex));
+        if (!vault.ready) throw new Error("this vault is not active yet");
+        result = { vault: vault.vault_id, network: vault.network, address: signer.vaultAddress() };
         break;
+      }
       case "payment-approve":
-        result = await drivePayment(signer, payment);
+        result = await drivePayment(signer, payment, P.witnessPins);
         break;
       case "create":
         await preopenCreate(P, method);
@@ -663,13 +909,15 @@ self.onmessage = async (e) => {
         signer.lock();
         result = null;
         break;
-      case "has-recovery":
+      case "recovery-status":
         await opfsPreopenRead(P.recovery);
-        result = signer.hasRecovery();
+        await opfsPreopenRead(P.legacyRecovery);
+        result = { recovery_identity: signer.hasRecovery(), legacy_recovery: signer.needsRecoveryMigration() };
         break;
       case "recovery-begin":
         // The words go only to the signer page, which shows them once.
         await opfsPreopenRead(P.recovery);
+        await opfsPreopenRead(P.legacyRecovery);
         result = signer.recoveryBegin();
         break;
       case "recovery-confirm":
@@ -677,22 +925,34 @@ self.onmessage = async (e) => {
         signer.recoveryConfirm();
         result = null;
         break;
-      case "recovery-backup":
-        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-        result = signer.recoveryBackup(vaultHex);
+      case "recovery-migrate":
+        await opfsPreopenRead(P.legacyRecovery);
+        await opfsPreopenWrite(P.recovery);
+        signer.recoveryMigrate(words);
+        result = null;
         break;
-      case "restore":
+      case "recovery-backup": {
+        const pathId = await vaultPathId(vaultHex);
+        for (const path of JSON.parse(vaultPaths(pathId))) await opfsPreopenRead(path);
+        result = signer.recoveryBackup(pathId);
+        break;
+      }
+      case "restore": {
+        const pathId = await vaultPathId(vaultHex);
         await preopenCreate(P, method);
         await opfsPreopenWrite(P.recovery);
-        for (const path of JSON.parse(vaultPaths(vaultHex))) await opfsPreopenWrite(path);
-        result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, vaultHex, words, blob));
+        for (const path of JSON.parse(vaultPaths(pathId))) await opfsPreopenWrite(path);
+        result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, pathId, words, blob, fingerprint));
         break;
-      case "remove": {
-        // Delete every signer file in this browser: release the sync handles, then the tree.
-        signer.lock();
-        opfsCloseAll();
+      }
+      case "remove-verified": {
+        // The page drains and blocks other ops during removal. Verify against the active
+        // KEK in the same worker that holds this partition's custody and sync handles.
+        signer.reauth(method, passphrase, prfSecret);
         const root = await navigator.storage.getDirectory();
+        opfsCloseAll();
         await root.removeEntry("loki", { recursive: true }).catch((e) => { if (e.name !== "NotFoundError") throw e; });
+        signer.lock();
         result = null;
         break;
       }
@@ -708,4 +968,8 @@ self.onmessage = async (e) => {
   }
 };
 
-self.postMessage({ cmd: "loaded" });
+self.addEventListener("unhandledrejection", () => self.postMessage({ cmd: "failed" }));
+try {
+  await ready;
+  self.postMessage({ cmd: "loaded" });
+} catch { self.postMessage({ cmd: "failed" }); }

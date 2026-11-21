@@ -53,6 +53,12 @@ mod member_schema_tests {
 }
 const STORAGE_BUDGET: u64 = 512 * 1024 * 1024;
 const PENDING_TRANSFERS: u64 = 128;
+const INCOMPLETE_TOTAL: u64 = 32; // Leave at least half of polling intake for complete messages.
+const INCOMPLETE_TTL_MS: u64 = 10 * 60 * 1000;
+
+fn incomplete_per_sender(members: usize) -> u64 {
+    (INCOMPLETE_TOTAL / members as u64).min(4)
+}
 
 fn schema_parts() -> (&'static str, &'static str) {
     let offset = SCHEMA
@@ -117,7 +123,12 @@ fn recovery_parts() -> (&'static str, &'static str) {
     )
 }
 
-const CURRENT_CATALOG: u8 = 6;
+fn inbox_work_parts(count: usize) -> (&'static str, &'static str) {
+    let schema = member_schema(count);
+    schema.split_at(schema.find("CREATE TABLE incomplete_leases").expect("inbox work schema boundary"))
+}
+
+const CURRENT_CATALOG: u8 = 7;
 
 /// Widen CHECK constraints in place by rewriting the schema text: every saved row already
 /// satisfies the wider bound, so the file content does not change (SQLite's documented
@@ -374,9 +385,13 @@ fn validate_metadata(
     if vault != roster.vault || saved_roster != digest || saved_owner != i64::from(owner) {
         return Err(ClientError::Identity);
     }
-    let catalog = if roster.members.len() != 3 {
-        validate_schema(connection, member_schema(roster.members.len()))?;
+    let members = roster.members.len();
+    let catalog = if validate_schema(connection, member_schema(members)).is_ok() {
         CURRENT_CATALOG
+    } else if validate_schema(connection, inbox_work_parts(members).0).is_ok() {
+        6
+    } else if members != 3 {
+        return Err(ClientError::Storage);
     } else if validate_schema(connection, schema_parts().0).is_ok() {
         0
     } else if validate_schema(connection, request_schema_parts().0).is_ok() {
@@ -390,8 +405,7 @@ fn validate_metadata(
     } else if validate_schema(connection, recovery_parts().0).is_ok() {
         5
     } else {
-        validate_schema(connection, SCHEMA)?;
-        CURRENT_CATALOG
+        return Err(ClientError::Storage);
     };
     let integrity: String = connection.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
     if integrity != "ok" {
@@ -477,13 +491,22 @@ impl ClientStore {
                 completion_parts().1
             } else if prior == 4 {
                 incoming_parts().1
-            } else {
+            } else if prior == 5 {
                 recovery_parts().1
+            } else {
+                inbox_work_parts(roster.members.len()).1
             };
             // A raised page ceiling still reuses free pages in an over-budget file.
             admit_storage_growth(&transaction, STORAGE_BUDGET)?;
             transaction.execute_batch(addition)?;
-            seed_diagnostic_ids(&transaction)?;
+            if prior < 6 {
+                seed_diagnostic_ids(&transaction)?;
+            }
+            seed_incomplete_leases(&transaction, roster.members.len())?;
+            transaction.execute_batch(
+                "INSERT INTO received_work(incoming,source) SELECT 1,rowid FROM incoming_originals WHERE kind=2;
+                 INSERT INTO received_work(incoming,source) SELECT 0,rowid FROM ack_links;",
+            )?;
             if validate_metadata(&transaction, roster, digest, owner)? != CURRENT_CATALOG {
                 return Err(ClientError::Storage);
             }
@@ -992,6 +1015,7 @@ fn outgoing_pending_count(connection: &Connection) -> ClientResult<u64> {
 const GROUP_OPEN: &str = "EXISTS (
     SELECT 1 FROM staged_sources s
     WHERE s.group_id=g.group_id
+    AND NOT EXISTS (SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash)
     AND (
         EXISTS (
             SELECT 1 FROM pending_downloads d
@@ -1008,8 +1032,7 @@ const GROUP_OPEN: &str = "EXISTS (
             )
         )
         OR (
-            NOT EXISTS (SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash)
-            AND NOT EXISTS (SELECT 1 FROM incoming_originals i WHERE i.source_root=s.root_hash)
+            NOT EXISTS (SELECT 1 FROM incoming_originals i WHERE i.source_root=s.root_hash)
             AND NOT EXISTS (SELECT 1 FROM incoming_conflicts c WHERE c.source_root=s.root_hash)
             AND NOT EXISTS (SELECT 1 FROM logical_records l WHERE l.source_root=s.root_hash)
             AND NOT EXISTS (SELECT 1 FROM outgoing_recipients o WHERE o.root_hash=s.root_hash)
@@ -2681,16 +2704,7 @@ impl ClientStore {
         let mut statement = self.connection.prepare(
             "SELECT rowid,vault,roster,sender,message_id,digest,ack_author,ack_message,request_id FROM ack_links WHERE rowid>?1 ORDER BY rowid LIMIT ?2",
         )?;
-        let rows = statement.query_map(params![after, limit], |row| {
-            Ok(AckLink {
-                cursor: row.get(0)?,
-                key: row_key(row, 1)?,
-                digest: row_id(row, 5)?,
-                ack_author: row.get(6)?,
-                ack_message: row_id(row, 7)?,
-                request_id: row_id(row, 8)?,
-            })
-        })?;
+        let rows = statement.query_map(params![after, limit], read_ack_link)?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -3072,6 +3086,22 @@ impl ClientStore {
         Ok(found != 0)
     }
 
+    pub(crate) fn retire_incomplete(&mut self) -> ClientResult<()> {
+        let now = crate::retry::now_ms()?.max(1);
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(&format!("DELETE FROM incomplete_leases AS l WHERE NOT EXISTS(
+            SELECT 1 FROM staged_sources s WHERE s.group_id=l.group_id AND {ROOT_MISSING})"), [])?;
+        let expired = transaction.execute(&format!("INSERT INTO source_rejections
+            SELECT s.root_hash,'incomplete_expired',NULL FROM staged_sources s
+            JOIN incomplete_leases l ON l.group_id=s.group_id WHERE l.expires_ms<=?1 AND {ROOT_MISSING}"), [now])?;
+        if expired != 0 {
+            discard_rejected_downloads(&transaction, None)?;
+            transaction.execute("DELETE FROM incomplete_leases WHERE expires_ms<=?1", [now])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Insert one verified source, its group, and its immutable requirements.
     ///
     /// The shared pending total includes outgoing rows. A group that is already open
@@ -3146,35 +3176,66 @@ impl ClientStore {
             )?;
         }
         let planned = plan_wanted(&transaction, &source.root_hash, &requirement_wires(source))?;
+        if planned.incomplete {
+            let admitted = transaction.execute(
+                "INSERT OR IGNORE INTO incomplete_leases SELECT ?1,?2,?3
+                 WHERE (SELECT count(*) FROM incomplete_leases WHERE sender=?2)<?4
+                 AND (SELECT count(*) FROM incomplete_leases)<?5",
+                params![source.group_id, source.key.sender, crate::retry::now_ms()? + INCOMPLETE_TTL_MS, incomplete_per_sender(self.member_count), INCOMPLETE_TOTAL],
+            )?;
+            if admitted == 0 {
+                return Err(ClientError::Capacity);
+            }
+        }
         apply_wanted(&transaction, &source.root_hash, &planned)?;
         transaction.commit()?;
         Ok(StageResult::Staged)
     }
 
-    /// Committed kind-2 originals, including rows with no early-reference index entry.
-    ///
-    /// The derived reference phase is not consulted. A resolved or rejected index row
-    /// does not remove a source from this page.
-    pub(crate) fn page_received_originals(
-        &self,
-        after: u64,
-        limit: u16,
-    ) -> ClientResult<Vec<IncomingOriginal>> {
-        page_bounds(after, limit)?;
+    /// Use the committed prerequisite only to schedule work. The source and its
+    /// target still need authentication, including when the expected digest differs.
+    pub(crate) fn received_original_work(&self, limit: u16) -> ClientResult<Vec<IncomingOriginal>> {
         let mut statement = self.connection.prepare(
-            "SELECT rowid,vault,roster,sender,message_id,digest,kind,session,source_root FROM incoming_originals WHERE kind=2 AND rowid>?1 ORDER BY rowid LIMIT ?2",
+            "SELECT i.rowid,i.vault,i.roster,i.sender,i.message_id,i.digest,i.kind,i.session,i.source_root
+             FROM received_work w JOIN incoming_originals i ON i.rowid=w.source
+             LEFT JOIN incoming_dependencies d ON (d.vault,d.roster,d.sender,d.message_id)=(i.vault,i.roster,i.sender,i.message_id)
+             WHERE w.incoming=1 AND (d.prerequisite IS NULL OR d.prerequisite_sender=i.sender
+                OR EXISTS(SELECT 1 FROM incoming_originals o WHERE (o.vault,o.roster,o.sender,o.message_id)=(d.vault,d.roster,d.prerequisite_sender,d.prerequisite))
+                OR EXISTS(SELECT 1 FROM logical_records o WHERE (o.vault,o.roster,o.sender,o.message_id)=(d.vault,d.roster,d.prerequisite_sender,d.prerequisite)))
+             ORDER BY w.source LIMIT ?1",
         )?;
-        let rows = statement.query_map(params![after, limit], |row| {
-            Ok(IncomingOriginal {
-                cursor: row.get(0)?,
-                key: row_key(row, 1)?,
-                digest: row_id(row, 5)?,
-                kind: row.get(6)?,
-                session: row_optional_id(row, 7)?,
-                source_root: row_id(row, 8)?,
-            })
-        })?;
+        let rows = statement.query_map([limit], read_received_original)?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn received_local_work(&self, limit: u16) -> ClientResult<Vec<AckLink>> {
+        let mut statement = self.connection.prepare(
+            "SELECT a.rowid,a.vault,a.roster,a.sender,a.message_id,a.digest,a.ack_author,a.ack_message,a.request_id
+             FROM received_work w JOIN ack_links a ON a.rowid=w.source WHERE w.incoming=0 ORDER BY w.source LIMIT ?1",
+        )?;
+        let rows = statement.query_map([limit], read_ack_link)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn received_for_target(
+        &self, key: &LogicalKey, digest: &Id32, session: Option<Id32>, signer: MemberId, after: Option<Id32>,
+    ) -> ClientResult<Vec<IncomingOriginal>> {
+        let mut statement = self.connection.prepare(
+            "SELECT i.rowid,i.vault,i.roster,i.sender,i.message_id,i.digest,i.kind,i.session,i.source_root
+             FROM incoming_dependencies d JOIN incoming_originals i ON (i.vault,i.roster,i.sender,i.message_id)=(d.vault,d.roster,d.sender,d.message_id)
+             WHERE (d.vault,d.roster,d.prerequisite_sender,d.prerequisite,d.prerequisite_digest,d.sender)=(?1,?2,?3,?4,?5,?6)
+             AND i.kind=2 AND i.session IS ?7 AND (?8 IS NULL OR d.message_id>?8) ORDER BY d.message_id LIMIT 16",
+        )?;
+        let rows = statement.query_map(params![key.vault, key.roster, key.sender, key.message, digest, signer, session, after], read_received_original)?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    pub(crate) fn local_ack_for_target(&self, key: &LogicalKey, digest: &Id32, signer: MemberId) -> ClientResult<Option<AckLink>> {
+        Ok(self.connection.query_row(
+            "SELECT rowid,vault,roster,sender,message_id,digest,ack_author,ack_message,request_id FROM ack_links
+             WHERE (vault,roster,sender,message_id,digest,ack_author)=(?1,?2,?3,?4,?5,?6)",
+            params![key.vault, key.roster, key.sender, key.message, digest, signer], read_ack_link,
+        ).optional()?)
     }
 
     /// Saved logical or incoming row for this identity. Neither table is signature proof.
@@ -3252,12 +3313,7 @@ impl ClientStore {
             transaction.commit()?;
             return Ok(());
         }
-        if let Err(error) = admit_storage_growth(&transaction, self.storage_budget) {
-            if error == ClientError::Capacity {
-                return Ok(());
-            }
-            return Err(error);
-        }
+        admit_storage_growth(&transaction, self.storage_budget)?;
         transaction.execute(
             "INSERT INTO early_received_refs VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
             params![
@@ -3301,9 +3357,68 @@ impl ClientStore {
             "INSERT INTO source_rejections VALUES(?1,?2,?3)",
             params![root, reason, body_digest],
         )?;
+        discard_rejected_downloads(&transaction, Some(root))?;
+        transaction.execute(&format!("DELETE FROM incomplete_leases AS l
+            WHERE l.group_id=(SELECT group_id FROM staged_sources WHERE root_hash=?1)
+            AND NOT EXISTS(SELECT 1 FROM staged_sources s WHERE s.group_id=l.group_id AND {ROOT_MISSING})"), [root])?;
         transaction.commit()?;
         Ok(())
     }
+}
+
+const ROOT_MISSING: &str = "NOT EXISTS(SELECT 1 FROM source_rejections j WHERE j.root_hash=s.root_hash)
+    AND EXISTS(SELECT 1 FROM staged_requirements r WHERE r.root_hash=s.root_hash
+        AND NOT EXISTS(SELECT 1 FROM ciphertext_objects c WHERE c.hash=r.hash))";
+
+fn discard_rejected_downloads(connection: &Connection, root: Option<&Id32>) -> ClientResult<()> {
+    // Retain advertised missing entries and requirements shared by any non-rejected root.
+    let abandoned = "EXISTS(SELECT 1 FROM staged_requirements r JOIN source_rejections j ON j.root_hash=r.root_hash
+            WHERE r.hash=d.source_hash AND (r.root_hash=?1 OR (?1 IS NULL AND j.reason='incomplete_expired')))
+        AND NOT EXISTS(SELECT 1 FROM staged_requirements r WHERE r.hash=d.source_hash
+            AND NOT EXISTS(SELECT 1 FROM source_rejections j WHERE j.root_hash=r.root_hash))
+        AND NOT EXISTS(SELECT 1 FROM incoming_journal j WHERE j.relay_key=d.relay_key AND j.run=d.run
+            AND j.mailbox=d.mailbox AND j.source_hash=d.source_hash AND j.disposition='missing')";
+    connection.execute(&format!("DELETE FROM download_auth_wait AS d WHERE {abandoned}"), [root])?;
+    connection.execute(&format!("DELETE FROM pending_downloads AS d WHERE {abandoned}"), [root])?;
+    Ok(())
+}
+
+fn read_ack_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<AckLink> {
+    Ok(AckLink {
+        cursor: row.get(0)?,
+        key: row_key(row, 1)?,
+        digest: row_id(row, 5)?,
+        ack_author: row.get(6)?,
+        ack_message: row_id(row, 7)?,
+        request_id: row_id(row, 8)?,
+    })
+}
+
+fn read_received_original(row: &rusqlite::Row<'_>) -> rusqlite::Result<IncomingOriginal> {
+    Ok(IncomingOriginal {
+        cursor: row.get(0)?,
+        key: row_key(row, 1)?,
+        digest: row_id(row, 5)?,
+        kind: row.get(6)?,
+        session: row_optional_id(row, 7)?,
+        source_root: row_id(row, 8)?,
+    })
+}
+
+fn seed_incomplete_leases(connection: &Connection, members: usize) -> ClientResult<()> {
+    let now = crate::retry::now_ms()?.max(1);
+    // Preserve recoverable legacy groups, but retire over-quota work on first intake.
+    connection.execute(&format!("WITH missing AS (
+            SELECT s.group_id,min(s.claimed_sender) AS sender,min(s.rowid) AS first_seen
+            FROM staged_sources s WHERE s.group_id IS NOT NULL AND {ROOT_MISSING} GROUP BY s.group_id
+        ), ranked AS (
+            SELECT *,row_number() OVER (PARTITION BY sender ORDER BY first_seen) AS sender_rank,
+                row_number() OVER (ORDER BY first_seen) AS total_rank FROM missing
+        ) INSERT INTO incomplete_leases
+        SELECT group_id,sender,CASE WHEN sender_rank<=?3 AND total_rank<=?4 THEN ?2 ELSE ?1 END FROM ranked"),
+        params![now, now + INCOMPLETE_TTL_MS, incomplete_per_sender(members), INCOMPLETE_TOTAL],
+    )?;
+    Ok(())
 }
 
 fn framed_wire(wire: u64) -> bool {
@@ -3465,6 +3580,7 @@ struct WantedTask {
 struct WantedPlan {
     coverage: Vec<CoverageLink>,
     tasks: Vec<WantedTask>,
+    incomplete: bool,
 }
 
 fn plan_wanted(connection: &Connection, root: &Id32, requirements: &[(Id32, i64)]) -> ClientResult<WantedPlan> {
@@ -3481,6 +3597,7 @@ fn plan_wanted(connection: &Connection, root: &Id32, requirements: &[(Id32, i64)
     let routes: Vec<_> = routes.collect::<Result<_, _>>()?;
     let mut coverage = Vec::new();
     let mut tasks = Vec::new();
+    let mut incomplete = false;
     for (hash, wire_length) in requirements {
         let mut missing_coverage = connection.prepare(
             "SELECT j.relay_key, j.run, j.mailbox, j.sequence FROM incoming_journal j WHERE j.source_hash=?1 AND NOT EXISTS (SELECT 1 FROM staged_coverage v WHERE v.root_hash=?2 AND v.relay_key=j.relay_key AND v.run=j.run AND v.mailbox=j.mailbox AND v.sequence=j.sequence)",
@@ -3502,6 +3619,7 @@ fn plan_wanted(connection: &Connection, root: &Id32, requirements: &[(Id32, i64)
         if saved != 0 {
             continue;
         }
+        incomplete = true;
         for route in &routes {
             let current: Option<i64> = connection
                 .query_row(
@@ -3523,7 +3641,7 @@ fn plan_wanted(connection: &Connection, root: &Id32, requirements: &[(Id32, i64)
             }
         }
     }
-    Ok(WantedPlan { coverage, tasks })
+    Ok(WantedPlan { coverage, tasks, incomplete })
 }
 
 fn apply_wanted(connection: &Connection, root: &Id32, planned: &WantedPlan) -> ClientResult<()> {

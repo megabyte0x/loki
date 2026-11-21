@@ -61,11 +61,11 @@ export function browserVaultStatus(vaults: { vault: string; active: boolean }[] 
   return { phase: vaults?.some((v) => v.vault === vault && v.active) ? "active" : "creating_keys" };
 }
 
-/** One transaction from the browser signer's own chain scan (loki-signer-core chain_scan.rs). */
+/** One transaction observed in the configured provider's compact blocks. */
 export type ChainTx = { txid: string; height: number; received_zat: number; change_zat: number; spent_zat: number };
 
 /** The History list from the chain scan: what each transaction did to the vault. A spend shows
- *  its net outflow (amount sent plus fee); every entry is mined, by construction. */
+ *  its net outflow (amount sent plus fee); the provider reported every entry as mined. */
 export function chainPayments(history: ChainTx[]): Payment[] {
   return history.map((t) => {
     const sent = t.spent_zat > 0;
@@ -75,23 +75,27 @@ export function chainPayments(history: ChainTx[]): Payment[] {
   });
 }
 
-/** A payment's status on the browser signer. The terms and signing group come from the
- *  proposer's notices; "confirmed" only from the chain: the scan saw its input note spent. */
+/** A spend reported by the configured provider identifies the attempt only if the signer checked the same txid. */
 export function chainPaymentSession(r: {
   terms: { proposer: number; recipient: string; amount_zat: number; fee_zat: number };
   signers: number[];
   ended?: "cancelled" | "failed" | null;
+  closed?: boolean;
   spent: { txid: string; height: number } | null;
+  txid?: string | null;
+  approved?: boolean;
+  slot?: number;
 }): PaymentSession {
+  const confirmed = r.spent !== null && r.spent.txid === r.txid;
   return {
-    phase: r.spent ? "confirmed" : r.ended ?? "signing",
-    signatures_received: !!r.spent,
-    txid: r.spent?.txid ?? null,
-    // The proposer forms the signing group from the first approvals, so its members approved.
-    approvals: r.signers,
-    // Not known on the browser signer before the chain shows the payment (its approval is sent,
-    // not kept); false keeps the Approve button for a request this member has not signed.
-    approval_requested: !!r.spent,
+    phase: confirmed ? "confirmed" : r.spent ? (r.txid ? "replaced" : "spent_unverified") :
+      r.ended ?? (r.closed ? "awaiting_verification" : "signing"),
+    signatures_received: confirmed,
+    txid: confirmed ? r.spent?.txid : null,
+    spent_by: confirmed ? null : r.spent?.txid ?? null,
+    // The proposer supplies the signing list; only our own stored decision proves approval here.
+    approvals: r.approved === true && r.slot !== undefined ? [r.slot] : [],
+    approval_requested: r.approved === true,
     intent: { proposer: r.terms.proposer, signers: r.signers, recipient: r.terms.recipient, amount_zat: r.terms.amount_zat, fee_zat: r.terms.fee_zat, open_approval: true },
   };
 }
@@ -109,10 +113,28 @@ function signerOrigin(): string {
 }
 
 const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this browser (first-paint hint only)
+// Setup and signing can include several minutes of ceremony or user interaction. Chain reads
+// can also take longer on the first scan and resume from their last saved batch.
+const LONG_CALLS = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
+
+let grant: string | undefined;
+export function onboardingGrant(): string | undefined {
+  const { pathname, search, hash } = window.location;
+  const fragment = new URLSearchParams(hash.slice(1));
+  const supplied = fragment.get("onboarding");
+  if (supplied !== null) {
+    grant = /^[0-9a-f]{64}$/.test(supplied) ? supplied : undefined;
+    fragment.delete("onboarding");
+    window.history.replaceState(window.history.state, "", pathname + search + (fragment.size ? `#${fragment}` : ""));
+  }
+  return grant;
+}
 
 async function postJson<T>(url: string, body: unknown): Promise<T> {
-  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const signal = AbortSignal.timeout(30_000);
+  const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
   const data = await res.json().catch(() => ({}));
+  signal.throwIfAborted();
   if (!res.ok) throw new ApiError(data.error ?? "coordinator request failed", res.status);
   return data as T;
 }
@@ -125,33 +147,49 @@ function browserSigner(origin: string): SignerModule {
   frame.title = "Loki signer";
   frame.allow = `publickey-credentials-create ${origin}; publickey-credentials-get ${origin}`;
   Object.assign(frame.style, { position: "fixed", inset: "0", width: "100%", height: "100%", border: "0", zIndex: "1000", display: "none", colorScheme: "normal" });
-  document.body.append(frame);
 
-  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   let seq = 0;
-  let ready: () => void;
-  const loaded = new Promise<void>((resolve, reject) => {
-    ready = resolve;
-    setTimeout(() => reject(new ApiError(`The signer at ${origin} did not load`, 503)), 15000);
-  });
+  let failure: ApiError | undefined;
+  const { promise: loaded, resolve: ready, reject: notReady } = Promise.withResolvers<void>();
+  const startup = setTimeout(() => fail(new ApiError(`The signer at ${origin} did not load. Try again.`, 503)), 15_000);
   loaded.catch(() => {});
-  window.addEventListener("message", (e: MessageEvent) => {
+  function fail(error: ApiError) {
+    if (failure) return;
+    failure = error;
+    clearTimeout(startup);
+    notReady(error);
+    for (const p of pending.values()) { clearTimeout(p.timer); p.reject(error); }
+    pending.clear();
+    window.removeEventListener("message", receive);
+    frame.remove(); // Stop the old worker and hide any prompt before a retry opens a new signer.
+    browser = undefined;
+  }
+  function receive(e: MessageEvent) {
     if (e.origin !== origin || e.source !== frame.contentWindow) return;
     const d = e.data ?? {};
-    if (d.cmd === "ready") { ready(); return; }
+    if (d.cmd === "ready") { clearTimeout(startup); ready(); return; }
+    if (d.cmd === "failed") { fail(new ApiError(d.error ?? "The browser signer stopped. Try again.", 503)); return; }
     if (d.cmd === "show") { frame.style.display = "block"; return; }
     if (d.cmd === "hide") { frame.style.display = "none"; return; }
     const p = pending.get(d.id);
     if (!p) return;
     pending.delete(d.id);
+    clearTimeout(p.timer);
     d.ok ? p.resolve(d.result) : p.reject(new ApiError(d.error ?? "signer error", d.status ?? 500));
-  });
+  }
+  window.addEventListener("message", receive);
+  document.body.append(frame);
   async function call<T>(op: string, params?: unknown): Promise<T> {
     await loaded;
+    if (failure) throw failure;
     const id = ++seq;
     return new Promise<T>((resolve, reject) => {
-      pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
-      frame.contentWindow!.postMessage({ id, op, params }, origin);
+      const timer = setTimeout(() => fail(new ApiError(`The browser signer did not finish ${op}. Unlock it and try again.`, 504)),
+        LONG_CALLS.has(op) ? 15 * 60_000 : 60_000);
+      pending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      try { frame.contentWindow!.postMessage({ id, op, params }, origin); }
+      catch { fail(new ApiError("Could not reach the browser signer. Try again.", 503)); }
     });
   }
   const opened = (s: SignerSession) => { try { localStorage.setItem(SEALED, "1"); } catch {} return s; };
@@ -169,21 +207,23 @@ function browserSigner(origin: string): SignerModule {
       const origin = window.location.origin;
       const enrollment = await call<Record<string, string>>("enroll-begin");
       // No advertise_url (frostd-only) and no slot (coordinator allocates).
-      const { challenge } = await postJson<{ challenge: string }>(`${origin}/api/members/challenge`, enrollment);
-      const { signature } = await call<{ signature: string }>("enroll-sign", { challenge });
-      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge, signature });
+      const reply = await postJson<{ challenge: string; replacement_generation?: number; relay_challenge_pubkey: string }>(`${origin}/api/members/challenge`, { ...enrollment, onboarding_grant: onboardingGrant() });
+      const proof = await call<{ signature: string; replacement_authorization?: string; relay_proof: string }>("enroll-sign", reply);
+      const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge: reply.challenge, ...proof });
+      grant = undefined;
       return member;
     },
     async request<T>(pathAndQuery: string, body?: unknown): Promise<T> {
       const [path, query] = pathAndQuery.split("?");
       const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string };
       if (path === "status") {
-        const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string }>("status");
+        const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string; network: "testnet" | "regtest" }>("status");
         // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
         // next status poll fills them in.
         const vaults = await call<{ vault: string; active: boolean }[]>("vaults").catch(() => undefined);
+        if (failure) throw failure;
         if (args.vault) return browserVaultStatus(vaults, args.vault) as T;
-        return { phase: "home", network: "testnet", secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
+        return { phase: "home", network: s.network, secure_element: s.se, profile: s.profile, persisted: s.persisted, relay: s.relay, vaults } as T;
       }
       if (path === "lock") { await this.lock(); return {} as T; }
       // Join a vault (enroll → roster → agree → session → DKG). The member confirms every member
@@ -196,15 +236,26 @@ function browserSigner(origin: string): SignerModule {
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
-      // Balance, History and a payment's status from the signer's own scan of the chain.
-      if (path === "balance") return { balance_zat: Number((await call<{ balance_zat: string }>("chain", payment)).balance_zat) } as T;
-      if (path === "payments") return { payments: chainPayments((await call<{ history: ChainTx[] }>("chain", payment)).history) } as T;
-      if (path === "payment-status") return chainPaymentSession(await call("payment-status", payment)) as T;
+      if (path === "verify-address") return call<T>(path, payment);
+      if (path === "balance" || path === "payments") {
+        const scan = await call<{ balance_zat: string; history: ChainTx[]; chain_trust: "provider_reported" }>("chain", payment);
+        return (path === "balance"
+          ? { balance_zat: Number(scan.balance_zat), chain_trust: scan.chain_trust }
+          : { payments: chainPayments(scan.history), chain_trust: scan.chain_trust }) as T;
+      }
+      if (path === "payment-status") {
+        const status = await call<Parameters<typeof chainPaymentSession>[0] & { chain_trust: "provider_reported" }>("payment-status", payment);
+        return { ...chainPaymentSession(status), chain_trust: status.chain_trust } as T;
+      }
       // Recovery words are shown, typed and checked on the signer page; only the opaque
       // backup ciphertext ({backup} from recovery-export) and public results come back.
       if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);
       if (path === "restore") { const r = await call<T>(path, body); try { localStorage.setItem(SEALED, "1"); } catch {} return r; }
-      if (path === "remove") { const r = await call<T>(path, body); try { localStorage.removeItem(SEALED); } catch {} return r; }
+      if (path === "manage-custody") {
+        const removed = await call<boolean>(path);
+        if (removed) { try { localStorage.removeItem(SEALED); } catch {} }
+        return removed as T;
+      }
       throw new SignerPending(path);
     },
   };
@@ -275,18 +326,16 @@ const mockSigner: SignerModule = {
 // DOM and no browser storage, get the mock. No probe, no silent fallback: if the signer origin
 // is missing or unreachable, signer calls fail.
 
-let implPromise: Promise<SignerModule> | null = null;
-function impl(): Promise<SignerModule> {
-  implPromise ??= (async () => (typeof document === "undefined" ? mockSigner : browserSigner(signerOrigin())))();
-  return implPromise;
+let browser: SignerModule | undefined;
+function impl(): SignerModule {
+  return typeof document === "undefined" ? mockSigner : (browser ??= browserSigner(signerOrigin()));
 }
 
 export const signer: SignerModule = {
-  hasSigner: async () => (await impl()).hasSigner(),
-  createSigner: async (opts) => (await impl()).createSigner(opts),
-  unlock: async (opts) => (await impl()).unlock(opts),
-  lock: async () => (await impl()).lock(),
-  enroll: async (coordinatorOrigin) => (await impl()).enroll(coordinatorOrigin),
-  async request<T = unknown>(path: string, body?: unknown): Promise<T> { return (await impl()).request<T>(path, body); },
+  hasSigner: async () => impl().hasSigner(),
+  createSigner: async (opts) => impl().createSigner(opts),
+  unlock: async (opts) => impl().unlock(opts),
+  lock: async () => impl().lock(),
+  enroll: async (coordinatorOrigin) => impl().enroll(coordinatorOrigin),
+  async request<T = unknown>(path: string, body?: unknown): Promise<T> { return impl().request<T>(path, body); },
 };
-

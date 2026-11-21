@@ -19,7 +19,7 @@ class FixtureWallet implements WalletApi {
       failed = false;
   final bool fresh;
   String coordinator = 'https://coordinator.example';
-  String? openedTx, pairOrigin;
+  String? openedTx, pairLink;
   final writes = <(String, Json)>[];
 
   Json get pending => {
@@ -156,8 +156,8 @@ class FixtureWallet implements WalletApi {
   @override
   Future<void> unlock() async => running = true;
   @override
-  Future<void> pair(String origin) async {
-    pairOrigin = origin;
+  Future<void> pair(String link) async {
+    pairLink = link;
     running = true;
   }
 

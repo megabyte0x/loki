@@ -32,6 +32,9 @@ const FINAL_STATUS_MAGIC: &[u8; 8] = b"LOKIFSV1";
 const HEADER: usize = 8 + 32 + 2 + 2 + 24 + 4;
 const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
+const COURIER_PAYLOAD_LIMIT: usize = 64 * 1024;
+/// Largest local courier envelope (encrypted round two, including its AEAD tag).
+pub const MAX_COURIER_ENVELOPE: usize = HEADER + COURIER_PAYLOAD_LIMIT + 16 + SIGNATURE;
 const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
 const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
 const SESSION_HEADER: usize = 8 + 1 + 24 + 4;
@@ -222,6 +225,59 @@ impl Identity {
         self.signing.sign(device_pub).to_bytes()
     }
 
+    /// Authorize replacing the coordinator's current device, for one challenge and generation.
+    pub fn authorize_device_replacement(&self, origin: &str, device_pub: &[u8], challenge: &[u8; 32], generation: u64) -> [u8; 64] {
+        let identity = hex::encode(self.public().signing);
+        let device = hex::encode(device_pub);
+        let nonce = hex::encode(challenge);
+        let message = format!("loki-member-device-replacement-v1\n{origin}\n{identity}\n{device}\n{generation}\n{nonce}");
+        self.signing.sign(message.as_bytes()).to_bytes()
+    }
+
+    pub fn nonce_claim_proof(
+        &self,
+        vault: [u8; 32],
+        pin: &loki_relay_protocol::types::RelayPin,
+        mailbox: [u8; 32],
+        cid: [u8; 32],
+        challenge: [u8; 32],
+        record: &[u8],
+    ) -> loki_relay_protocol::nonce::ClaimProof {
+        use loki_relay_protocol::nonce::{self, Claimant, ClaimProof};
+        let claimant = Claimant { vault, slot: self.id, key: self.signing.verifying_key().to_bytes() };
+        let signature = self.signing.sign(&nonce::claim_input(claimant, pin, mailbox, cid, challenge, record)).to_bytes();
+        ClaimProof { claimant, signature }
+    }
+
+    /// Prove control of the roster relay key without signing a frostd login challenge.
+    pub fn relay_registration_proof(
+        &self,
+        origin: &str,
+        challenge: &[u8; 32],
+        coordinator_key: &[u8; 32],
+    ) -> Result<[u8; 32], String> {
+        let shared = self.encryption.diffie_hellman(&PublicKey::from(*coordinator_key));
+        if !shared.was_contributory() {
+            return Err("invalid coordinator relay challenge key".into());
+        }
+        let public = self.public();
+        let context = format!(
+            "loki-relay-registration-v1\n{origin}\n{}\n{}\n{}",
+            hex::encode(public.signing),
+            hex::encode(public.encryption),
+            hex::encode(challenge),
+        );
+        let mut proof = [0; 32];
+        hkdf::Hkdf::<sha2::Sha256>::new(None, shared.as_bytes())
+            .expand(context.as_bytes(), &mut proof)
+            .map_err(|_| "invalid relay proof length")?;
+        Ok(proof)
+    }
+
+    pub(crate) fn sign_recovery_backup(&self, domain_separated_payload: &[u8]) -> [u8; 64] {
+        self.signing.sign(domain_separated_payload).to_bytes()
+    }
+
     pub fn sign_setup_agreement(
         &self,
         vault: &[u8; 32],
@@ -331,7 +387,7 @@ impl Identity {
             return Err("wrong DKG round-one envelope".into());
         }
         let size = u32::from_be_bytes(wire[42..46].try_into().unwrap()) as usize;
-        if size > 64 * 1024 || wire.len() != PUBLIC_HEADER + size + SIGNATURE {
+        if size > COURIER_PAYLOAD_LIMIT || wire.len() != PUBLIC_HEADER + size + SIGNATURE {
             return Err("invalid DKG round-one length".into());
         }
         let verify = VerifyingKey::from_bytes(&sender.signing).map_err(|_| "invalid sender key")?;
@@ -398,7 +454,7 @@ impl Identity {
             return Err("DKG envelope belongs to another vault or member".into());
         }
         let size = u32::from_be_bytes(wire[68..72].try_into().unwrap()) as usize;
-        if size > 64 * 1024 + 16 || wire.len() != HEADER + size + SIGNATURE {
+        if size > COURIER_PAYLOAD_LIMIT + 16 || wire.len() != HEADER + size + SIGNATURE {
             return Err("invalid DKG envelope length".into());
         }
         let verify = VerifyingKey::from_bytes(&sender.signing).map_err(|_| "invalid sender key")?;
@@ -566,13 +622,7 @@ impl Identity {
         body: &[u8],
     ) -> Result<Vec<u8>, String> {
         context.validate()?;
-        if self.id == recipient.id
-            || !context.signers.contains(&self.id)
-            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient.id)
-            || (!context.signers.contains(&recipient.id)
-                && !matches!(kind, MessageKind::Package | MessageKind::Share))
-            || body.len() > kind.max_body()
-        {
+        if !kind.permits(context, self.id, recipient.id) || body.len() > kind.max_body() {
             return Err("invalid signing sender, recipient, or body size".into());
         }
         let version = if context.signers.len() == 2 { 1 } else { 2 };
@@ -656,12 +706,6 @@ impl Identity {
         let signers_end = 105 + context.signers.len() * 2;
         let meta_end = signers_end + 9;
         let inner_header = meta_end + 32;
-        if sender.id == recipient
-            || !context.signers.contains(&sender.id)
-            || !(1..=crate::member_state::MAX_MEMBERS).contains(&recipient)
-        {
-            return Err("sender or recipient outside signing attempt".into());
-        }
         let key = self.session_key(box_peer, context)?;
         let inner = XChaCha20Poly1305::new(&key.into())
             .decrypt(
@@ -686,10 +730,8 @@ impl Identity {
             return Err("signing inner context mismatch".into());
         }
         let kind = MessageKind::try_from(inner[signers_end + 4])?;
-        if !context.signers.contains(&recipient)
-            && !matches!(kind, MessageKind::Package | MessageKind::Share)
-        {
-            return Err("non-signer may receive only package or share copies".into());
+        if !kind.permits(context, sender.id, recipient) {
+            return Err("sender or recipient not allowed for signing message kind".into());
         }
         let size = u32::from_be_bytes(inner[signers_end + 5..meta_end].try_into().unwrap()) as usize;
         if size > kind.max_body() || inner_header + size + SIGNATURE > inner.len() {

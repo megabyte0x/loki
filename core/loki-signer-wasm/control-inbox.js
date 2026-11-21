@@ -1,20 +1,28 @@
-// Control-session reads for the browser signer. frostd hands each message to its recipient
-// once: a receive drains the inbox. A native member saves what it reads (payment.rs
-// `sync_control`); the browser signer must keep what it drained too, or a proposer's notice,
-// sent once at publish, is gone after the first approval-inbox poll and after a page reload.
-// This keeps every relay message of a session in `store` and returns the whole history on
-// each read. The messages are kept as the relay delivered them, still sealed to this member
-// (the caller opens them), so the store holds nothing the relay operator could not see.
+// Frostd's receive is destructive and offers no cursor. The worker serializes reads and
+// reduces each drain before saving. Retry a failed write before the next receive, even if
+// that receive would be empty. A worker crash before commit can still lose the drain.
 export function controlInbox(store = memoryStore()) {
-  const seen = new Map();
-  return async (sessionId, drain) => {
-    const all = seen.get(sessionId) ?? [...await store.get(sessionId)];
-    const fresh = await drain();
-    all.push(...fresh);
-    seen.set(sessionId, all);
-    if (fresh.length) await store.put(sessionId, all);
-    return [...all];
+  let dirty;
+  async function flush() {
+    if (!dirty) return;
+    await store.put(...dirty);
+    dirty = undefined;
+  }
+  async function read(key, drain, reduce = (old, fresh) => fresh.length ? [...old, ...fresh] : old) {
+    await flush();
+    const old = await store.get(key);
+    const next = await reduce(old, await drain(old));
+    if (next !== old) {
+      dirty = [key, next];
+      await flush();
+    }
+    return next;
+  }
+  read.prune = async (scope, live) => {
+    await store.prune(scope, live);
+    await flush();
   };
+  return read;
 }
 
 function memoryStore() {
@@ -22,22 +30,66 @@ function memoryStore() {
   return { get: async (k) => m.get(k) ?? [], put: async (k, v) => { m.set(k, v); } };
 }
 
-// The browser store: IndexedDB on the signer origin, one record per control session.
-// ponytail: never pruned; drop sessions of settled payments if it grows.
+export const MAX_CONTROL_SESSIONS = 256;
+
+// Keep legacy ciphertext readable until it can be authenticated and compacted. New records
+// are scoped to the relay and device, and still contain only sealed payment terms.
 export function idbStore(name = "loki_control") {
   const db = new Promise((resolve, reject) => {
-    const req = indexedDB.open(name, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore("sessions");
+    const req = indexedDB.open(name, 2);
+    req.onupgradeneeded = (e) => {
+      if (e.oldVersion === 0) req.result.createObjectStore("sessions");
+      req.result.createObjectStore("notices");
+    };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
   const run = async (mode, fn) => {
-    const r = fn((await db).transaction("sessions", mode).objectStore("sessions"));
-    return new Promise((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
+    const tx = (await db).transaction(["notices", "sessions"], mode, { durability: "strict" });
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error ?? new Error("could not save the payment inbox"));
+      fn(tx.objectStore("notices"), tx.objectStore("sessions"), tx);
+    });
   };
   return {
-    get: async (k) => (await run("readonly", (s) => s.get(k))) ?? [],
-    put: (k, v) => run("readwrite", (s) => s.put(v, k)),
+    async get(key) {
+      let result;
+      await run("readonly", (notices, legacy) => {
+        const req = notices.get(key);
+        req.onsuccess = () => {
+          if (req.result) { result = req.result; return; }
+          const count = notices.count();
+          count.onsuccess = () => {
+            if (count.result >= MAX_CONTROL_SESSIONS) return;
+            const prior = legacy.get(key[1]);
+            prior.onsuccess = () => { result = { wires: prior.result ?? [] }; };
+          };
+        };
+      });
+      if (!result) throw new Error("the payment inbox is full; close old relay sessions first");
+      return result;
+    },
+    put: (key, { migrated, ...value }) => run("readwrite", (notices, legacy, tx) => {
+      const count = notices.count();
+      count.onsuccess = () => {
+        const update = () => {
+          notices.put(value, key);
+          if (migrated) legacy.delete(key[1]);
+        };
+        if (count.result < MAX_CONTROL_SESSIONS) { update(); return; }
+        const existing = notices.getKey(key);
+        existing.onsuccess = () => existing.result ? update() : tx.abort();
+      };
+    }),
+    prune: (scope, live) => run("readwrite", (notices) => {
+      const keys = notices.getAllKeys();
+      keys.onsuccess = () => {
+        for (const key of keys.result) {
+          if (key[0] === scope && !live.has(key[1])) notices.delete(key);
+        }
+      };
+    }),
   };
 }
 

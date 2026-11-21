@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+loki-http-ingress = { path = "../ingress" }
 loki-relay-protocol = { path = "../protocol" }
 loki-relay-client = { path = "../client" }
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }

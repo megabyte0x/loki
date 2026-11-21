@@ -37,6 +37,25 @@ pub fn finalized_sighash(tx: &Transaction) -> Result<[u8; 32], String> {
     Ok(*digest.as_ref())
 }
 
+fn ironwood_verifying_key() -> &'static orchard::circuit::VerifyingKey {
+    static KEY: std::sync::OnceLock<orchard::circuit::VerifyingKey> = std::sync::OnceLock::new();
+    KEY.get_or_init(|| {
+        orchard::circuit::VerifyingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3)
+    })
+}
+
+/// Check the authorizing data, which is not committed to by the transaction ID.
+pub fn verify_ironwood_authorization(tx: &Transaction, sighash: [u8; 32]) -> Result<(), String> {
+    use rand_zp::{rand_core::UnwrapErr, rngs::SysRng};
+    let bundle = tx.ironwood_bundle().ok_or("missing Ironwood bundle")?;
+    let mut validator = orchard::bundle::BatchValidator::new(ironwood_verifying_key());
+    validator.add_bundle(bundle, sighash).map_err(|e| format!("Ironwood proof: {e:?}"))?;
+    if !validator.validate(UnwrapErr(SysRng)) {
+        return Err("invalid Ironwood proof or signatures".into());
+    }
+    Ok(())
+}
+
 /// Finalize an approved, signed PCZT into a broadcastable transaction.
 ///
 /// `sighash` is the sighash the members approved; proving refuses if applying the anchor
@@ -77,10 +96,8 @@ pub fn prove(
     let finalized = SpendFinalizer::new(proved)
         .finalize_spends()
         .map_err(|e| format!("spend finalizer: {e:?}"))?;
-    let vk =
-        orchard::circuit::VerifyingKey::build(orchard::circuit::OrchardCircuitVersion::PostNu6_3);
     let tx = TransactionExtractor::new(finalized)
-        .with_orchard(&vk)
+        .with_orchard(ironwood_verifying_key())
         .extract()
         .map_err(|e| format!("extract transaction: {e:?}"))?;
     let mut raw = Vec::new();

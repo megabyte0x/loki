@@ -262,7 +262,7 @@ async fn real_relays_partial_provision_lost_response_and_restart_backfill_exact_
                 remote
                     .query_row("SELECT count(*) FROM mailboxes", [], |r| r.get::<_, u64>(0))
                     .unwrap(),
-                u64::from(n)
+                0
             );
             assert_eq!(
                 remote
@@ -291,7 +291,7 @@ async fn lose_created_response(
     next: axum::middleware::Next,
 ) -> axum::response::Response {
     let creation =
-        request.method() == axum::http::Method::PUT && request.uri().path().split('/').count() == 4;
+        request.method() == axum::http::Method::PUT && request.uri().path().ends_with("/setup");
     let reply = next.run(request).await;
     if creation
         && reply.status() == axum::http::StatusCode::CREATED

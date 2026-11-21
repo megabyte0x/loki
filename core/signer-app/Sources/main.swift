@@ -10,16 +10,22 @@ import Security
 //   LokiSigner approve     -> real DKG + payment gated by the native approval dialog
 
 let mode = CommandLine.arguments.dropFirst().first ?? "native"
-if mode == "native" || mode == "pair" || mode.hasPrefix("loki://") {
-    let link = mode == "pair" ? CommandLine.arguments.dropFirst(2).first : mode.hasPrefix("loki://") ? mode : nil
-    let offset = mode == "pair" ? 3 : 2
-    runNativeSigner(arguments: Array(CommandLine.arguments.dropFirst(offset)), link: link)
+if mode == "native" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    guard !args.contains(where: { $0.hasPrefix("loki://") || $0 == "--pairing-url" }) else {
+        FileHandle.standardError.write(Data("Open pairing links in the wallet, not in command arguments.\n".utf8))
+        exit(2)
+    }
+    // Apple events are the normal handoff; automation may pipe one line on private stdin.
+    let link = args.contains("--pairing-stdin") ? readLine() : nil
+    SignerLog.start()
+    runNativeSigner(arguments: args.filter { $0 != "--pairing-stdin" }, link: link)
 }
 if mode == "approve" {
     runApprovalSelftest()
 }
 if !["persist", "biometric", "rust", "member", "serve"].contains(mode) {
-    FileHandle.standardError.write("Unknown mode; use native, pair <link>, serve, approve, rust, member, persist or biometric\n".data(using: .utf8)!)
+    FileHandle.standardError.write(Data("Unknown mode; use native, serve, approve, rust, member, persist or biometric. Open pairing links in the wallet.\n".utf8))
     exit(2)
 }
 let biometric = (mode == "biometric")

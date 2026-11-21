@@ -18,15 +18,27 @@
 
 use crate::signer::recovery::verify_device_authorization;
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+const LOGIN_TTL: Duration = Duration::from_secs(120);
+const MAX_LOGIN_CHALLENGES: usize = 256;
+const LOGIN_CHALLENGES_PER_GRANT: usize = 16;
+
+pub fn device_id(device_pub: &[u8]) -> Result<Vec<u8>, String> {
+    VerifyingKey::from_sec1_bytes(device_pub)
+        .map(|key| key.to_encoded_point(true).as_bytes().to_vec())
+        .map_err(|e| format!("bad device key: {e}"))
+}
 
 /// The service-side record of the devices allowed to act for one recovery identity.
+#[derive(Clone)]
 pub struct DeviceRegistry {
     recovery_signing_pub: [u8; 32],
     /// SEC1-encoded device public key -> still active (set to `false` on revoke).
     devices: BTreeMap<Vec<u8>, bool>,
-    /// Login challenges issued but not yet consumed. A response is accepted at most once.
-    outstanding: BTreeSet<[u8; 32]>,
+    /// Nonce -> issuance time, grant digest, used (retained until expiry for rate accounting).
+    challenges: BTreeMap<[u8; 32], (Instant, [u8; 32], bool)>,
 }
 
 impl DeviceRegistry {
@@ -36,7 +48,7 @@ impl DeviceRegistry {
         Self {
             recovery_signing_pub,
             devices: BTreeMap::new(),
-            outstanding: BTreeSet::new(),
+            challenges: BTreeMap::new(),
         }
     }
 
@@ -44,18 +56,48 @@ impl DeviceRegistry {
     /// point; `authorization` is `RecoveryKey::authorize_device(device_pub)`. Rejects a bad
     /// authorization (wrong recovery key) or an unparseable device key.
     pub fn enroll(&mut self, device_pub: &[u8], authorization: &[u8; 64]) -> Result<(), String> {
+        let id = device_id(device_pub)?;
+        if self.devices.get(&id) == Some(&false) {
+            return Err("revoked device requires a recovery renewal authorization".into());
+        }
         verify_device_authorization(&self.recovery_signing_pub, device_pub, authorization)?;
-        VerifyingKey::from_sec1_bytes(device_pub).map_err(|e| format!("bad device key: {e}"))?;
-        self.devices.insert(device_pub.to_vec(), true);
+        self.devices.insert(id, true);
         Ok(())
     }
 
-    /// Issue a fresh random login challenge and remember it until it is answered.
-    pub fn issue_challenge(&mut self) -> [u8; 32] {
+    /// The store supplies the current profile/device generation, never the requester.
+    pub fn enroll_renewal(
+        &mut self,
+        device_pub: &[u8],
+        generation: &[u8; 32],
+        authorization: &[u8; 64],
+    ) -> Result<(), String> {
+        let message = crate::signer::recovery::device_renewal_message(device_pub, generation);
+        verify_device_authorization(&self.recovery_signing_pub, &message, authorization)?;
+        self.devices.insert(device_id(device_pub)?, true);
+        self.invalidate_challenges();
+        Ok(())
+    }
+
+    /// Expire login challenges, and limit issuance even when a caller immediately uses them.
+    pub fn issue_challenge(&mut self, grant: [u8; 32]) -> Option<[u8; 32]> {
+        let now = Instant::now();
+        self.challenges
+            .retain(|_, (issued, _, _)| now.duration_since(*issued) < LOGIN_TTL);
+        if self.challenges.len() >= MAX_LOGIN_CHALLENGES
+            || self
+                .challenges
+                .values()
+                .filter(|(_, owner, _)| grant == *owner)
+                .count()
+                >= LOGIN_CHALLENGES_PER_GRANT
+        {
+            return None;
+        }
         let mut challenge = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut challenge);
-        self.outstanding.insert(challenge);
-        challenge
+        self.challenges.insert(challenge, (now, grant, false));
+        Some(challenge)
     }
 
     /// Verify a device's response to a challenge this registry issued. The challenge is
@@ -67,32 +109,50 @@ impl DeviceRegistry {
         challenge: &[u8; 32],
         signature: &[u8],
     ) -> Result<(), String> {
-        if self.devices.get(device_pub) != Some(&true) {
+        if self.devices.get(&device_id(device_pub)?) != Some(&true) {
             return Err("device is not enrolled or has been revoked".into());
         }
-        if !self.outstanding.remove(challenge) {
-            return Err("unknown or already-used login challenge".into());
+        if let Some((issued, _, used)) = self.challenges.get_mut(challenge) {
+            if !*used && issued.elapsed() < LOGIN_TTL {
+                *used = true;
+                return verify_device_signature(device_pub, challenge, signature);
+            }
         }
-        verify_device_signature(device_pub, challenge, signature)
+        Err("unknown, expired or already-used login challenge".into())
+    }
+
+    fn invalidate_challenges(&mut self) {
+        for (_, _, used) in self.challenges.values_mut() {
+            *used = true;
+        }
     }
 
     /// Revoke a compromised device. Its future logins fail; re-keying the vault to retire its
     /// share is a separate group action.
     pub fn revoke(&mut self, device_pub: &[u8]) {
-        if let Some(active) = self.devices.get_mut(device_pub) {
-            *active = false;
+        if let Ok(id) = device_id(device_pub) {
+            if let Some(active) = self.devices.get_mut(&id) {
+                *active = false;
+                self.invalidate_challenges();
+            }
         }
     }
 }
 
 /// Shared P-256 verifier for login nonces and domain-separated registration transcripts.
 /// Apple signs messages with ECDSA/SHA-256; accept its DER and the fixed-width encoding.
-pub fn verify_device_signature(device_pub: &[u8], message: &[u8], signature: &[u8]) -> Result<(), String> {
-    let vk = VerifyingKey::from_sec1_bytes(device_pub).map_err(|e| format!("bad device key: {e}"))?;
+pub fn verify_device_signature(
+    device_pub: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<(), String> {
+    let vk =
+        VerifyingKey::from_sec1_bytes(device_pub).map_err(|e| format!("bad device key: {e}"))?;
     let sig = Signature::from_der(signature)
         .or_else(|_| Signature::from_slice(signature))
         .map_err(|e| format!("bad signature encoding: {e}"))?;
-    vk.verify(message, &sig).map_err(|_| "device signature does not verify".to_string())
+    vk.verify(message, &sig)
+        .map_err(|_| "device signature does not verify".to_string())
 }
 
 #[cfg(test)]
@@ -124,7 +184,9 @@ mod tests {
         let message = b"loki-member-registration-v1\ncoordinator\n1\nidentity\nrelay\nendpoint";
         let sig: Signature = sk.sign(message);
         assert!(verify_device_signature(&public, message, sig.to_der().as_bytes()).is_ok());
-        assert!(verify_device_signature(&public, b"changed endpoint", sig.to_der().as_bytes()).is_err());
+        assert!(
+            verify_device_signature(&public, b"changed endpoint", sig.to_der().as_bytes()).is_err()
+        );
         assert!(verify_device_signature(&device().1, message, sig.to_der().as_bytes()).is_err());
     }
 
@@ -139,12 +201,16 @@ mod tests {
         registry.enroll(&device_pub, &authz).unwrap();
 
         // Daily login: challenge -> device signs -> verified.
-        let challenge = registry.issue_challenge();
+        let challenge = registry.issue_challenge([0; 32]).unwrap();
         let sig = sign(&sk, &challenge);
-        registry.verify_login(&device_pub, &challenge, &sig).unwrap();
+        registry
+            .verify_login(&device_pub, &challenge, &sig)
+            .unwrap();
 
         // The same (challenge, signature) cannot be replayed — the challenge was consumed.
-        assert!(registry.verify_login(&device_pub, &challenge, &sig).is_err());
+        assert!(registry
+            .verify_login(&device_pub, &challenge, &sig)
+            .is_err());
     }
 
     #[test]
@@ -169,9 +235,11 @@ mod tests {
             .unwrap();
 
         registry.revoke(&device_pub);
-        let challenge = registry.issue_challenge();
+        let challenge = registry.issue_challenge([0; 32]).unwrap();
         let sig = sign(&sk, &challenge);
-        assert!(registry.verify_login(&device_pub, &challenge, &sig).is_err());
+        assert!(registry
+            .verify_login(&device_pub, &challenge, &sig)
+            .is_err());
     }
 
     #[test]
@@ -185,7 +253,7 @@ mod tests {
 
         // Unknown device (never enrolled).
         let (sk2, other_pub) = device();
-        let challenge = registry.issue_challenge();
+        let challenge = registry.issue_challenge([0; 32]).unwrap();
         assert!(registry
             .verify_login(&other_pub, &challenge, &sign(&sk2, &challenge))
             .is_err());
@@ -206,7 +274,7 @@ mod tests {
             .enroll(&device_pub, &recovery.authorize_device(&device_pub))
             .unwrap();
 
-        let issued = registry.issue_challenge();
+        let issued = registry.issue_challenge([0; 32]).unwrap();
         // Device signs a different nonce than the one issued.
         let sig = sign(&sk, &[1u8; 32]);
         assert!(registry.verify_login(&device_pub, &issued, &sig).is_err());
@@ -230,8 +298,10 @@ mod tests {
             .enroll(&device_pub, &recovery.authorize_device(&device_pub))
             .expect("recovery authorizes the Enclave device key");
 
-        let challenge = registry.issue_challenge();
-        let sig = device.sign(&challenge).expect("Enclave signs the challenge");
+        let challenge = registry.issue_challenge([0; 32]).unwrap();
+        let sig = device
+            .sign(&challenge)
+            .expect("Enclave signs the challenge");
         registry
             .verify_login(&device_pub, &challenge, &sig)
             .expect("the Secure Enclave's signature logs the device in");

@@ -1,5 +1,5 @@
 mod operator_config;
-pub use operator_config::{validate_endpoint, OperatorSet, ServiceLimits};
+pub use operator_config::{validate_endpoint, validate_peer_destination, OperatorSet, ServiceLimits};
 mod crypto;
 pub use crypto::{open_record, seal_record, SealContext, SealDomain};
 mod descriptor;

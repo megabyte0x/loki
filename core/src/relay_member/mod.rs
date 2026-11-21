@@ -261,6 +261,14 @@ fn roster(value: &Value) -> MemberResult<Roster> {
     Ok(Roster { vault, members })
 }
 pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<LoadedMember> {
+    load_with_signing_identity(root, pass_file, roster_path).map(|(member, _)| member)
+}
+
+pub fn load_with_signing_identity(
+    root: &Path,
+    pass_file: &Path,
+    roster_path: &Path,
+) -> MemberResult<(LoadedMember, Identity)> {
     member_root(root)?;
     private_directory(&root.join("secrets"))?;
     let pass_bytes = bounded_read(pass_file, MAX_PASS, true)?;
@@ -334,9 +342,9 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
     }
     let identity =
         CommIdentity::from_serialized(&identity_raw).map_err(|_| MemberError::Identity)?;
-    let legacy = Identity::from_secret_bytes(identity_raw.as_ref())
-        .map_err(|_| MemberError::Identity)?
-        .public();
+    let signing_identity = Identity::from_secret_bytes(identity_raw.as_ref())
+        .map_err(|_| MemberError::Identity)?;
+    let legacy = signing_identity.public();
     let own = identity.public();
     if own.id != legacy.id
         || own.signing != legacy.signing
@@ -346,7 +354,7 @@ pub fn load(root: &Path, pass_file: &Path, roster_path: &Path) -> MemberResult<L
         return Err(MemberError::Identity);
     }
     roster_digest(&roster).map_err(|_| MemberError::Roster)?;
-    Ok(LoadedMember { identity, roster, threshold: certified.threshold, network: certified.network })
+    Ok((LoadedMember { identity, roster, threshold: certified.threshold, network: certified.network }, signing_identity))
 }
 
 pub mod config;

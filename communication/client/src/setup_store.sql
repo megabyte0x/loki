@@ -15,3 +15,4 @@ CREATE TABLE received (key BLOB PRIMARY KEY REFERENCES outgoing(key), digest BLO
 CREATE TABLE rejected (hash BLOB PRIMARY KEY REFERENCES objects(hash)) STRICT;
 CREATE TABLE retries (pin BLOB PRIMARY KEY CHECK(length(pin)=32), attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 1000000), next_ms INTEGER NOT NULL CHECK(next_ms>0)) STRICT;
 CREATE TABLE deferred (hash BLOB PRIMARY KEY REFERENCES objects(hash)) STRICT;
+CREATE TABLE pending_roots (hash BLOB PRIMARY KEY REFERENCES objects(hash), expires_ms INTEGER NOT NULL CHECK(expires_ms>0)) STRICT;

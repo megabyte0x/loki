@@ -108,8 +108,8 @@ class _WalletState extends State<_Wallet> {
       coordinator;
   DateTime nextScan = DateTime.fromMillisecondsSinceEpoch(0);
   final verifyUntil = <String, DateTime>{};
-  bool scanning = false, enteringOrigin = false;
-  String pairingOrigin = '';
+  bool scanning = false, enteringLink = false;
+  String pairingLink = '';
   _Page page = _Page.vaults;
   _Page formBack = _Page.vaults;
   ({Json vault, String attempt})? review;
@@ -923,9 +923,9 @@ class _WalletState extends State<_Wallet> {
         children: [
           LokiHead(
             'Signer setup',
-            enteringOrigin ? 'Enter coordinator address' : 'Set up your signer',
-            enteringOrigin
-                ? 'Use the HTTPS origin shared by your vault organizer, without a page or path.'
+            enteringLink ? 'Enter pairing link' : 'Set up your signer',
+            enteringLink
+                ? 'Paste the one-use pairing link your coordinator issued for this member slot.'
                 : 'Pair a new signer with this Mac, or recover an existing signer.',
           ),
           Surface(
@@ -938,29 +938,28 @@ class _WalletState extends State<_Wallet> {
                   children: [
                     Expanded(
                       child: LokiLabel(
-                        enteringOrigin
-                            ? 'Coordinator HTTPS origin'
-                            : 'Start on this Mac',
+                        enteringLink ? 'Pairing link' : 'Start on this Mac',
                       ),
                     ),
-                    if (enteringOrigin)
-                      Text('01 / 04', style: lokiMono(9, color: c.muted)),
+                    if (enteringLink)
+                      Text('01 / 03', style: lokiMono(9, color: c.muted)),
                   ],
                 ),
-                if (enteringOrigin)
+                if (enteringLink)
                   TextFormField(
-                    initialValue: pairingOrigin,
+                    initialValue: pairingLink,
                     autofocus: true,
                     readOnly: busy,
+                    obscureText: true,
                     autocorrect: false,
                     enableSuggestions: false,
                     style: lokiMono(13),
                     onChanged: (text) => setState(() {
-                      pairingOrigin = text;
+                      pairingLink = text;
                       actionError = null;
                     }),
                     decoration: const InputDecoration(
-                      hintText: 'Enter HTTPS address',
+                      hintText: 'Paste pairing link',
                       prefixIcon: Icon(Icons.link, size: 17),
                     ),
                   )
@@ -970,7 +969,7 @@ class _WalletState extends State<_Wallet> {
                     style: lokiSans(14, weight: 600),
                   ),
                   Text(
-                    'Use the coordinator’s HTTPS origin from your organizer.',
+                    'Use the one-use pairing link from your coordinator.',
                     style: lokiSans(12, color: c.muted),
                   ),
                   const Divider(),
@@ -987,8 +986,8 @@ class _WalletState extends State<_Wallet> {
             ),
           ),
           Notice(
-            enteringOrigin
-                ? 'Next: check the address. Continue shows the canonical origin before any request is sent.'
+            enteringLink
+                ? 'Next: check the coordinator and slot. Continue shows them before any request is sent.'
                 : 'Adding or removing an enrolled fingerprint can make this Mac’s signer keys unusable. Keep your words and backup.',
           ),
           if (hasNativeFeedback) nativeFeedback(),
@@ -1000,26 +999,26 @@ class _WalletState extends State<_Wallet> {
             spacing: 8,
             children: [
               ActionChipButton(
-                enteringOrigin ? 'Cancel' : 'Restore signer',
-                enteringOrigin ? Icons.close : Icons.key_outlined,
+                enteringLink ? 'Cancel' : 'Restore signer',
+                enteringLink ? Icons.close : Icons.key_outlined,
                 busy
                     ? null
-                    : enteringOrigin
+                    : enteringLink
                     ? () => setState(() {
-                        enteringOrigin = false;
+                        enteringLink = false;
                         actionError = null;
                       })
                     : () => act(api.restore),
               ),
               ActionChipButton(
-                enteringOrigin ? 'Continue' : 'Pair this Mac',
+                enteringLink ? 'Continue' : 'Pair this Mac',
                 Icons.arrow_forward,
-                busy || (enteringOrigin && pairingOrigin.trim().isEmpty)
+                busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
-                    : enteringOrigin
-                    ? () => act(() => api.pair(pairingOrigin.trim()))
+                    : enteringLink
+                    ? () => act(() => api.pair(pairingLink.trim()))
                     : () => setState(() {
-                        enteringOrigin = true;
+                        enteringLink = true;
                         actionError = null;
                       }),
                 primary: true,

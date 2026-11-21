@@ -11,16 +11,16 @@ const { createServer } = require("http");
 const next = require("next");
 
 const port = parseInt(process.env.PORT || "3001", 10);
-// Next must know its real host/port, or it derives request origins from the default
-// localhost:3000 — which breaks member self-registration (the device signs over the
-// coordinator origin it was given). Behind a TLS proxy, set HOSTNAME to the public host.
-const hostname = process.env.HOSTNAME || "localhost";
-// Next builds request origins (used to verify self-registration signatures) from this port.
-// Behind a TLS proxy/tunnel the listen port is loopback-only; the public origin is https on
-// 443, which URL.origin omits. Set PUBLIC_PORT=443 so the derived origin is https://HOSTNAME
-// with no port, matching what members sign over. Defaults to the listen port (direct/loopback).
-const publicPort = parseInt(process.env.PUBLIC_PORT || String(port), 10);
-const app = next({ dev: false, hostname, port: publicPort });
+const bind = "127.0.0.1";
+const origin = process.env.PUBLIC_ORIGIN ?? new URL(`http://localhost:${port}`).origin;
+const publicUrl = new URL(origin);
+const loopback = ["localhost", bind].includes(publicUrl.hostname);
+const https = publicUrl.protocol === "https:";
+if (publicUrl.origin !== origin || !(https || (loopback && publicUrl.protocol === "http:"))) {
+  throw new Error("PUBLIC_ORIGIN must be a canonical HTTPS or loopback HTTP origin");
+}
+const publicPort = Number(publicUrl.port || (https ? 443 : 80));
+const app = next({ dev: false, hostname: publicUrl.hostname, port: publicPort });
 const handle = app.getRequestHandler();
 
 const cacheFor = (url) =>
@@ -30,6 +30,10 @@ const cacheFor = (url) =>
 
 app.prepare().then(() => {
   createServer((req, res) => {
+    // Registration signatures bind the public origin. Never infer it from client headers.
+    req.headers["x-forwarded-proto"] = https ? "https" : "http";
+    req.headers["x-forwarded-host"] = publicUrl.host;
+    req.headers["x-forwarded-port"] = String(publicPort);
     const cc = cacheFor(req.url);
     const setHeader = res.setHeader.bind(res);
     // Coerce any Cache-Control Next tries to set to our value.
@@ -47,5 +51,5 @@ app.prepare().then(() => {
       return writeHead(...args);
     };
     handle(req, res);
-  }).listen(port, () => console.log(`loki web on :${port}`));
+  }).listen(port, bind, () => console.log(`loki web on ${bind}:${port} for ${origin}`));
 });

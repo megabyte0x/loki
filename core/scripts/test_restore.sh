@@ -16,8 +16,11 @@
 #      broadcast and confirms.
 #   5. A fourth member started against an unreachable coordinator serves its local API.
 #
-# Needs a running frostd and the web app as the coordinator, for example:
-#   LOKI_REGISTRY=/abs/roster.json npx next dev --hostname localhost -p 3001   (in web/wallet)
+# Run in a private terminal: you will confirm recovery for three disposable members and
+# re-enter member 3's original words during the restore. Do not record the terminal session.
+# Needs a running frostd and the web app as the coordinator. Configure three grants
+# pinned to slots 1..3 (see web/wallet/README.md), and set LOKI_ONBOARDING_GRANT_1,
+# LOKI_ONBOARDING_GRANT_2, and LOKI_ONBOARDING_GRANT_3 to the respective bearers.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -108,19 +111,31 @@ wait_for() {
   fail "$what"
 }
 roster_entry() { curl -sf -m 10 "$coordinator/api/members" | jq -c --argjson slot "$1" '.slots[] | select(.slot == $slot)'; }
-device_of() { jq -r --argjson slot "$1" '.[] | select(.slot == $slot) | .device_pubkey' "$LOKI_REGISTRY.devices"; }
+device_of() { jq -r --argjson slot "$1" '.devices[] | select(.slot == $slot) | .device_pubkey' "$LOKI_REGISTRY"; }
 
 echo "== three members register with $coordinator and create a 2-of-3 vault"
-for i in 1 2 3; do with_coordinator "$i" "$tmp/$i"; done
+for i in 1 2 3; do
+  grant_var="LOKI_ONBOARDING_GRANT_$i"
+  onboarding[i]=${!grant_var:?set $grant_var}
+  unset "$grant_var"
+done
+for i in 1 2 3; do LOKI_ONBOARDING_GRANT="${onboarding[i]}" with_coordinator "$i" "$tmp/$i"; done
+unset onboarding
 for i in 1 2 3; do
   wait_for "member $i registers to slot $i" 60 registered "$i"
-  grep -q 'recovery words not set up: output is not a terminal' "$tmp/$i.log" || fail "member $i did not report the skipped recovery words"
+  grep -q 'recovery words not set up' "$tmp/$i.log" || fail "member $i did not report the skipped recovery words"
   [[ ! -e "$tmp/$i/recovery.pub" ]] || fail "member $i minted recovery words into a log"
 done
 echo "registered slots 1..3; no recovery words were minted into the member logs"
-for i in 1 2; do
-  api "$i" POST /api/recovery-setup '{}' | jq -e '(.words | split(" ") | length) == 24' >/dev/null || fail "recovery setup $i"
-done
+setup_recovery() {
+  local i="$1" data="${dir[$1]}"
+  stop "$i"
+  echo "Set up recovery for disposable member $i (profile passphrase: $(passphrase "$i"))"
+  "$bin" recovery-setup --data "$data" || fail "local recovery setup $i"
+  with_coordinator "$i" "$data"
+  wait_for "member $i re-registers" 60 registered "$i"
+}
+for i in 1 2; do setup_recovery "$i"; done
 created="$(api 1 POST /api/create '{"name":"Testnet restore vault","members":3,"threshold":2}')" || fail "create: $created"
 vault="$(jq -er '.vault' <<<"$created")" || fail vault
 for i in 2 3; do
@@ -141,10 +156,12 @@ for i in 1 2; do recovery "$i" | jq -e '.recovery_identity and .recovery_backup'
 
 echo "== member 3 sets up recovery only after the vault is active"
 recovery 3 | jq -e '(.recovery_identity | not) and (.recovery_backup | not)' >/dev/null || fail "member 3 already has recovery"
-words="$(api 3 POST /api/recovery-setup '{}' | jq -er '.words')" || fail 'recovery setup 3'
+setup_recovery 3
 recovery 3 | jq -e '.recovery_identity and .recovery_backup' >/dev/null || fail "member 3 has no backup after recovery setup"
 echo "member 3 has a recovery backup after setting up recovery late"
-backup="$(api 3 GET "/api/recovery-backup?vault=$vault" | jq -er '.backup')" || fail 'export backup'
+api 3 GET "/api/recovery-backup?vault=$vault" >"$tmp/backup.json" || fail 'export backup'
+fingerprint="$(openssl dgst -sha256 -r "$tmp/3/vaults/$vault/signer/recovery.backup" | cut -d' ' -f1)"
+cp "$tmp/3/recovery.pub" "$tmp/recovery-3.pub"
 old_roster="$(roster_entry 3)"
 old_device="$(device_of 3)"
 [[ -n "$old_device" ]] || fail 'no device binding for slot 3'
@@ -158,11 +175,15 @@ echo "== a fresh profile on a new data directory restores from the words and the
 new="$tmp/3-new-device"
 start 3 "$new"
 api 3 POST /api/profile-create "$(jq -nc --arg passphrase "$(passphrase 3)" '{name:"Member 3",passphrase:$passphrase}')" >/dev/null || fail 'profile 3'
-restored="$(api 3 POST /api/recovery-restore "$(jq -nc --arg vault "$vault" --arg words "$words" --arg backup "$backup" '{vault:$vault,words:$words,backup:$backup}')")" || fail "restore: $restored"
+stop 3
+echo "Enter member 3's original words (profile passphrase: $(passphrase 3))"
+"$bin" recovery-restore --data "$new" --network testnet --frostd-url "$frostd" \
+  --backup "$tmp/backup.json" --fingerprint "$fingerprint" || fail 'local restore 3'
+cmp "$new/recovery.pub" "$tmp/recovery-3.pub" || fail 'restore used a different recovery identity'
+start 3 "$new"
+api 3 POST /api/unlock "$(jq -nc --arg passphrase "$(passphrase 3)" '{passphrase:$passphrase}')" >/dev/null || fail 'unlock profile 3'
 phase_is 3 active || fail 'restored vault is not active'
 recovery 3 | jq -e '.recovery_identity and .recovery_backup' >/dev/null || fail 'restore did not bring the recovery identity'
-again="$(api_raw 3 POST /api/recovery-setup '{}')"
-[[ "${again##*$'\n'}" == 409 ]] || fail "restored profile minted a second set of words: $again"
 echo "restored; the profile's recovery identity is the restored words"
 
 echo "== the restored member restarts with --coordinator-url and re-registers to slot 3"

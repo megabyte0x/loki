@@ -3,6 +3,14 @@ use crate::{ClientError, ClientResult};
 const FLOOR_MS: u64 = 250;
 const CEILING_MS: u64 = 30_000;
 
+pub(crate) fn now_ms() -> ClientResult<u64> {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| ClientError::Storage)?
+        .as_millis();
+    u64::try_from(ms).map_err(|_| ClientError::Capacity)
+}
+
 fn ceiling(attempts: u64) -> ClientResult<u64> {
     let shift = u32::try_from(attempts.min(7)).map_err(|_| ClientError::Capacity)?;
     let scaled = FLOOR_MS.checked_shl(shift).ok_or(ClientError::Capacity)?;

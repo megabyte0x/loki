@@ -50,6 +50,15 @@ impl Drop for SecretValue {
 fn error<T>(_: T) -> MemberError {
     MemberError::Sealed
 }
+
+pub(super) fn check_peer_destinations(member: &LoadedMember, descriptor: &loki_relay_client::AuthenticatedDescriptor) -> MemberResult<()> {
+    let development = member.network == crate::network::VaultNetwork::Regtest;
+    for relay in &descriptor.body().relays {
+        loki_relay_client::validate_peer_destination(&relay.route.endpoint, development).map_err(error)?;
+    }
+    Ok(())
+}
+
 fn array(v: &Value, len: usize) -> MemberResult<&[Value]> {
     match v {
         Value::Array(a) if a.len() == len => Ok(a),
@@ -176,6 +185,7 @@ impl LocalConfig {
         let mut peers = Vec::new();
         for wire in &self.peer_wires {
             let auth = open_descriptor(&member.identity, &member.roster, wire).map_err(error)?;
+            check_peer_destinations(member, &auth)?;
             if auth.body().owner == member.identity.public().id
                 || peers
                     .iter()
@@ -328,6 +338,7 @@ impl LocalConfig {
     }
     pub fn import(&mut self, member: &LoadedMember, wire: &[u8]) -> MemberResult<()> {
         let next = open_descriptor(&member.identity, &member.roster, wire).map_err(error)?;
+        check_peer_destinations(member, &next)?;
         if next.body().owner == member.identity.public().id {
             return Err(MemberError::Identity);
         }

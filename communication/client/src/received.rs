@@ -11,8 +11,9 @@ use crate::{
 use loki_relay_protocol::types::{
     Id32, LogicalKey, MemberId, MessageBody, MessageRef, Payload, Roster,
 };
+use rusqlite::params;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 const ACK_REQUEST_DOMAIN: &[u8] = b"Loki_Relay_Received_Request_v1\0";
 
@@ -217,7 +218,8 @@ impl ReceivedStatus {
     }
 }
 
-struct CertifiedAck {
+#[derive(Eq, Hash, PartialEq)]
+struct AckClaim {
     target: LogicalKey,
     digest: Id32,
     session: Option<Id32>,
@@ -227,7 +229,7 @@ struct CertifiedAck {
 enum AckOutcome {
     Pending,
     Rejected(&'static str),
-    Certified(CertifiedAck),
+    Bound(AckClaim),
 }
 
 struct AckObservation {
@@ -236,40 +238,50 @@ struct AckObservation {
     outcome: AckOutcome,
 }
 
-/// Re-open every committed Received source and record durable history.
-///
-/// `early_received_refs` and `reference_rejections` key only the target member.
-/// They omit the acknowledgement id, session, and source, so they are not vetoes.
-/// A wrong source keeps its own `source_rejections` reason. A later valid source
-/// from the same member is still certified. Unknown targets stay pending.
+/// Process bounded, persisted work. An early acknowledgement is selected after
+/// the target arrives; neither the scheduling index nor a receipt certifies it.
 pub fn reconcile_received(
     store: &mut ClientStore,
     roster: &Roster,
     identity: &CommIdentity,
 ) -> ClientResult<()> {
     store.check_association(roster, identity.public().id)?;
-    let observations = collect_acks(store, roster, identity)?;
-    for observation in &observations {
-        match &observation.outcome {
-            AckOutcome::Pending => {}
-            AckOutcome::Rejected(reason) => {
-                durable_reason(
-                    store,
-                    &observation.source_root,
-                    reason,
-                    observation.body_digest.as_ref(),
-                )?;
+    let mut facts = HashMap::new();
+    let mut certified = HashSet::new();
+    let incoming = store.received_original_work(100)?;
+    let local = store.received_local_work(100)?;
+    let observations = incoming.iter().map(|row| (true, row.cursor, observe_incoming(store, roster, identity, row)))
+        .chain(local.iter().map(|link| (false, link.cursor, observe_local(store, roster, identity, link))))
+        .map(|(incoming, cursor, observation)| Ok((incoming, cursor, observation?)))
+        .collect::<ClientResult<Vec<_>>>()?;
+    for (incoming, cursor, observation) in observations {
+        let reason = match observation.outcome {
+            AckOutcome::Pending => None,
+            AckOutcome::Rejected(reason) => Some(reason),
+            AckOutcome::Bound(claim) => {
+                let fact = match facts.entry(claim.target.clone()) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(target_fact(store, roster, identity, &claim.target)?)
+                    }
+                };
+                match fact.as_ref().map(|fact| claim.certify(fact)) {
+                    Some(Ok(())) => {
+                        if !certified.contains(&claim) {
+                            store.note_received_ref(&claim.target, &claim.digest, claim.session, claim.signer, &observation.source_root)?;
+                            certified.insert(claim);
+                        }
+                        None
+                    }
+                    Some(Err(reason)) => Some(reason),
+                    None => None,
+                }
             }
-            AckOutcome::Certified(certified) => {
-                store.note_received_ref(
-                    &certified.target,
-                    &certified.digest,
-                    certified.session,
-                    certified.signer,
-                    &observation.source_root,
-                )?;
-            }
+        };
+        if let Some(reason) = reason {
+            store.reject_source_root(&observation.source_root, reason, observation.body_digest.as_ref())?;
         }
+        store.connection.execute("DELETE FROM received_work WHERE incoming=?1 AND source=?2", params![incoming, cursor])?;
     }
     Ok(())
 }
@@ -287,7 +299,6 @@ pub fn received_status(
     {
         return Err(ClientError::Identity);
     }
-    let observations = collect_acks(store, roster, identity)?;
     let mut status = ReceivedStatus {
         key: key.clone(),
         digest: *digest,
@@ -296,33 +307,69 @@ pub fn received_status(
         audience: Vec::new(),
         peers: BTreeSet::new(),
     };
-    let Some(fact) = target_fact(store, roster, identity, key, digest)? else {
+    let Some(fact) = target_fact(store, roster, identity, key)? else {
         return Ok(status);
     };
+    if !fact.is_test || fact.digest != *digest {
+        return Ok(status);
+    }
     status.session = fact.session;
     status.audience = fact.audience.clone();
     status.author_committed = true;
-    for observation in &observations {
-        let AckOutcome::Certified(certified) = &observation.outcome else {
+    let owner = identity.public().id;
+    for &signer in &fact.audience {
+        if signer == key.sender {
             continue;
+        }
+        let matches = |observation: AckObservation| {
+            matches!(observation.outcome, AckOutcome::Bound(claim)
+                if claim.signer == signer && claim.target == *key && claim.certify(&fact).is_ok())
         };
-        if certified.target == fact.key
-            && certified.digest == fact.digest
-            && certified.session == fact.session
-            && certified.signer != fact.key.sender
-            && fact.audience.contains(&certified.signer)
-        {
-            status.peers.insert(certified.signer);
+        if signer == owner {
+            if let Some(link) = store.local_ack_for_target(key, digest, owner)? {
+                if matches(observe_local(store, roster, identity, &link)?) {
+                    status.peers.insert(signer);
+                }
+            }
+            continue;
+        }
+        let mut after = None;
+        'sources: loop {
+            let page = store.received_for_target(key, digest, fact.session, signer, after)?;
+            let Some(last) = page.last() else { break; };
+            after = Some(last.key.message);
+            for row in &page {
+                if matches(observe_incoming(store, roster, identity, row)?) {
+                    status.peers.insert(signer);
+                    break 'sources;
+                }
+            }
         }
     }
     Ok(status)
 }
 
 struct TargetFact {
-    key: LogicalKey,
     digest: Id32,
     session: Option<Id32>,
     audience: Vec<MemberId>,
+    is_test: bool,
+}
+
+impl AckClaim {
+    fn certify(&self, fact: &TargetFact) -> Result<(), &'static str> {
+        if self.digest != fact.digest {
+            Err("digest")
+        } else if !fact.is_test {
+            Err("type")
+        } else if self.session != fact.session {
+            Err("session")
+        } else if !fact.audience.contains(&self.signer) {
+            Err("audience")
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn target_fact(
@@ -330,7 +377,6 @@ fn target_fact(
     roster: &Roster,
     identity: &CommIdentity,
     key: &LogicalKey,
-    digest: &Id32,
 ) -> ClientResult<Option<TargetFact>> {
     let Some(saved) = store.saved_record(key)? else {
         return Ok(None);
@@ -346,59 +392,15 @@ fn target_fact(
         Err(error) => return Err(error),
     };
     let body = opened.message().body();
-    if &body.key != key
-        || opened.message().digest() != digest
-        || !matches!(body.payload, Payload::Test(_))
-    {
+    if &body.key != key || opened.message().digest() != &saved.digest {
         return Ok(None);
     }
     Ok(Some(TargetFact {
-        key: key.clone(),
-        digest: *digest,
+        digest: *opened.message().digest(),
         session: body.session,
         audience: body.audience.clone(),
+        is_test: matches!(body.payload, Payload::Test(_)),
     }))
-}
-
-fn collect_acks(
-    store: &ClientStore,
-    roster: &Roster,
-    identity: &CommIdentity,
-) -> ClientResult<Vec<AckObservation>> {
-    let mut found = Vec::new();
-    let mut after = 0u64;
-    loop {
-        let page = store.page_received_originals(after, 100)?;
-        let Some(last) = page.last() else {
-            break;
-        };
-        let cursor = last.cursor;
-        let short = page.len() < 100;
-        for row in &page {
-            found.push(observe_incoming(store, roster, identity, row)?);
-        }
-        if short || cursor <= after {
-            break;
-        }
-        after = cursor;
-    }
-    after = 0;
-    loop {
-        let page = store.recover_ack_links(after, 100)?;
-        let Some(last) = page.last() else {
-            break;
-        };
-        let cursor = last.cursor;
-        let short = page.len() < 100;
-        for link in &page {
-            found.push(observe_local(store, roster, identity, link)?);
-        }
-        if short || cursor <= after {
-            break;
-        }
-        after = cursor;
-    }
-    Ok(found)
 }
 
 fn observe_incoming(
@@ -429,7 +431,6 @@ fn observe_incoming(
         source_root: row.source_root,
         body_digest: Some(*opened.message().digest()),
         outcome: judge(
-            store,
             roster,
             identity,
             &opened,
@@ -477,7 +478,6 @@ fn observe_local(
         source_root: saved.source_root,
         body_digest: Some(*opened.message().digest()),
         outcome: judge(
-            store,
             roster,
             identity,
             &opened,
@@ -499,7 +499,6 @@ fn outcome_from_open(error: ClientError) -> ClientResult<AckOutcome> {
 }
 
 fn judge(
-    store: &ClientStore,
     roster: &Roster,
     identity: &CommIdentity,
     opened: &AuthenticatedTransfer,
@@ -538,41 +537,10 @@ fn judge(
         sender: target_ref.sender,
         message: target_ref.message,
     };
-    let Some(saved) = store.saved_record(&target_key)? else {
-        return Ok(AckOutcome::Pending);
-    };
-    let target = match open_saved(store, roster, identity, &saved, &target_key) {
-        Ok(target) => target,
-        Err(
-            ClientError::MissingObjects(_)
-            | ClientError::Crypto
-            | ClientError::Identity
-            | ClientError::Wire(_),
-        ) => {
-            return Ok(AckOutcome::Pending);
-        }
-        Err(error) => return Err(error),
-    };
-    let target_body = target.message().body();
-    if &target_body.key != &target_key {
-        return Ok(AckOutcome::Pending);
-    }
-    if target.message().digest() != &target_ref.digest {
-        return Ok(AckOutcome::Rejected("digest"));
-    }
-    if !matches!(target_body.payload, Payload::Test(_)) {
-        return Ok(AckOutcome::Rejected("type"));
-    }
-    if target_body.session != body.session {
-        return Ok(AckOutcome::Rejected("session"));
-    }
-    if !target_body.audience.contains(&body.key.sender) {
-        return Ok(AckOutcome::Rejected("audience"));
-    }
-    Ok(AckOutcome::Certified(CertifiedAck {
+    Ok(AckOutcome::Bound(AckClaim {
         target: target_key,
         digest: target_ref.digest,
-        session: target_body.session,
+        session: body.session,
         signer: body.key.sender,
     }))
 }
@@ -634,20 +602,4 @@ fn open_hashes(
         &root.ok_or(ClientError::Storage)?,
         &objects,
     )
-}
-
-/// Keep the first per-source reason. A full page budget retries on a later pass.
-///
-/// `reference_rejections` is not written. Its key cannot name a second session or
-/// source for the same target member, so a historical row would hide a later acknowledgement.
-fn durable_reason(
-    store: &mut ClientStore,
-    root: &Id32,
-    reason: &str,
-    digest: Option<&Id32>,
-) -> ClientResult<()> {
-    match store.reject_source_root(root, reason, digest) {
-        Err(ClientError::Capacity) => Ok(()),
-        other => other,
-    }
 }

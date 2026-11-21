@@ -47,3 +47,30 @@ CREATE TABLE IF NOT EXISTS nonce_uses (
     PRIMARY KEY (mailbox, cid),
     FOREIGN KEY (mailbox) REFERENCES mailboxes(id)
 ) STRICT;
+
+-- Even an older binary pointed at an enrolled root must not issue a fresh legacy receipt.
+CREATE TRIGGER IF NOT EXISTS nonce_uses_read_only BEFORE INSERT ON nonce_uses
+BEGIN
+    SELECT RAISE(ABORT, 'legacy nonce ledger is read-only');
+END;
+
+CREATE TABLE IF NOT EXISTS nonce_claimants (
+    mailbox BLOB NOT NULL REFERENCES mailboxes(id),
+    vault BLOB NOT NULL CHECK (length(vault) = 32),
+    slot INTEGER NOT NULL CHECK (slot BETWEEN 1 AND 65535),
+    signing_key BLOB NOT NULL CHECK (length(signing_key) = 32),
+    quota INTEGER NOT NULL CHECK (quota > 0),
+    used_bytes INTEGER NOT NULL CHECK (used_bytes BETWEEN 0 AND quota),
+    PRIMARY KEY (mailbox, vault, slot)
+) STRICT;
+
+CREATE TABLE IF NOT EXISTS nonce_claims (
+    mailbox BLOB NOT NULL,
+    vault BLOB NOT NULL,
+    slot INTEGER NOT NULL,
+    cid BLOB NOT NULL CHECK (length(cid) = 32),
+    record_hash BLOB NOT NULL CHECK (length(record_hash) = 32),
+    wire BLOB NOT NULL CHECK (length(wire) BETWEEN 1 AND 65536),
+    PRIMARY KEY (mailbox, vault, slot, cid),
+    FOREIGN KEY (mailbox, vault, slot) REFERENCES nonce_claimants(mailbox, vault, slot)
+) STRICT, WITHOUT ROWID;

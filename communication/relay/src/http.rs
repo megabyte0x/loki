@@ -1,17 +1,20 @@
 use crate::{
     store::{HashPresence, PutClass},
-    Capability, DbHandle, RelayError, RelayResult,
+    Capability, DbHandle, RelayError, RelayResult, Role,
 };
 use axum::{
-    body::{Body, Bytes},
-    extract::{rejection::BytesRejection, DefaultBodyLimit, Extension, Request, State},
+    body::{Body, Bytes, HttpBody},
+    extract::{
+        rejection::BytesRejection, DefaultBodyLimit, Extension, FromRequest, Request, State,
+    },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{get, put},
     Router,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use loki_http_ingress::PeerGate;
 use loki_relay_protocol::{
     envelope::MAX_WIRE_LEN,
     http::ErrorCode,
@@ -28,16 +31,22 @@ const REQUEST_CONCURRENCY: usize = 32;
 const FRESH_REQUEST_LIMIT: usize = 30;
 const RESERVED_REQUESTS: usize = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const UNAUTHENTICATED_BODY_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_AFTER: HeaderValue = HeaderValue::from_static("1");
 
 #[derive(Clone, Copy)]
-struct AdmissionMark {
-    reserved_only: bool,
+enum AdmissionMark {
+    Reserved,
+    Denied,
 }
 
 #[derive(Clone)]
 struct Gate {
     inner: Arc<Mutex<GateCounts>>,
+    screening: PeerGate,
+    rejected_body: PeerGate,
+    witness_body: PeerGate,
+    identity: PeerGate,
     db: DbHandle,
 }
 struct GateCounts {
@@ -65,14 +74,22 @@ impl Gate {
     fn new(db: DbHandle) -> Self {
         Self {
             inner: Arc::new(Mutex::new(GateCounts { total: 0, fresh: 0 })),
+            screening: PeerGate::new(64, REQUEST_CONCURRENCY),
+            rejected_body: PeerGate::new(16, 4),
+            witness_body: PeerGate::new(16, 4),
+            identity: PeerGate::new(16, 8),
             db,
         }
     }
 
-    /// One of 30 fresh body slots. Never the leftover reserved progress slots.
+    fn fresh_available(counts: &GateCounts) -> bool {
+        counts.total < REQUEST_CONCURRENCY && counts.fresh < FRESH_REQUEST_LIMIT
+    }
+
+    /// One of 30 fresh slots. Never the leftover reserved progress slots.
     fn try_acquire_fresh(&self) -> Option<RequestPermit> {
         let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        if counts.total >= REQUEST_CONCURRENCY || counts.fresh >= FRESH_REQUEST_LIMIT {
+        if !Self::fresh_available(&counts) {
             return None;
         }
         counts.fresh += 1;
@@ -108,96 +125,123 @@ async fn deadline(request: Request, next: Next) -> Response {
     }
 }
 
-async fn admit(State(gate): State<Gate>, mut request: Request, next: Next) -> Response {
-    if request.method() == Method::GET {
-        let Some(permit) = gate.try_acquire_progress() else {
-            return error_response(RelayError::RateLimit);
-        };
-        request.extensions_mut().insert(AdmissionMark {
-            reserved_only: false,
-        });
-        let response = next.run(request).await;
-        drop(permit);
-        return response;
-    }
-    if let Some(permit) = gate.try_acquire_fresh() {
-        request.extensions_mut().insert(AdmissionMark {
-            reserved_only: false,
-        });
-        let response = next.run(request).await;
-        drop(permit);
-        return response;
-    }
-    // Fresh body slots are full. Do not read an unclassified body on a progress slot.
-    if request.method() == Method::PUT {
-        if let Ok((mailbox, hash)) = path(request.uri()) {
-            return screen_committed_put(gate, request, next, mailbox, hash).await;
-        }
-        if control_path(request.uri()).is_ok() {
-            return error_response(RelayError::RateLimit);
-        }
-        if nonce_path(request.uri()).is_ok() {
-            return error_response(RelayError::RateLimit);
-        }
-        return error_response(RelayError::MalformedRequest);
-    }
-    error_response(RelayError::RateLimit)
+async fn admit(State(gate): State<Gate>, request: Request, next: Next) -> Response {
+    admit_checked(gate, request, next)
+        .await
+        .unwrap_or_else(error_response)
 }
 
-/// A fresh hash is refused before the body is read. Only a committed hash may
-/// occupy a progress slot for the rest of the body and the writer retry.
-async fn screen_committed_put(
-    gate: Gate,
-    mut request: Request,
-    next: Next,
-    mailbox: Id32,
-    hash: Id32,
-) -> Response {
-    let headers = request.headers().clone();
-    let capability = match capability(&headers) {
-        Ok(capability) => capability,
-        Err(error) => return error_response(error),
-    };
-    if let Err(error) = request_headers(&headers, request.method()) {
-        return error_response(error);
+async fn admit_checked(gate: Gate, mut request: Request, next: Next) -> RelayResult<Response> {
+    let headers = request.headers();
+    let uri = request.uri();
+    let method = request.method();
+    if uri.path() == "/v1/identity" && matches!(*method, Method::GET | Method::HEAD) {
+        bodyless(&request)?;
+        id(single(headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
+        let _permit = gate
+            .identity
+            .try_acquire(request.extensions())
+            .ok_or(RelayError::RateLimit)?;
+        return Ok(next.run(request).await);
     }
-    let Some(permit) = gate.try_acquire_progress() else {
-        return error_response(RelayError::RateLimit);
+    let write = *method == Method::PUT;
+    let object = path(uri).ok();
+    let (target, object_write) = if *method == Method::GET {
+        let mailbox = match object {
+            Some((mailbox, _)) => mailbox,
+            None => page_path(uri)?.0,
+        };
+        request_headers(headers, method)?;
+        bodyless(&request)?;
+        (Some((mailbox, Role::Read)), None)
+    } else if write {
+        if let Some((mailbox, hash)) = object {
+            request_headers(headers, method)?;
+            (None, Some((mailbox, hash)))
+        } else {
+            let (mailbox, rotate) = control_path(uri)?;
+            control_headers(headers)?;
+            (rotate.then_some((mailbox, Role::Admin)), None)
+        }
+    } else {
+        return Err(RelayError::MalformedRequest);
     };
+    let capability = capability(headers)?;
+    if write && object_write.is_none() && !Gate::fresh_available(&gate.inner.lock().unwrap()) {
+        return Err(RelayError::RateLimit);
+    }
+    let screening = gate
+        .screening
+        .try_acquire(request.extensions())
+        .ok_or(RelayError::RateLimit)?;
     let db = gate.db.clone();
-    let screened = tokio::task::spawn_blocking(move || db.classify_hash(mailbox, hash, capability))
-        .await
-        .unwrap_or(Err(RelayError::StorageUnavailable));
-    match screened {
-        Ok(HashPresence::Committed) => {
-            request.extensions_mut().insert(AdmissionMark {
-                reserved_only: true,
-            });
-            let response = next.run(request).await;
-            drop(permit);
-            response
+    let screened = tokio::task::spawn_blocking(move || {
+        let _screening = screening;
+        if let Some((mailbox, hash)) = object_write {
+            db.classify_hash(mailbox, hash, capability).map(Some)
+        } else {
+            db.authenticate(target, &capability).map(|()| None)
         }
-        Ok(HashPresence::Fresh) | Err(RelayError::RateLimit) => {
-            drop(permit);
-            error_response(RelayError::RateLimit)
+    })
+    .await
+    .map_err(|_| RelayError::StorageUnavailable)?;
+    let presence = match screened {
+        Ok(presence) => presence,
+        Err(RelayError::Capability) if write => {
+            // Preserve PUT body errors without granting writer capacity.
+            let _permit = gate
+                .rejected_body
+                .try_acquire(request.extensions())
+                .ok_or(RelayError::RateLimit)?;
+            request.extensions_mut().insert(AdmissionMark::Denied);
+            return tokio::time::timeout(UNAUTHENTICATED_BODY_TIMEOUT, next.run(request))
+                .await
+                .map_err(|_| RelayError::StorageUnavailable);
         }
-        Err(error) => {
-            drop(permit);
-            error_response(error)
-        }
+        Err(error) => return Err(error),
+    };
+    let _permit = if !write {
+        gate.try_acquire_progress()
+    } else if let Some(fresh) = gate.try_acquire_fresh() {
+        Some(fresh)
+    } else if matches!(presence, Some(HashPresence::Committed)) {
+        request.extensions_mut().insert(AdmissionMark::Reserved);
+        gate.try_acquire_progress()
+    } else {
+        None
+    }
+    .ok_or(RelayError::RateLimit)?;
+    Ok(next.run(request).await)
+}
+
+fn bodyless(request: &Request) -> RelayResult<()> {
+    let headers = request.headers();
+    if request.body().size_hint().lower() > MAX_WIRE_LEN as u64 {
+        return Err(RelayError::ObjectTooLarge);
+    }
+    if single(headers, "transfer-encoding")?.is_some()
+        || single(headers, "content-length")?.is_some_and(|value| value.parse::<usize>() != Ok(0))
+        || !request.body().is_end_stream()
+    {
+        return Err(RelayError::MalformedRequest);
+    }
+    Ok(())
+}
+
+async fn health(request: Request) -> Response {
+    match bodyless(&request) {
+        Ok(()) => StatusCode::OK.into_response(),
+        Err(error) => error_response(error),
     }
 }
 
 /// The caller retains the DbWriter owner for the lifetime of this router.
 pub fn router(db: DbHandle) -> Router {
+    let gate = Gate::new(db.clone());
     Router::new()
         .route(
             "/v1/mailboxes/{mailbox}/objects/{hash}",
             put(object_route).get(object_route),
-        )
-        .route(
-            "/v1/mailboxes/{mailbox}/nonces/{cid}",
-            put(nonce_route).layer(DefaultBodyLimit::max(nonce::MAX_RECORD)),
         )
         .route(
             "/v1/mailboxes/{mailbox}",
@@ -213,12 +257,20 @@ pub fn router(db: DbHandle) -> Router {
         )
         .route("/v1/mailboxes/{mailbox}/entries", get(page_route))
         .route("/v1/identity", get(identity_route))
-        .route("/health", get(|| async { StatusCode::OK }))
         .fallback(malformed)
         .method_not_allowed_fallback(malformed)
         .layer(DefaultBodyLimit::max(MAX_WIRE_LEN))
-        .layer(middleware::from_fn_with_state(Gate::new(db.clone()), admit))
+        .layer(middleware::from_fn_with_state(gate.clone(), admit))
         .layer(middleware::from_fn(deadline))
+        .route(
+            "/v1/mailboxes/{mailbox}/nonces/{cid}",
+            put(nonce_route)
+                .fallback(malformed)
+                .route_layer(DefaultBodyLimit::max(nonce::MAX_RECORD))
+                .route_layer(Extension(gate))
+                .route_layer(middleware::from_fn(deadline)),
+        )
+        .route("/health", get(health).fallback(malformed))
         .with_state(db)
 }
 
@@ -361,30 +413,40 @@ async fn object_route(
     admission: Option<Extension<AdmissionMark>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let reserved_only = admission.is_some_and(|mark| mark.reserved_only);
-    match object_request(db, uri, method, headers, body, reserved_only).await {
+    match object_request(db, uri, method, headers, body, admission.map(|mark| mark.0)).await {
         Ok(response) => response,
         Err(error) => error_response(error),
     }
 }
 
-async fn nonce_route(
-    State(db): State<DbHandle>,
-    uri: Uri,
-    method: Method,
-    headers: HeaderMap,
-    body: Result<Bytes, BytesRejection>,
-) -> Response {
+async fn nonce_route(Extension(gate): Extension<Gate>, request: Request) -> Response {
     let result: RelayResult<Response> = async {
-        let (mailbox, cid) = nonce_path(&uri)?;
-        if method != Method::PUT {
+        let (mailbox, cid) = nonce_path(request.uri())?;
+        let headers = request.headers();
+        let token = single(headers, "authorization")?
+            .and_then(|raw| raw.strip_prefix(nonce::CLAIM_SCHEME))
+            .ok_or(RelayError::Capability)?;
+        let mut raw = [0; nonce::CLAIM_PROOF_LEN];
+        hex::decode_to_slice(token, &mut raw).map_err(|_| RelayError::Capability)?;
+        let proof = nonce::ClaimProof::from_bytes(raw);
+        let length = request_headers(headers, request.method())?;
+        let challenge =
+            id(single(headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
+        if challenge == [0; 32] {
             return Err(RelayError::MalformedRequest);
         }
-        let owner_read = capability(&headers)?;
-        let length = request_headers(&headers, &method)?;
-        let challenge =
-            id(single(&headers, "x-loki-challenge")?.ok_or(RelayError::MalformedRequest)?)?;
-        let wire = body.map_err(|rejection| {
+        // The signature covers the record, so isolate the read and proof check from the writer.
+        let ingress = gate
+            .witness_body
+            .try_acquire(request.extensions())
+            .ok_or(RelayError::RateLimit)?;
+        let wire = tokio::time::timeout(
+            UNAUTHENTICATED_BODY_TIMEOUT,
+            Bytes::from_request(request, &()),
+        )
+        .await
+        .map_err(|_| RelayError::StorageUnavailable)?
+        .map_err(|rejection| {
             if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
                 RelayError::ObjectTooLarge
             } else {
@@ -397,8 +459,18 @@ async fn nonce_route(
         {
             return Err(RelayError::MalformedRequest);
         }
-        let (created, receipt) = db
-            .claim_nonce(mailbox, cid, challenge, wire.to_vec(), owner_read)?
+        let db = gate.db.clone();
+        let (wire, proof) = tokio::task::spawn_blocking(move || {
+            let _ingress = ingress;
+            db.authenticate_nonce(mailbox, cid, challenge, &wire, &proof)?;
+            Ok::<_, RelayError>((wire, proof))
+        })
+        .await
+        .map_err(|_| RelayError::StorageUnavailable)??;
+        let _permit = gate.try_acquire_fresh().ok_or(RelayError::RateLimit)?;
+        let (created, receipt) = gate
+            .db
+            .claim_nonce(mailbox, cid, challenge, wire.to_vec(), proof)?
             .receive()
             .await?;
         Ok(binary(
@@ -447,7 +519,7 @@ async fn object_request(
     method: Method,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
-    reserved_only: bool,
+    admission: Option<AdmissionMark>,
 ) -> RelayResult<Response> {
     let (mailbox, hash) = path(&uri)?;
     let capability = capability(&headers)?;
@@ -470,6 +542,9 @@ async fn object_request(
         if <Id32>::from(Sha256::digest(&body)) != hash {
             return Err(RelayError::MalformedRequest);
         }
+        if matches!(admission, Some(AdmissionMark::Denied)) {
+            return Err(RelayError::Capability);
+        }
         // Classification and queue admission run off the HTTP worker.
         // The writer repeats validation, current auth, and the commit.
         let saved = enqueue_put(
@@ -480,7 +555,7 @@ async fn object_request(
                 wire: body.to_vec(),
             },
             capability,
-            reserved_only,
+            matches!(admission, Some(AdmissionMark::Reserved)),
         )
         .await?
         .receive()
@@ -605,8 +680,7 @@ async fn control_route(
     admission: Option<Extension<AdmissionMark>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
-    let reserved_only = admission.is_some_and(|mark| mark.reserved_only);
-    match control_request(db, uri, headers, body, reserved_only).await {
+    match control_request(db, uri, headers, body, admission.map(|mark| mark.0)).await {
         Ok(response) => response,
         Err(error) => error_response(error),
     }
@@ -617,13 +691,14 @@ async fn control_request(
     uri: Uri,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
-    reserved_only: bool,
+    admission: Option<AdmissionMark>,
 ) -> RelayResult<Response> {
-    if reserved_only {
-        return Err(RelayError::RateLimit);
-    }
     let (mailbox, rotate) = control_path(&uri)?;
     let capability = capability(&headers)?;
+    // Invalid authority can get a body error, but never enqueue a write.
+    let capability = (!matches!(admission, Some(AdmissionMark::Denied)))
+        .then_some(capability)
+        .ok_or(RelayError::Capability);
     let length = control_headers(&headers)?;
     let body = body.map_err(|rejection| {
         if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
@@ -636,9 +711,9 @@ async fn control_request(
         return Err(RelayError::MalformedRequest);
     }
     if uri.path().ends_with("/setup") {
-        loki_relay_protocol::http::decode_setup_control(&body)?;
+        loki_relay_protocol::http::decode_namespace_control(&body)?;
         let result = db
-            .setup_control(mailbox, body.to_vec(), capability)?
+            .setup_control(mailbox, body.to_vec(), capability?)?
             .receive()
             .await?;
         Ok(binary(
@@ -653,7 +728,7 @@ async fn control_request(
     } else if rotate {
         loki_relay_protocol::http::decode_append_update(&body)?;
         let revision = db
-            .rotate(mailbox, body.to_vec(), capability)?
+            .rotate(mailbox, body.to_vec(), capability?)?
             .receive()
             .await?;
         Ok(binary(
@@ -664,7 +739,7 @@ async fn control_request(
     } else {
         loki_relay_protocol::http::decode_creation(&body)?;
         let result = db
-            .create(mailbox, body.to_vec(), capability)?
+            .create(mailbox, body.to_vec(), capability?)?
             .receive()
             .await?;
         Ok(binary(

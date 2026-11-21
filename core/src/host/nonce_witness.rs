@@ -2,28 +2,25 @@
 //! The operator supplies two independently managed, pre-provisioned relay mailboxes.
 
 use std::{io::Read, path::Path};
-use loki_relay_client::{RelayHttp, Secret32};
+use loki_relay_client::RelayHttp;
 use loki_relay_protocol::types::{RelayPin, RelayRoute};
+use crate::setup_transport::Identity;
 use crate::signing_session::{NonceWitness, WitnessPins};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 #[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
+// Ignore the retired `read` field in old files; never serialize or use it.
 pub struct WitnessConfig {
     pub endpoint: String,
     pub key: [u8; 32],
     pub run: [u8; 32],
     pub mailbox: [u8; 32],
-    pub read: [u8; 32],
-}
-
-impl Drop for WitnessConfig {
-    fn drop(&mut self) { self.read.zeroize(); }
 }
 
 pub(super) struct RelayWitness {
     attempt: String,
-    routes: [(RelayRoute, Secret32); 2],
+    routes: [RelayRoute; 2],
+    claimant: Option<([u8; 32], Identity)>,
     http: RelayHttp,
     runtime: tokio::runtime::Runtime,
 }
@@ -50,9 +47,14 @@ pub(super) fn check(config: &[WitnessConfig; 2], development: bool) -> Result<()
     Ok(())
 }
 
+pub(super) fn fingerprint(config: &[WitnessConfig; 2]) -> String {
+    hex::encode(crate::signing_session::witness_fingerprint(
+        config.each_ref().map(|w| (w.key, w.run, w.mailbox)),
+    ))
+}
+
 impl RelayWitness {
-    /// This member's witnesses: the `--nonce-witnesses` file (named by a flag or saved), or the
-    /// ones LokiSigner fetched from its coordinator for this launch.
+    /// LokiSigner's approved launch snapshot, or the headless `--nonce-witnesses` file.
     pub(super) fn for_member(st: &super::state::AppState, attempt: &str) -> Result<Self, String> {
         let development = st.config.development_http;
         match (&st.config.nonce_witnesses, &st.fetched_config) {
@@ -67,34 +69,44 @@ impl RelayWitness {
 
     fn from_config(config: [WitnessConfig; 2], development: bool, attempt: &str) -> Result<Self, String> {
         check(&config, development)?;
-        let routes = config.map(|c| (RelayRoute {
-            pin: RelayPin { key: c.key, run: c.run }, endpoint: c.endpoint.clone(),
+        let routes = config.map(|c| RelayRoute {
+            pin: RelayPin { key: c.key, run: c.run }, endpoint: c.endpoint,
             mailbox: c.mailbox, append_revision: 1,
-        }, Secret32::from_bytes(c.read)));
+        });
         Ok(Self {
             attempt: attempt.to_owned(),
             routes,
+            claimant: None,
             http: if development { RelayHttp::new() } else { RelayHttp::hosted() }
                 .map_err(|e| e.to_string())?,
             runtime: tokio::runtime::Builder::new_current_thread().enable_all().build()
                 .map_err(|e| e.to_string())?,
         })
     }
+
+    pub(super) fn authorize(mut self, vault: [u8; 32], identity: &Identity) -> Result<Self, String> {
+        let secret = Zeroizing::new(identity.to_secret_bytes());
+        self.claimant = Some((vault, Identity::from_secret_bytes(&secret[..])?));
+        Ok(self)
+    }
 }
 
 impl NonceWitness for RelayWitness {
     fn pins(&self) -> WitnessPins {
         std::array::from_fn(|i| {
-            let route = &self.routes[i].0;
+            let route = &self.routes[i];
             (route.pin.key, route.pin.run, route.mailbox)
         })
     }
 
     fn claim(&mut self, cid: [u8; 32], record: &[u8]) -> Result<(), String> {
-        for (index, (route, read)) in self.routes.iter().enumerate() {
+        let (vault, identity) = self.claimant.as_ref().ok_or("nonce witness has no vault identity")?;
+        for (index, route) in self.routes.iter().enumerate() {
             let (attempt, witness) = (&self.attempt, index + 1);
             eprintln!("payment {attempt}: relay sending nonce claim to witness {witness}");
-            let created = self.runtime.block_on(self.http.claim_nonce(route, read, cid, record))
+            let created = self.runtime.block_on(self.http.claim_nonce(route, cid, record, |challenge| {
+                identity.nonce_claim_proof(*vault, &route.pin, route.mailbox, cid, challenge, record)
+            }))
                 .map_err(|e| {
                     eprintln!("payment {attempt}: relay nonce claim error from witness {witness}");
                     format!("nonce witness claim: {e}")
@@ -119,37 +131,38 @@ mod tests {
     fn provisioned_witness_json_round_trips_into_hosted_signing() {
         let config = [1, 5].map(|n| WitnessConfig {
             endpoint: "http://127.0.0.1:39101".into(), key: [n; 32],
-            run: [n + 1; 32], mailbox: [n + 2; 32], read: [n + 3; 32],
+            run: [n + 1; 32], mailbox: [n + 2; 32],
         });
         let raw = Zeroizing::new(serde_json::to_vec_pretty(&config).unwrap());
         let json: serde_json::Value = serde_json::from_slice(&raw).unwrap();
         assert_eq!(json.as_array().unwrap().len(), 2);
         for (entry, n) in json.as_array().unwrap().iter().zip([1, 5]) {
-            assert_eq!(entry.as_object().unwrap().len(), 5);
-            for (field, value) in [("key", n), ("run", n + 1), ("mailbox", n + 2), ("read", n + 3)] {
+            assert_eq!(entry.as_object().unwrap().len(), 4);
+            for (field, value) in [("key", n), ("run", n + 1), ("mailbox", n + 2)] {
                 assert_eq!(entry[field], serde_json::json!(vec![value; 32]));
             }
         }
         let decoded: [WitnessConfig; 2] = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(decoded[0].read, [4; 32]);
-        assert_eq!(decoded[1].read, [8; 32]);
+        assert!(decoded == config);
         let path = std::env::temp_dir().join(format!("loki-witness-{}.json", uuid::Uuid::new_v4()));
         std::fs::write(&path, &*raw).unwrap();
         let witness = RelayWitness::open(Some(&path), true, "test").unwrap();
         assert_eq!(witness.pins(), [([1; 32], [2; 32], [3; 32]), ([5; 32], [6; 32], [7; 32])]);
-        assert_eq!(witness.routes[0].1.as_bytes(), &[4; 32]);
-        assert_eq!(witness.routes[1].1.as_bytes(), &[8; 32]);
         assert!(RelayWitness::open(Some(&path), false, "test").is_err());
         std::fs::remove_file(path).unwrap();
     }
 
-    /// Live: two dev relays provisioned with `examples/provision_nonce_witnesses`, named by
-    /// `LOKI_NONCE_WITNESSES`. A fresh claim is accepted by both; the same claim again is
+    /// Live: two dev relays enrolled for the fixture identity, named by
+    /// `LOKI_NONCE_TEST_WITNESSES`. A fresh claim is accepted by both; the same claim again is
     /// refused, which is what blocks a rolled-back nonce from signing twice.
     #[test]
     fn provisioned_relays_accept_a_claim_once_and_refuse_a_duplicate() {
-        let Some(path) = std::env::var_os("LOKI_NONCE_WITNESSES") else { return };
-        let mut witness = RelayWitness::open(Some(Path::new(&path)), true, "test").unwrap();
+        let Some(path) = std::env::var_os("LOKI_NONCE_TEST_WITNESSES") else { return };
+        let mut secret = [7; 66];
+        secret[..2].copy_from_slice(&1u16.to_be_bytes());
+        let identity = Identity::from_secret_bytes(&secret).unwrap();
+        let mut witness = RelayWitness::open(Some(Path::new(&path)), true, "test").unwrap()
+            .authorize([8; 32], &identity).unwrap();
         let mut cid = [0u8; 32];
         rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut cid);
         witness.claim(cid, b"first use").unwrap();

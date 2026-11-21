@@ -11,6 +11,7 @@ publish = false
 # (reqwest/tokio) stays in `loki-poc`; only the `Transport` trait + message types live here.
 
 [dependencies]
+loki-relay-protocol = { path = "../../communication/protocol" }
 # default-features=false drops the halo2 circuit: the in-browser signer verifies
 # sighashes and signs but does NOT prove (proving is the server-side builder). Native
 # loki-poc keeps the circuit via its own orchard dep (cargo unifies features), so the

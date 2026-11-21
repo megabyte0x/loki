@@ -1,5 +1,5 @@
 use crate::{ClientError, ClientResult};
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use hpke::{kem::X25519HkdfSha256, Deserializable, Kem, Serializable};
 use loki_relay_protocol::types::MemberPublic;
 use zeroize::Zeroizing;
@@ -32,6 +32,37 @@ impl CommIdentity {
             id: self.id,
             signing: self.signing.verifying_key().to_bytes(),
             encryption,
+        }
+    }
+
+    pub fn nonce_claim_proof(
+        &self,
+        vault: [u8; 32],
+        route: &loki_relay_protocol::types::RelayRoute,
+        cid: [u8; 32],
+        challenge: [u8; 32],
+        record: &[u8],
+    ) -> loki_relay_protocol::nonce::ClaimProof {
+        use loki_relay_protocol::nonce::{self, ClaimProof, Claimant};
+        let claimant = Claimant {
+            vault,
+            slot: self.id,
+            key: self.signing.verifying_key().to_bytes(),
+        };
+        let signature = self
+            .signing
+            .sign(&nonce::claim_input(
+                claimant,
+                &route.pin,
+                route.mailbox,
+                cid,
+                challenge,
+                record,
+            ))
+            .to_bytes();
+        ClaimProof {
+            claimant,
+            signature,
         }
     }
 }

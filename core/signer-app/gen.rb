@@ -4,7 +4,7 @@ Dir.chdir(__dir__)
 proj_path = File.join(__dir__, 'LokiSigner.xcodeproj')
 project = Xcodeproj::Project.new(proj_path)
 target = project.new_target(:application, 'LokiSigner', :osx, '13.0')
-target.add_file_references(%w[Sources/main.swift Sources/Native.swift Sources/PromptPage.swift Sources/VaultAddresses.swift Sources/Recovery.swift].map { |path| project.new_file(path) })
+target.add_file_references(%w[Sources/main.swift Sources/Native.swift Sources/PromptPage.swift Sources/VaultAddresses.swift Sources/Recovery.swift Sources/SignerStatus.swift Sources/SignerLog.swift].map { |path| project.new_file(path) })
 backend = project.new_file('libs/libse_backend.dylib')
 embed = target.new_copy_files_build_phase('Embed Enclave backend')
 embed.dst_subfolder_spec = '10'

@@ -18,6 +18,7 @@ pub enum AdmissionError {
     Quota,
     Malformed,
     Storage,
+    StorageBusy,
     Unavailable,
 }
 impl AdmissionError {
@@ -30,7 +31,7 @@ impl AdmissionError {
             Self::Terminal => "terminal",
             Self::Quota => "quota",
             Self::Malformed => "malformed",
-            Self::Storage => "storage",
+            Self::Storage | Self::StorageBusy => "storage",
             Self::Unavailable => "unavailable",
         }
     }
@@ -47,8 +48,16 @@ impl From<WireError> for AdmissionError {
     }
 }
 impl From<rusqlite::Error> for AdmissionError {
-    fn from(_: rusqlite::Error) -> Self {
-        Self::Storage
+    fn from(error: rusqlite::Error) -> Self {
+        use rusqlite::ErrorCode;
+        match error.sqlite_error_code() {
+            Some(
+                ErrorCode::DatabaseBusy
+                | ErrorCode::DatabaseLocked
+                | ErrorCode::FileLockingProtocolFailed,
+            ) => Self::StorageBusy,
+            _ => Self::Storage,
+        }
     }
 }
 impl From<std::io::Error> for AdmissionError {

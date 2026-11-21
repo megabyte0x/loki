@@ -3,13 +3,13 @@
 # every artifact on stdout (build logs go to stderr):
 #   - native: loki_member_app (relay-communication), the packaged member binary
 #     (communication/deploy/run-member.sh MEMBER_BIN)
-#   - browser: the loki-signer-wasm wasm-pack bundle (web/wallet/scripts/copy-signer.mjs)
+#   - browser: the signer origin's build-hash.json manifest (static files and both wasm packages)
 #
-#   core/scripts/repro-build.sh > SHA256SUMS
+#   core/scripts/repro-build.sh > signer.manifest
 #
 # Same OS + arch + toolchain => same hashes, whatever the checkout path or user. See
 # docs/product/AUDIT_SCOPE.md §3. Needs: rustup with 1.95.0 (+ wasm32-unknown-unknown),
-# wasm-pack 0.15.1, network (crates.io, wasm-bindgen download). Uncommitted changes are
+# wasm-pack 0.15.1, Node.js 24, network (crates.io, wasm-bindgen download). Uncommitted changes are
 # not built.
 set -euo pipefail
 exec 3>&1 1>&2
@@ -31,8 +31,11 @@ flags="--remap-path-prefix=$build=/build -C codegen-units=1"
 cd "$build/src/core"
 RUSTFLAGS="$flags" cargo build --release --locked --features relay-communication --bin loki_member_app
 # --no-opt: skip wasm-opt, a separately downloaded binaryen this build does not pin.
-RUSTFLAGS="$flags --cfg getrandom_backend=\"wasm_js\"" \
-  wasm-pack build loki-signer-wasm --release --no-opt --target web --out-dir "$build/wasm-pkg" -- --locked
+for crate in loki-signer-wasm wasm-transport; do
+  RUSTFLAGS="$flags --cfg getrandom_backend=\"wasm_js\"" \
+    wasm-pack build "$crate" --release --no-opt --target web -- --locked
+done
 
 cd "$build"
-find target/release/loki_member_app wasm-pkg -type f | LC_ALL=C sort | xargs shasum -a 256 >&3
+shasum -a 256 target/release/loki_member_app >&3
+node src/core/loki-signer-wasm/serve.mjs --hash >&3

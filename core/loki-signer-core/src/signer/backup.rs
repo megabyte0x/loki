@@ -24,14 +24,17 @@ use crate::signer::local::{ApprovalPolicy, LocalSigner, SignerError};
 use crate::signer::nonce::NonceStore;
 use crate::signer::secure_element::{SealedShare, SecureElement, SoftwareSecureElement};
 use crate::signer::Network;
+use crate::setup_transport::Identity;
 use crate::zip2005;
+use reddsa_frost::frost::redpallas as frost;
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use zeroize::Zeroizing;
 
 const BACKUP_MAGIC: &[u8; 8] = b"LOKIBAK2";
-/// Magic for a recovery-sealed artifact: same plaintext as [`BACKUP_MAGIC`], but HPKE-sealed
-/// to a words-derived recovery public key instead of a passphrase KEK.
-const RECOVERY_BACKUP_MAGIC: &[u8; 8] = b"LOKIRCV1";
+const LEGACY_RECOVERY_MAGIC: &[u8; 8] = b"LOKIRCV1";
+const RECOVERY_BACKUP_MAGIC: &[u8; 8] = b"LOKIRCV2";
+const RECOVERY_SIGNATURE_DOMAIN: &[u8] = b"loki recovery backup signature v2\0";
 
 fn network_tag(n: Network) -> u8 {
     match n {
@@ -192,6 +195,21 @@ impl BackupMaterial {
 /// The share plaintext is never in these bytes — only AEAD ciphertext.
 pub struct BackupArtifact(pub Vec<u8>);
 
+impl BackupArtifact {
+    pub fn fingerprint(&self) -> String {
+        hex::encode(Sha256::digest(&self.0))
+    }
+
+    /// Compare with a fingerprint from the original signer or a known-good offline copy,
+    /// not with a fingerprint supplied alongside an untrusted backup.
+    pub fn check_fingerprint(&self, expected: &str) -> Result<(), String> {
+        if hex::decode(expected.trim()).ok().as_deref() != Some(&Sha256::digest(&self.0)[..]) {
+            return Err("backup does not match the independently saved SHA-256 fingerprint".into());
+        }
+        Ok(())
+    }
+}
+
 /// Argon2id salt for the backup KEK: the vault id (stable, non-secret, vault-scoped).
 fn backup_salt(vault_id: &[u8; 32]) -> &[u8] {
     vault_id
@@ -242,9 +260,19 @@ fn validate_material(material: BackupMaterial, vault_id: &[u8; 32]) -> Result<Ba
     if &material.vault_id != vault_id {
         return Err("backup is for a different vault".into());
     }
-    // Prove the share and public package actually parse and derive a valid FVK.
-    reddsa_frost::frost::redpallas::keys::KeyPackage::deserialize(&material.key_package)
+    let share = frost::keys::KeyPackage::deserialize(&material.key_package)
         .map_err(|e| format!("backup share does not parse: {e}"))?;
+    let public = frost::keys::PublicKeyPackage::deserialize(&material.public_package)
+        .map_err(|e| format!("backup public package does not parse: {e}"))?;
+    let id = frost::Identifier::try_from(material.member_id).map_err(|e| e.to_string())?;
+    let verifying_share = frost::keys::VerifyingShare::from(*share.signing_share());
+    if share.identifier() != &id || share.verifying_key() != public.verifying_key()
+        || share.min_signers() != &material.threshold || public.min_signers() != Some(material.threshold)
+        || public.verifying_shares().len() != usize::from(material.members)
+        || share.verifying_share() != &verifying_share
+        || public.verifying_shares().get(&id) != Some(&verifying_share) {
+        return Err("backup share differs from its public vault metadata".into());
+    }
     let ak = material.group_ak()?;
     zip2005::frost_viewing_key(&ak, &material.group_sk)
         .map_err(|e| format!("backup cannot derive the vault FVK: {e:?}"))?;
@@ -255,6 +283,9 @@ fn validate_material(material: BackupMaterial, vault_id: &[u8; 32]) -> Result<Ba
         if roster.fingerprint() != material.roster_fingerprint
             || roster.vault != material.vault_id
             || roster.birth_height != material.birth_height
+            || roster.threshold != material.threshold
+            || roster.members.len() != usize::from(material.members)
+            || roster.network.label() != match material.network { Network::Regtest => "regtest", Network::Testnet => "testnet" }
             || roster.members.get(&material.member_id) != Some(&identity.public())
         {
             return Err("backup identity or roster does not match".into());
@@ -297,8 +328,9 @@ fn rebuild_signer<SE: SecureElement>(
     let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk)
         .map_err(|e| SignerError::Other(format!("FVK derivation: {e:?}")))?;
     // Fresh nonce epoch: strictly greater than the backed-up epoch.
-    let next_epoch = material.backup_epoch + 1;
-    let nonces = NonceStore::open_at_epoch(&nonce_dir, next_epoch)
+    let next_epoch = material.backup_epoch.checked_add(1)
+        .ok_or_else(|| SignerError::Other("backup epoch overflow".into()))?;
+    let nonces = NonceStore::open_at_epoch(&nonce_dir, next_epoch, material.vault_id, material.member_id)
         .map_err(|e| SignerError::Other(e.to_string()))?;
     let identity = if material.identity.is_empty() {
         None
@@ -335,10 +367,18 @@ pub fn create_to_recovery(
     material: &BackupMaterial,
     recovery_pub: &[u8; 32],
 ) -> Result<BackupArtifact, String> {
+    if material.roster.is_empty() {
+        return Err("this backup has no roster to authenticate its author".into());
+    }
+    let author = Identity::from_secret_bytes(&material.identity)?;
+    let mut signed = Zeroizing::new(RECOVERY_SIGNATURE_DOMAIN.to_vec());
+    signed.extend_from_slice(&material.encode_plaintext());
+    let signature = author.sign_recovery_backup(&signed);
+    signed.extend_from_slice(&signature);
     let blob = crate::signer::recovery::seal_backup(
         recovery_pub,
         &material.vault_id,
-        &material.encode_plaintext(),
+        &signed[RECOVERY_SIGNATURE_DOMAIN.len()..],
     )?;
     let mut out = Vec::with_capacity(8 + blob.len());
     out.extend_from_slice(RECOVERY_BACKUP_MAGIC);
@@ -346,18 +386,36 @@ pub fn create_to_recovery(
     Ok(BackupArtifact(out))
 }
 
-/// VERIFY a recovery-sealed artifact with the words-derived recovery key (same validation as
-/// the passphrase [`verify`]). Wrong words (different key) or a tampered blob -> `Err`.
+/// Open and validate recovery material. V1 has no author signature. V2 proves that the
+/// embedded member signed the payload, but does not establish that the member or vault is
+/// trusted. Importers must independently authenticate the artifact before installing it.
 pub fn verify_recovery(
     artifact: &BackupArtifact,
     recovery: &crate::signer::recovery::RecoveryKey,
     vault_id: &[u8; 32],
 ) -> Result<BackupMaterial, String> {
-    if artifact.0.len() < 8 || &artifact.0[..8] != RECOVERY_BACKUP_MAGIC {
-        return Err("not a Loki recovery backup artifact".into());
-    }
+    let signed = match artifact.0.get(..8) {
+        Some(magic) if magic == RECOVERY_BACKUP_MAGIC => true,
+        Some(magic) if magic == LEGACY_RECOVERY_MAGIC => false,
+        _ => return Err("not a Loki recovery backup artifact".into()),
+    };
     let plain = recovery.open_backup(vault_id, &artifact.0[8..])?;
-    let material = BackupMaterial::decode_plaintext(&plain)?;
+    let material = if signed {
+        let (payload, sig) = plain.split_at(plain.len().checked_sub(64).ok_or("truncated recovery signature")?);
+        let material = BackupMaterial::decode_plaintext(payload)?;
+        let author = Identity::from_secret_bytes(&material.identity)?.public();
+        let key = ed25519_dalek::VerifyingKey::from_bytes(&author.signing).map_err(|e| e.to_string())?;
+        let mut message = Zeroizing::new(RECOVERY_SIGNATURE_DOMAIN.to_vec());
+        message.extend_from_slice(payload);
+        key.verify_strict(&message, &ed25519_dalek::Signature::from_bytes(sig.try_into().unwrap()))
+            .map_err(|_| "invalid recovery backup signature")?;
+        material
+    } else {
+        BackupMaterial::decode_plaintext(&plain)?
+    };
+    if material.backup_epoch.checked_add(1).is_none() {
+        return Err("backup epoch overflow".into());
+    }
     validate_material(material, vault_id)
 }
 
@@ -370,10 +428,12 @@ pub fn restore_recovery<SE: SecureElement>(
     artifact: &BackupArtifact,
     recovery: &crate::signer::recovery::RecoveryKey,
     vault_id: &[u8; 32],
+    expected_fingerprint: &str,
     se: SE,
     nonce_dir: PathBuf,
     approval: ApprovalPolicy,
 ) -> Result<LocalSigner<SE>, SignerError> {
+    artifact.check_fingerprint(expected_fingerprint).map_err(SignerError::Other)?;
     let material = verify_recovery(artifact, recovery, vault_id).map_err(SignerError::Other)?;
     rebuild_signer(material, se, nonce_dir, approval)
 }
@@ -429,8 +489,18 @@ mod tests {
     #[test]
     fn recovery_artifact_restores_a_signing_share_from_the_words() {
         use crate::signer::recovery::RecoveryKey;
-        let (material, public) = fixture();
+        let (mut material, public) = fixture();
         let vault_id = material.vault_id;
+        let ids: Vec<_> = (1..=3).map(Identity::new).collect();
+        material.identity = Zeroizing::new(ids[0].to_secret_bytes().to_vec());
+        material.roster = serde_json::to_vec(&serde_json::json!({
+            "vault": hex::encode(vault_id), "threshold": 2, "setup_version": 2,
+            "members": ids.iter().map(|i| serde_json::json!({
+                "id": i.public().id, "signing": hex::encode(i.public().signing),
+                "encryption": hex::encode(i.public().encryption),
+            })).collect::<Vec<_>>(),
+        })).unwrap();
+        material.roster_fingerprint = crate::member_state::Roster::from_bytes(&material.roster).unwrap().fingerprint();
 
         // First launch: words + recovery key. Back up to the PUBLIC key only.
         let (words, key) = RecoveryKey::generate().unwrap();
@@ -452,11 +522,13 @@ mod tests {
             &art,
             &restored_key,
             &vault_id,
+            &art.fingerprint(),
             SoftwareSecureElement::generate(),
             tempdir("recovery-nonces"),
             Box::new(|_v| true),
         )
         .unwrap();
+        signer.adopt_restored_roster(&material.roster, Box::new(|_, _| true)).unwrap();
 
         let ak: [u8; 32] = public.verifying_key().serialize().unwrap().try_into().unwrap();
         let fvk = zip2005::frost_viewing_key(&ak, &material.group_sk).unwrap();
@@ -584,7 +656,7 @@ mod tests {
 
         // --- Pre-restore signer (epoch 3): commit a nonce, capturing its sealed file. ---
         let old_nonce_dir = tempdir("old-nonces");
-        let pre = NonceStore::open_at_epoch(&old_nonce_dir, 3).unwrap();
+        let pre = NonceStore::open_at_epoch(&old_nonce_dir, 3, vault_id, material.member_id).unwrap();
         let cand = CandidateRef {
             vault_id,
             payment_id: [1u8; 32],
@@ -598,7 +670,7 @@ mod tests {
             s
         };
         let pre_se = SoftwareSecureElement::generate();
-        pre.commit(&nonce_id, &pre_se, key1.signing_share())
+        pre.commit(&nonce_id, &pre_se, key1.signing_share(), None)
             .unwrap();
         assert_eq!(pre.state(&nonce_id), NonceState::Committed);
 

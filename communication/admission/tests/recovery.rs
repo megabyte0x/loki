@@ -138,8 +138,14 @@ fn setup_storage_quota_is_per_relay_and_purpose() {
     assert!(store.apply(&state, None, 2592101).is_ok());
 }
 
-/// Rewrite a current root's schema back to the version-1 bounds (at most 4 members).
+/// Rewrite a current root's schema back to version 1 (at most 4 members).
 fn narrow_to_version_one(external: &rusqlite::Connection) {
+    external
+        .execute_batch(
+            "DROP INDEX operations_ceremony_slot; DROP INDEX mailboxes_payment_relay;
+        ALTER TABLE operations DROP COLUMN slot; ALTER TABLE mailboxes DROP COLUMN payment_state;",
+        )
+        .unwrap();
     let version: i64 = external
         .query_row("PRAGMA schema_version", [], |r| r.get(0))
         .unwrap();
@@ -177,7 +183,7 @@ fn terminal_notice_schema_migrates_only_unversioned_legacy_roots() {
     let version: u64 = external
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     external
         .execute_batch("DROP TABLE terminal_notices;")
         .unwrap();
@@ -220,7 +226,7 @@ fn version_one_root_widens_in_place_for_larger_vaults() {
     let version: u64 = external
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     let kept: u16 = external
         .query_row(
             "SELECT member_count FROM ceremonies WHERE id=?1",

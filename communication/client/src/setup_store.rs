@@ -14,6 +14,8 @@ use std::{
 const SCHEMA: &str = include_str!("setup_store.sql");
 const DEFERRED_SCHEMA: &str =
     "CREATE TABLE deferred (hash BLOB PRIMARY KEY REFERENCES objects(hash)) STRICT;\n";
+const PENDING_ROOTS_SCHEMA: &str =
+    "CREATE TABLE pending_roots (hash BLOB PRIMARY KEY REFERENCES objects(hash), expires_ms INTEGER NOT NULL CHECK(expires_ms>0)) STRICT;\n";
 const BUDGET: u64 = 256 * 1024 * 1024;
 /// Stores made before vaults grew past 4 members bound recipients at 4.
 const NARROW_RECIPIENT: &str = "recipient BETWEEN 1 AND 4)";
@@ -149,19 +151,21 @@ impl SetupStore {
             File::open(&path)?.sync_all()?;
         }
         if crate::store::validate_schema(&c, SCHEMA).is_err() {
-            // Earlier stores: recipients bounded at 4 members, and before that no
-            // `deferred` table. Check the association before changing anything.
-            let narrow = SCHEMA.replace(WIDE_RECIPIENT, NARROW_RECIPIENT);
+            // Recognize exact previous catalogs before adding derived pending work.
+            let previous = SCHEMA.strip_suffix(PENDING_ROOTS_SCHEMA).ok_or(ClientError::Storage)?;
+            let narrow = previous.replace(WIDE_RECIPIENT, NARROW_RECIPIENT);
             let without_deferred =
                 |schema: &str| schema.strip_suffix(DEFERRED_SCHEMA).map(str::to_owned);
-            let (deferred, widen) = if crate::store::validate_schema(&c, &narrow).is_ok() {
+            let (deferred, widen) = if crate::store::validate_schema(&c, previous).is_ok() {
+                (true, false)
+            } else if crate::store::validate_schema(&c, &narrow).is_ok() {
                 (true, true)
             } else if without_deferred(&narrow)
                 .is_some_and(|legacy| crate::store::validate_schema(&c, &legacy).is_ok())
             {
                 (false, true)
             } else {
-                let legacy = without_deferred(SCHEMA).ok_or(ClientError::Storage)?;
+                let legacy = without_deferred(previous).ok_or(ClientError::Storage)?;
                 crate::store::validate_schema(&c, &legacy)?;
                 (false, false)
             };
@@ -173,15 +177,16 @@ impl SetupStore {
             if saved != association(transport)? {
                 return Err(ClientError::Identity);
             }
-            if !deferred {
-                let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                tx.execute_batch(DEFERRED_SCHEMA)?;
-                tx.commit()?;
-            }
             if widen {
                 crate::store::widen_checks(&mut c, NARROW_RECIPIENT, WIDE_RECIPIENT)?;
             }
-            crate::store::validate_schema(&c, SCHEMA)?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if !deferred {
+                tx.execute_batch(DEFERRED_SCHEMA)?;
+            }
+            tx.execute_batch(PENDING_ROOTS_SCHEMA)?;
+            crate::store::validate_schema(&tx, SCHEMA)?;
+            tx.commit()?;
         }
         let saved: Vec<u8> = c.query_row(
             "SELECT association FROM metadata WHERE singleton=1",

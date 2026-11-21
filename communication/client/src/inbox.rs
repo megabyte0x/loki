@@ -1688,6 +1688,7 @@ fn authenticate_staged_with_limit(
     if !roster.members.iter().any(|member| member == &public) {
         return Err(ClientError::Identity);
     }
+    store.retire_incomplete()?;
     let mut opened = Vec::new();
     discover_objects(store, roster, identity, &mut opened, admission_limit)?;
     complete_staged(store, roster, identity, &mut opened)?;
