@@ -860,30 +860,60 @@ fn send_control_on(tx: &mut FrostdTransport, v: &Vault<impl Sized>, p: &Payment,
 
 // Only roster-owned control sessions are drained. Signing sessions have ephemeral owners.
 fn sync_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault) -> Result<(), String> {
-    let result = sync_control_inner(st, data, pass, vault, v, None);
-    match &result {
-        Ok(()) => native_event!(st, Event::RelayReachable),
-        Err(_) => {
-            eprintln!("vault {vault}: frostd control receive error");
-            if !st.is_stopping() { native_event!(st, Event::RelayUnavailable); }
-        }
-    }
-    result
+    // The background loop (`control_round`) reports the relay's state; this may skip a round.
+    sync_control_inner(st, data, pass, vault, v, None).inspect_err(|_| {
+        eprintln!("vault {vault}: frostd control receive error");
+    })
 }
 
 fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
     target: Option<(&FrostdTransport, &Payment)>,
 ) -> Result<(), String> {
+    let lock = control_receiver(st, vault)?;
+    // `/receive` drains the mailbox, so one receiver per vault at a time keeps every batch whole
+    // and applied in order. A caller that finds another receiver busy skips: that receiver
+    // applies the messages. Never wait here: callers may hold `st.payment`, which the background
+    // receiver takes after this lock.
+    let Ok(_receiving) = lock.try_lock() else { return Ok(()) };
+    let (batches, fetch_error) = fetch_control(st, v, target);
+    apply_control(st, data, pass, vault, v, batches)?;
+    fetch_error.map_or(Ok(()), Err)
+}
+
+/// The per-vault lock held by whoever is receiving that vault's control messages.
+fn control_receiver(st: &AppState, vault: &str) -> Result<Arc<std::sync::Mutex<()>>, String> {
+    Ok(st.control_receivers.lock().map_err(|e| e.to_string())?.entry(vault.to_owned()).or_default().clone())
+}
+
+/// Control messages drained from one roster-owned session.
+struct ControlBatch {
+    session: Uuid,
+    proposer: u16,
+    messages: Vec<crate::transport::Incoming>,
+}
+
+/// The network half of a control sync: lists this member's sessions and drains the roster-owned
+/// ones. Takes no payment lock. Batches already drained are returned with any later error, because
+/// the relay never delivers them twice.
+fn fetch_control(st: &AppState, v: &Vault, target: Option<(&FrostdTransport, &Payment)>) -> (Vec<ControlBatch>, Option<String>) {
+    let mut batches = Vec::new();
     let mut lease = None;
     let (tx, sessions) = if let Some((tx, p)) = target {
         // This mailbox and its roster owner were authenticated when the terms were stored.
-        (tx, vec![p.control_session_id.ok_or("missing payment control session")?])
+        let Some(session) = p.control_session_id else { return (batches, Some("missing payment control session".into())) };
+        (tx, vec![session])
     } else {
-        let tx = lease.insert(RelayLease::take(st, &v.identity)?).transport();
-        (tx, tx.list_sessions().map_err(|e| e.to_string())?)
+        let tx = match RelayLease::take(st, &v.identity) {
+            Ok(relay) => lease.insert(relay).transport(),
+            Err(e) => return (batches, Some(e)),
+        };
+        match tx.list_sessions() {
+            Ok(sessions) => (tx, sessions),
+            Err(e) => return (batches, Some(e.to_string())),
+        }
     };
     for session in sessions {
-        if st.is_stopping() { return Err("profile is locked".into()); }
+        if st.is_stopping() { return (batches, Some("profile is locked".into())); }
         let (proposer, timeout) = if let Some((_, p)) = target {
             (p.proposer, Duration::from_secs(2))
         } else {
@@ -898,8 +928,20 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
             }
             (proposer.id, Duration::from_secs(30))
         };
-        let batch = tx.recv_control_bounded(session, timeout).map_err(|e| e.to_string())?;
-        for msg in batch {
+        match tx.recv_control_bounded(session, timeout) {
+            Ok(messages) => batches.push(ControlBatch { session, proposer, messages }),
+            Err(e) => return (batches, Some(e.to_string())),
+        }
+    }
+    if let Some(lease) = lease { lease.keep(); }
+    (batches, None)
+}
+
+/// Applies drained control messages to this member's payment records. Runs under `st.payment`.
+fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault, batches: Vec<ControlBatch>) -> Result<(), String> {
+    for ControlBatch { session, proposer, messages } in batches {
+        if st.is_stopping() { return Err("profile is locked".into()); }
+        for msg in messages {
             let Some(peer) = v
                 .peers
                 .values()
@@ -1094,7 +1136,6 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
             }
         }
     }
-    if let Some(lease) = lease { lease.keep(); }
     Ok(())
 }
 
@@ -2542,6 +2583,89 @@ fn watch_chain(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), 
     Ok(())
 }
 
+/// The background control sync's state for one vault, as the wallet shows it.
+#[derive(Clone, Default)]
+pub(super) struct ControlStatus {
+    in_progress: bool,
+    last_ok_at: Option<u64>,
+    last_error: Option<&'static str>,
+}
+
+fn control_status(st: &AppState, vault: &str) -> Value {
+    let status = st.control_status.lock().ok().and_then(|all| all.get(vault).cloned()).unwrap_or_default();
+    json!({"in_progress": status.in_progress, "last_ok_at": status.last_ok_at, "last_error": status.last_error})
+}
+
+fn set_control_status(st: &AppState, vault: &str, change: impl FnOnce(&mut ControlStatus)) {
+    if let Ok(mut all) = st.control_status.lock() { change(all.entry(vault.to_owned()).or_default()); }
+}
+
+/// How often the background loop drains a vault's control mailbox.
+const CONTROL_EVERY: Duration = Duration::from_secs(3);
+
+/// Keeps this vault's control messages flowing while the profile is unlocked: discovers new
+/// requests, applies approvals and notices, and restarts payment workers. The wallet's polls only
+/// read local state, so a click never waits behind relay traffic.
+fn watch_control(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<(), String> {
+    let key = format!("control/{vault}");
+    if !st.active_payments.lock().map_err(|e| e.to_string())?.insert(key.clone()) {
+        return Ok(());
+    }
+    let st = st.clone();
+    let data = data.to_owned();
+    let pass = Zeroizing::new(pass.to_owned());
+    let vault = vault.to_owned();
+    tokio::spawn(async move {
+        let _active = ActivePayment { st: &st, key };
+        while !st.is_stopping() && st.session.read().await.is_some() {
+            let (state, data, pass, id) = (st.clone(), data.clone(), pass.clone(), vault.clone());
+            if tokio::task::spawn_blocking(move || control_round(&state, &data, &pass, &id)).await.is_err() { break; }
+            tokio::select! {
+                _ = st.wait_for_stop() => break,
+                _ = tokio::time::sleep(CONTROL_EVERY) => {},
+            }
+        }
+    });
+    Ok(())
+}
+
+/// One background sync: drain the mailbox without the payment lock, apply under it, then make
+/// sure every local payment has its worker.
+fn control_round(st: &Shared, data: &Path, pass: &str, vault: &str) {
+    set_control_status(st, vault, |s| s.in_progress = true);
+    let result = (|| {
+        let v = load_vault(st, data, pass, vault)?;
+        let fetch_error = {
+            let lock = control_receiver(st, vault)?;
+            let _receiving = lock.lock().map_err(|e| e.to_string())?;
+            let (batches, fetch_error) = fetch_control(st, &v, None);
+            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+            apply_control(st, data, pass, vault, &v, batches)?;
+            fetch_error
+        };
+        restore_workers(st, data, pass, vault, v.slot)?;
+        fetch_error.map_or(Ok(()), Err)
+    })();
+    let stopping = st.is_stopping();
+    match &result {
+        Ok(()) => native_event!(st, Event::RelayReachable),
+        Err(_) if stopping => {}
+        Err(_) => {
+            eprintln!("vault {vault}: frostd control receive error");
+            native_event!(st, Event::RelayUnavailable);
+        }
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    set_control_status(st, vault, |s| {
+        s.in_progress = false;
+        match result {
+            Ok(()) => { s.last_ok_at = Some(now); s.last_error = None; }
+            Err(_) if stopping => {}
+            Err(_) => s.last_error = Some("relay_unavailable"),
+        }
+    });
+}
+
 fn chain_watch_round(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<bool, String> {
     let in_flight = {
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
@@ -2722,11 +2846,8 @@ pub(super) async fn payments(
     };
     blocking(move || {
         let v = load_vault(&st, &data, &pass, &vault)?;
-        {
-            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-            let _ = sync_control(&st, &data, &pass, &vault, &v);
-        }
-        restore_workers(&st, &data, &pass, &vault, v.slot)?;
+        // Relay traffic runs in the background loop; this only reads local state.
+        watch_control(&st, &data, &pass, &vault)?;
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let all = all_payments(&data, &pass, &vault)?;
         let active = st.active_payments.lock().map_err(|e| e.to_string())?.clone();
@@ -2753,7 +2874,7 @@ pub(super) async fn payments(
                 "error": p.error, "failure_reason": p.failure_reason,
             }));
         }
-        Ok(json!({"payments":out, "chain_trust": PROVIDER_REPORTED}))
+        Ok(json!({"payments":out, "chain_trust": PROVIDER_REPORTED, "sync": control_status(&st, &vault)}))
     }).await
 }
 
@@ -2810,13 +2931,10 @@ pub(super) async fn pending(
     blocking(move || {
         // load_vault authorizes the caller as a member of this vault before listing anything.
         let v = load_vault(&st, &data, &pass, &vault)?;
-        {
-            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-            sync_control(&st, &data, &pass, &vault, &v)?;
-        }
-        restore_workers(&st, &data, &pass, &vault, v.slot)?;
+        // Discovery of new requests runs in the background loop; this only reads local state.
+        watch_control(&st, &data, &pass, &vault)?;
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-        Ok(json!({"pending": pending_for(&data, &pass, &vault, v.slot)?}))
+        Ok(json!({"pending": pending_for(&data, &pass, &vault, v.slot)?, "sync": control_status(&st, &vault)}))
     })
     .await
 }
@@ -2838,10 +2956,11 @@ pub(super) async fn status(
     blocking(move || {
         let v = load_vault(&st, &data, &pass, &vault)?;
         ensure_worker(&st, &data, &pass, &vault, &attempt, v.slot)?;
+        watch_control(&st, &data, &pass, &vault)?;
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-        let _ = sync_control(&st, &data, &pass, &vault, &v);
         let p = read_payment(&data, &pass, &vault, &attempt)?;
         Ok(json!({
+            "sync": control_status(&st, &vault),
             "phase": reported_phase(&p),
             "chain_trust": PROVIDER_REPORTED,
             "approvals":p.approvals,"error":p.error,"failure_reason":p.failure_reason,"approval_requested":p.approval_requested,
