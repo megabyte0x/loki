@@ -215,7 +215,7 @@ function browserSigner(origin: string): SignerModule {
     },
     async request<T>(pathAndQuery: string, body?: unknown): Promise<T> {
       const [path, query] = pathAndQuery.split("?");
-      const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string };
+      const args = { ...Object.fromEntries(new URLSearchParams(query ?? "")), ...(body as object) } as { vault?: string; attempt?: string; proposer?: string | number };
       if (path === "status") {
         const s = await call<{ profile: { id: string; name: string }; se: string; persisted: boolean | null; relay: string; network: "testnet" | "regtest" }>("status");
         // The signer's own vaults (OPFS). Refused while a join/payment holds the signer; the
@@ -232,7 +232,9 @@ function browserSigner(origin: string): SignerModule {
       // Payments other members proposed: list them, read one's announced terms, and approve it.
       // Approving opens the signer page, which checks the transaction against those terms and
       // asks the member to confirm with a fresh passkey assertion (or the passphrase).
-      const payment = { vaultHex: args.vault, attemptHex: args.attempt };
+      const { proposer } = args;
+      const payment = { vaultHex: args.vault, attemptHex: args.attempt,
+        proposer: typeof proposer === "string" && /^[1-9]\d*$/.test(proposer) ? Number(proposer) : proposer };
       if (path === "pending") return { pending: await call("pending", payment) } as T;
       if (path === "payment-review" || path === "payment-approve") return call<T>(path, payment);
       if (path === "address") return { address: await call<string>("address", payment) } as T;
