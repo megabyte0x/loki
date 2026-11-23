@@ -551,6 +551,7 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         if register_once(st, pass.clone(), None, None).await.is_ok() { return Ok("restore-ready"); }
         *st.registration_error.write().await = Some(RESTORE_RETRY.into());
     }
+    st.set_first_registration(true);
     tokio::spawn(keep_registering(st.clone(), pass, restored, notice.filter(|_| native).cloned()));
     Ok(if restored { "restore-pending" } else { "ready" })
 }
@@ -644,10 +645,16 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
     // identity. If the uncompleted reservation expires, request a fresh link.
     let mut pairing_claim = st.config.registration.as_ref().and_then(|launch| launch.pairing_challenge.clone());
     if restored { tokio::time::sleep(wait).await; }
+    let mut warned = false;
     loop {
-        match register_once(&st, pass.clone(), pairing_claim.take(), None).await {
+        let result = register_once(&st, pass.clone(), pairing_claim.take(), None).await;
+        // The first attempt's Touch ID prompt has been answered: vault opens may prompt now.
+        st.set_first_registration(false);
+        match result {
             Ok(member) => {
                 eprintln!("Public roster slot: {}", member.slot);
+                // Clear a warning an earlier attempt left in the app.
+                if warned { if let Some(notice) = &notice { notice("registration-ok", ""); } }
                 return;
             }
             Err(e) => {
@@ -655,6 +662,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
                 let (key_message, roster_unreachable) = match &e {
                     RegistrationFailure::Device(DeviceKeyError::Enclave(key)) => {
                         if shown_key_errors.insert(*key) {
+                            warned = true;
                             if let Some(notice) = &notice {
                                 notice(if key.is_gone() { "registration-key-gone" } else { "registration-key" }, key.message());
                             }
@@ -687,7 +695,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
                 eprintln!("coordinator registration failed, retrying in {}s (the local signer keeps running): {}", wait.as_secs(), key_message.unwrap_or(&logged));
                 *st.registration_error.write().await = Some(reported.clone());
                 if key_message.is_none() && (!restored || roster_unreachable) {
-                    if let Some(notice) = warning.take() { notice("registration-warning", &reported); }
+                    if let Some(notice) = warning.take() { warned = true; notice("registration-warning", &reported); }
                 }
             }
         }

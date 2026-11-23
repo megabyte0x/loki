@@ -46,6 +46,14 @@ String _withUnit(Object? zats, {bool fixed = false}) {
   return value == '—' ? value : '$value TAZ';
 }
 
+/// Unix seconds as `YYYY-MM-DD HH:MM:SS UTC`, or null.
+String? _utc(Object? seconds) {
+  if (seconds is! int || seconds <= 0) return null;
+  final t = DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true);
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}:${two(t.second)} UTC';
+}
+
 String? _text(Object? value) =>
     value is String && value.isNotEmpty ? value : null;
 String? _id(Object? value) =>
@@ -1215,6 +1223,8 @@ class _HistoryPageState extends State<HistoryPage> {
           const Divider(height: 1),
           if (fee != null)
             ValueRow('Network fee', _withUnit(fee.toString()), mono: true),
+          if (_utc(payment['created_at']) case final created?)
+            ValueRow('Created', created, mono: true),
           if (confirmed && height is int && height > 0)
             ValueRow(
               'Block height',

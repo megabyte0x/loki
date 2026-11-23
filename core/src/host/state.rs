@@ -469,11 +469,30 @@ pub struct AppState {
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
+    /// True until the first registration attempt after unlock finishes. Its device-key Touch ID
+    /// prompt comes first; vault opens wait so two prompts never race (and cancel each other).
+    pub(super) first_registration: (std::sync::Mutex<bool>, std::sync::Condvar),
     /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
 impl AppState {
+    /// Marks whether the first registration attempt after unlock is still running.
+    pub(super) fn set_first_registration(&self, running: bool) {
+        let (lock, changed) = &self.first_registration;
+        if let Ok(mut flag) = lock.lock() { *flag = running; }
+        changed.notify_all();
+    }
+
+    /// Waits (at most `limit`) for the first registration attempt, so its Touch ID prompt is
+    /// answered before another one appears.
+    pub(super) fn after_first_registration(&self, limit: std::time::Duration) {
+        let (lock, changed) = &self.first_registration;
+        if let Ok(flag) = lock.lock() {
+            let _ = changed.wait_timeout_while(flag, limit, |running| *running && !self.is_stopping());
+        }
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -499,6 +518,7 @@ impl AppState {
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
             wallet_tabs: None,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
+            first_registration: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
             fetched_config: None,
         }
     }

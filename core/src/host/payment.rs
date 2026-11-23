@@ -117,6 +117,9 @@ struct Payment {
     /// Kept after settlement too: a reorg can make these exact bytes sendable again.
     #[serde(skip_serializing_if = "Option::is_none")]
     raw_tx: Option<String>,
+    /// When this member first recorded the payment (Unix seconds), for ordering and display.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_at: Option<u64>,
     /// The proposer sent every member its sealed copy of `raw_tx`.
     #[serde(default)]
     copies_sent: bool,
@@ -627,6 +630,20 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
 /// A replacement spends the note of the payment it replaces, and a Retry keeps its terms. A
 /// member that holds the replaced payment checks that; one that never saw it relies on the
 /// candidate review alone.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
+}
+
+/// When this member first recorded `p`: its own timestamp, or for an older record the file's
+/// creation time.
+fn created_at(data: &Path, p: &Payment) -> Option<u64> {
+    p.created_at.or_else(|| {
+        let file = payment_dir(data, &p.vault).ok()?.path().join(format!("{}.json", p.attempt));
+        let created = std::fs::metadata(file).ok()?.created().ok()?;
+        created.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+    })
+}
+
 /// The nullifiers of every note this payment spends.
 fn input_nullifiers(p: &Payment) -> Result<Vec<[u8; 32]>, String> {
     p.note_selection.iter().map(|n| hex32(n)).collect()
@@ -1146,6 +1163,7 @@ fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
                 {
                     let expiry = incoming.signing_expiry;
                     incoming.phase = "signing".into();
+                    incoming.created_at = Some(unix_now());
                     // Clear the unsigned proposal's claimed local state. A checked signed
                     // copy can also establish the expiry before the original notice arrives.
                     incoming.signers.clear();
@@ -1474,7 +1492,7 @@ fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value, v: Vault, mu
     let attempt = hex::encode(random);
     let note_selection = notes.iter().map(|note| hex::encode(note.nullifier(&v.fvk).to_bytes())).collect();
     // No signing group yet: the request is open to every member (`signing_group`).
-    let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, phase: "draft".into(), ..Default::default() };
+    let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, phase: "draft".into(), created_at: Some(unix_now()), ..Default::default() };
     check_intent(&p, &v)?;
     let nullifiers = input_nullifiers(&p)?;
     w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifiers, expiry)?;
@@ -2652,7 +2670,7 @@ pub(super) async fn replace(State(st): State<Shared>, Json(body): Json<Value>) -
         };
         let mut random = [0u8; 32];
         OsRng.fill_bytes(&mut random);
-        let p = Payment { attempt: hex::encode(random), vault: vault.clone(), proposer: v.slot, recipient, amount_zat, memo, fee_zat, change_zat, note_selection: old.note_selection.clone(), target_height: anchor, expiry_height: expiry, phase: "draft".into(), replaces: Some(Replaces { attempt: old.attempt.clone(), cancel }), ..Default::default() };
+        let p = Payment { attempt: hex::encode(random), vault: vault.clone(), proposer: v.slot, recipient, amount_zat, memo, fee_zat, change_zat, note_selection: old.note_selection.clone(), target_height: anchor, expiry_height: expiry, phase: "draft".into(), replaces: Some(Replaces { attempt: old.attempt.clone(), cancel }), created_at: Some(unix_now()), ..Default::default() };
         check_intent(&p, &v)?;
         check_replacement(&data, &pass, &v, &p)?;
         // The note stays reserved: `reconcile` keeps it so while either payment is in flight.
@@ -3000,8 +3018,11 @@ pub(super) async fn payments(
                 "target_height": p.target_height, "expiry_height": p.expiry_height,
                 "signing_expiry": p.signing_expiry, "tx_expiry": held_tx_expiry(&v, p),
                 "error": p.error, "failure_reason": p.failure_reason,
+                "created_at": created_at(&data, p),
             }));
         }
+        // Newest first.
+        out.sort_by_key(|row| std::cmp::Reverse(row["created_at"].as_u64().unwrap_or(0)));
         Ok(json!({"payments":out, "chain_trust": PROVIDER_REPORTED, "sync": control_status(&st, &vault)}))
     }).await
 }

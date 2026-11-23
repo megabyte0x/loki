@@ -134,6 +134,10 @@ pub(super) fn viewing_key(
     mode: VaultOpen,
     open: impl FnOnce() -> Result<SignerViewingKey, String>,
 ) -> Result<FullViewingKey, String> {
+    if !matches!(mode, VaultOpen::Payment) {
+        // One Touch ID prompt at a time: the signer's own registration prompt first.
+        st.after_first_registration(std::time::Duration::from_secs(90));
+    }
     let mut cache = st.viewing_keys.lock().map_err(|e| e.to_string())?;
     if let Some(Some(fvk)) = cache.get(vault) {
         return Ok(fvk.clone());
