@@ -1176,6 +1176,20 @@ async fn with_body(
     })
     .await
 }
+
+/// Like `with_body`, without `st.payment`: for work that only reads or scans the wallet, whose
+/// database has its own sync lock. The closure takes `st.payment` itself before touching payments.
+async fn with_body_unlocked(
+    st: Shared,
+    body: Value,
+    f: impl FnOnce(Shared, PathBuf, Zeroizing<String>, Value) -> Result<Value, String> + Send + 'static,
+) -> Reply {
+    let (data, pass) = match unlocked(&st).await {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    blocking(move || f(st, data, pass, body)).await
+}
 fn url(st: &Shared) -> Result<&str, String> {
     st.config
         .lightwalletd
@@ -1270,7 +1284,8 @@ fn reconcile(data: &Path, pass: &str, vault: &str, slot: u16, w: &mut VaultWalle
 }
 
 pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    with_body(st, body, |st, data, pass, body| {
+    // Reads the scanned wallet only, so a balance refresh never holds up payment work.
+    with_body_unlocked(st, body, |st, data, pass, body| {
         use super::custody::VaultOpen;
         let vault = required(&body, "vault")?;
         let mode = if body["retry_touch_id"].as_bool() == Some(true) { VaultOpen::Retry } else { VaultOpen::Read };
@@ -1294,8 +1309,8 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
 }
 
 pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
-    with_body(st, body, |st, data, pass, body| {
-        let result = draft_locked(&st, &data, &pass, &body);
+    with_body_unlocked(st, body, |st, data, pass, body| {
+        let result = draft_scanned(&st, &data, &pass, &body);
         if let Err(error) = &result { native_event!(&st, Event::DraftRefused(draft_refusal(error))); }
         result
     }).await
@@ -1325,10 +1340,20 @@ fn payment_fee(v: &Vault, w: &VaultWallet, note: orchard::note::Note) -> Result<
 
 pub(super) const NO_SINGLE_NOTE: &str = "payment needs one Ironwood note large enough for amount and fee";
 
-/// Runs under `st.payment`.
-fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
+/// Scans the wallet without `st.payment`, then prepares the draft under it, so a long lightwalletd
+/// scan never blocks approvals or status. Reconciling and reserving still happen under the lock,
+/// on the fresh scan.
+fn draft_scanned(st: &Shared, data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
     let vault = required(body, "vault")?;
     let v = load_vault(st, data, pass, vault)?;
+    let (w, _, _) = wallet(st, data, pass, vault, &v)?;
+    let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+    draft_locked(st, data, pass, body, v, w)
+}
+
+/// Runs under `st.payment`, on a freshly scanned wallet.
+fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value, v: Vault, mut w: VaultWallet) -> Result<Value, String> {
+    let vault = required(body, "vault")?;
     let recipient = required(body, "recipient")?;
     let address = vault::orchard_receiver_from_ua(recipient, v.network.network_type())?;
     let amount_zat: u64 = required(body, "amount_zat")?.parse().map_err(|_| "invalid amount_zat")?;
@@ -1336,7 +1361,6 @@ fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value) -> Result<Va
     let amount = Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?;
     let memo = body["memo"].as_str().unwrap_or("");
     let memo_bytes = MemoBytes::from_bytes(memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
-    let (mut w, _, _) = wallet(st, data, pass, vault, &v)?;
     // Refresh locally authorized reservations before selecting a note.
     let _ = sync_control(st, data, pass, vault, &v);
     reconcile(data, pass, vault, v.slot, &mut w)?;
