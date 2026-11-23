@@ -351,6 +351,15 @@ class _SendPageState extends State<SendPage> {
   String? _busy, _error;
   bool? _editAfterDiscard;
   bool _publishUncertain = false;
+  // What the vault can pay now, from the signer's local wallet (`balance`).
+  Json? _funds;
+  bool _fundsLoading = false, _fundsFailed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFunds();
+  }
 
   @override
   void didUpdateWidget(covariant SendPage oldWidget) {
@@ -363,6 +372,60 @@ class _SendPageState extends State<SendPage> {
     _busy = _error = null;
     _editAfterDiscard = null;
     _publishUncertain = false;
+    _funds = null;
+    _loadFunds();
+  }
+
+  Future<void> _loadFunds() async {
+    final vault = _text(widget.vault['vault']);
+    if (vault == null || _fundsLoading) return;
+    setState(() => _fundsLoading = true);
+    try {
+      final funds = await widget.request('balance', {'vault': vault});
+      if (!_current(vault)) return;
+      setState(() {
+        _funds = funds;
+        _fundsFailed = false;
+      });
+    } catch (_) {
+      if (_current(vault)) setState(() => _fundsFailed = true);
+    } finally {
+      if (_current(vault)) setState(() => _fundsLoading = false);
+    }
+  }
+
+  /// Why the entered amount can't be funded right now, or null if it can or
+  /// the amounts aren't known. The signer still decides when drafting.
+  String? _fundingBlock() {
+    final funds = _funds, entered = _amountZats(_amount.text);
+    if (funds == null || entered == null) return null;
+    final amount = BigInt.parse(entered),
+        max = _readZats(funds['max_payment_zat']),
+        fee = _readZats(funds['max_payment_fee_zat']) ?? BigInt.zero,
+        spendable = _readZats(funds['spendable_zat']),
+        total = _readZats(funds['balance_zat']),
+        pending = _readZats(funds['pending_zat']) ?? BigInt.zero,
+        reserved = _readZats(funds['reserved_zat']) ?? BigInt.zero;
+    if (max == null || spendable == null || total == null) return null;
+    if (amount <= max) return null;
+    final needed = amount + fee;
+    if (needed > total) {
+      return 'This is more than the vault holds. With the network fee it needs ${_withUnit(needed.toString())}; the vault holds ${_withUnit(total.toString())}.';
+    }
+    if (needed > spendable) {
+      final waiting = pending > BigInt.zero
+          ? '${_withUnit(pending.toString())} is still waiting for ${funds['confirmations_required'] ?? 'more'} confirmations'
+          : null;
+      final held = reserved > BigInt.zero
+          ? '${_withUnit(reserved.toString())} is held by an open payment'
+          : null;
+      final why = [waiting, held].whereType<String>().join(' and ');
+      return 'Not spendable yet${why.isEmpty ? '' : ': $why'}. Spendable now: ${_withUnit(spendable.toString())}.';
+    }
+    final inputs = funds['max_inputs'];
+    return inputs == 1
+        ? 'No single note covers this amount plus the network fee. The largest payment right now is ${_withUnit(max.toString())}.'
+        : 'A payment can combine at most $inputs notes. The largest payment right now is ${_withUnit(max.toString())}.';
   }
 
   @override
@@ -417,6 +480,7 @@ class _SendPageState extends State<SendPage> {
         setState(
           () => _error = walletErrorWith('Could not prepare the payment.', e),
         );
+        _loadFunds();
       }
     } finally {
       if (_current(vault)) setState(() => _busy = null);
@@ -562,9 +626,49 @@ class _SendPageState extends State<SendPage> {
     );
   }
 
+  Widget _funding() {
+    final funds = _funds;
+    if (funds == null) {
+      return _PaymentNote(
+        _fundsFailed
+            ? 'Could not read the spendable balance. The signer still checks funds when you prepare the draft.'
+            : 'Reading the spendable balance…',
+        error: _fundsFailed,
+      );
+    }
+    final spendable = _readZats(funds['spendable_zat']),
+        total = _readZats(funds['balance_zat']),
+        pending = _readZats(funds['pending_zat']) ?? BigInt.zero,
+        reserved = _readZats(funds['reserved_zat']) ?? BigInt.zero,
+        max = _readZats(funds['max_payment_zat']);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 8,
+      children: [
+        ValueRow('Spendable now', _withUnit(spendable?.toString()), mono: true),
+        if (total != spendable)
+          ValueRow('Total balance', _withUnit(total?.toString()), mono: true),
+        if (pending > BigInt.zero)
+          _PaymentNote(
+            '${_withUnit(pending.toString())} waiting for ${funds['confirmations_required'] ?? 'more'} confirmations.',
+          ),
+        if (reserved > BigInt.zero)
+          _PaymentNote(
+            '${_withUnit(reserved.toString())} held by an open payment.',
+          ),
+        if (max != null && spendable != null && max < spendable)
+          ValueRow('Largest payment now', _withUnit(max.toString()), mono: true),
+        _PaymentNote(
+          'As of block ${funds['scanned_height'] ?? '—'}, as reported by the chain provider.',
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final policy = _policy(widget.vault);
+    final block = _draft == null ? _fundingBlock() : null;
     final details = Surface(
       padding: const EdgeInsets.all(18),
       child: Column(
@@ -598,6 +702,16 @@ class _SendPageState extends State<SendPage> {
         children: [
           const LokiLabel('Transaction summary'),
           _AmountHeading(_amountZats(_amount.text), pending: true),
+          const Divider(height: 1),
+          _funding(),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ActionChipButton(
+              _fundsLoading ? 'Refreshing…' : 'Refresh balance',
+              Icons.refresh,
+              _fundsLoading || _busy != null ? null : _loadFunds,
+            ),
+          ),
           const Divider(height: 1),
           ValueRow('Network fee', _withUnit(_draft?['fee_zat']), mono: true),
           ValueRow('Change', _withUnit(_draft?['change_zat']), mono: true),
@@ -639,6 +753,7 @@ class _SendPageState extends State<SendPage> {
                 ),
         ),
         if (_error case final error?) _PaymentNote(error, error: true),
+        if (block != null && _error == null) _PaymentNote(block, error: true),
         if (_editAfterDiscard != null)
           _Confirmation(
             title: 'Discard this draft?',
@@ -674,7 +789,7 @@ class _SendPageState extends State<SendPage> {
                   _busy != null || _text(widget.vault['vault']) == null
                       ? null
                       : _draft == null
-                      ? _prepare
+                      ? (block == null ? _prepare : null)
                       : _hasQuote(_draft!)
                       ? _publish
                       : null,
