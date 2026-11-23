@@ -20,15 +20,15 @@ use rusqlite::{Connection, OptionalExtension};
 use zcash_address::ZcashAddress;
 use zcash_client_backend::{
     data_api::{
-        AccountBirthday, AccountPurpose, MaxSpendMode, OutputLockStore, WalletCommitmentTrees, WalletRead, WalletWrite,
+        AccountBirthday, AccountPurpose, InputSource, MaxSpendMode, OutputLockStore, TargetValue, WalletCommitmentTrees, WalletRead, WalletWrite,
         chain::{
             BlockCache, BlockSource, ChainState, error::Error as ScanError, scan_cached_blocks,
         },
         error::Error as FundingError,
         scanning::ScanRange,
         wallet::{
-            ConfirmationsPolicy, propose_send_max_transfer, propose_transfer,
-            input_selection::{GreedyInputSelector, LockedInputPolicy, NoteSelection, SpendPolicy},
+            ConfirmationsPolicy, TargetHeight, propose_send_max_transfer, propose_transfer,
+            input_selection::{GreedyInputSelector, LockFilter, LockedInputPolicy, NoteSelection, SpendPolicy},
         },
     },
     fees::{DustOutputPolicy, StandardFeeRule, zip317::SingleOutputChangeStrategy},
@@ -59,6 +59,23 @@ type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng
 
 /// The start of the draft error for funds that are not yet confirmed deeply enough to spend.
 pub const FUNDS_WAITING: &str = "Funds for this payment are waiting for confirmations.";
+
+/// What a vault can pay right now, read from the local wallet database only.
+#[derive(Debug, Clone)]
+pub struct Spendability {
+    /// Every unspent note, whatever its state.
+    pub total_zat: u64,
+    /// Confirmed to `confirmations_required` and not reserved by an open payment.
+    pub spendable_zat: u64,
+    /// Received but not spendable yet: waiting for confirmations or for scanning.
+    pub pending_zat: u64,
+    /// Held by this device's open payments.
+    pub reserved_zat: u64,
+    /// The notes behind `spendable_zat`, largest first.
+    pub spendable_notes: Vec<orchard::note::Note>,
+    pub confirmations_required: u32,
+    pub scanned_height: u32,
+}
 
 pub struct VaultWallet {
     db: Database,
@@ -663,6 +680,44 @@ impl VaultWallet {
                 sum.checked_add(note.note().value().inner())
                     .ok_or_else(|| "vault balance exceeds u64".to_string())
             })
+    }
+
+    /// Splits the vault's Ironwood funds into spendable now, waiting and reserved, using the same
+    /// confirmation policy and lock rules as payment funding.
+    pub fn spendability(&self) -> Result<Spendability, String> {
+        let policy = ConfirmationsPolicy::default();
+        let scanned_height = self.scanned_height()?.ok_or("wallet has no scanned balance yet")?;
+        let account = self.account()?;
+        let summary = self.db.get_wallet_summary(policy)
+            .map_err(|e| format!("read wallet balance: {e}"))?
+            .ok_or("wallet has no scanned balance yet")?;
+        let balance = summary.account_balances().get(&account).map(|a| *a.ironwood_balance());
+        let zat = |value: Option<Zatoshis>| value.map_or(0, |v| v.into_u64());
+        let tip = self.db.chain_height()
+            .map_err(|e| format!("read chain height: {e}"))?
+            .ok_or("wallet has no chain tip yet")?;
+        let exclude_locked = LockedInputPolicy::Exclude;
+        let selected = self.db.select_spendable_notes(
+            account,
+            TargetValue::AllFunds(MaxSpendMode::MaxSpendable),
+            &[ShieldedPool::Ironwood],
+            TargetHeight::from(tip + 1),
+            policy,
+            &[],
+            LockFilter::Policy(&exclude_locked),
+        ).map_err(|e| format!("read spendable notes: {e}"))?;
+        let mut spendable_notes: Vec<_> = selected.ironwood().iter().map(|note| *note.note()).collect();
+        spendable_notes.sort_by_key(|note| std::cmp::Reverse(note.value().inner()));
+        Ok(Spendability {
+            total_zat: zat(balance.map(|b| b.total())),
+            spendable_zat: zat(balance.map(|b| b.spendable_value())),
+            pending_zat: zat(balance.map(|b| b.value_pending_spendability()))
+                + zat(balance.map(|b| b.change_pending_confirmation())),
+            reserved_zat: zat(balance.map(|b| b.locked_value())),
+            spendable_notes,
+            confirmations_required: policy.untrusted().get(),
+            scanned_height,
+        })
     }
 
     pub fn ironwood_note_count(&self, height: BlockHeight) -> Result<usize, String> {

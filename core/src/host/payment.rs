@@ -1167,7 +1167,19 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
         let mode = if body["retry_touch_id"].as_bool() == Some(true) { VaultOpen::Retry } else { VaultOpen::Read };
         let v = load_vault_for_view(&st, &data, &pass, vault, mode)?;
         let (w, _, _) = wallet(&st, &data, &pass, vault, &v)?;
-        Ok(json!({"balance_zat": w.ironwood_balance_zat()?, "chain_trust": PROVIDER_REPORTED}))
+        let s = w.spendability()?;
+        let largest = s.spendable_notes.first().copied();
+        // The hosted signer spends one note per payment, so the largest note bounds a payment.
+        let fee = largest.map(|note| payment_fee(&v, &w, note)).transpose()?;
+        let max_payment = largest.zip(fee).map_or(0, |(note, fee)| note.value().inner().saturating_sub(fee));
+        Ok(json!({
+            "balance_zat": s.total_zat, "spendable_zat": s.spendable_zat,
+            "pending_zat": s.pending_zat, "reserved_zat": s.reserved_zat,
+            "largest_note_zat": largest.map_or(0, |note| note.value().inner()),
+            "max_inputs": MAX_INPUTS, "max_payment_zat": max_payment, "max_payment_fee_zat": fee,
+            "confirmations_required": s.confirmations_required, "scanned_height": s.scanned_height,
+            "chain_trust": PROVIDER_REPORTED,
+        }))
     })
     .await
 }
@@ -1190,6 +1202,18 @@ fn draft_refusal(error: &str) -> super::diagnostics::DraftRefusal {
     }
 }
 
+/// Notes one hosted payment can spend.
+const MAX_INPUTS: usize = 1;
+
+/// The ZIP-317 fee of a payment spending `note`, priced by the same builder as the draft.
+fn payment_fee(v: &Vault, w: &VaultWallet, note: orchard::note::Note) -> Result<u64, String> {
+    let (anchor, expiry) = heights(w, v)?;
+    let own = v.fvk.address_at(0u64, orchard::keys::Scope::External);
+    let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![note], recipient: own, amount: Zatoshis::ZERO,
+        memo: MemoBytes::empty(), change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
+    Ok(quote_fee(&v.network, &inputs)?.into())
+}
+
 pub(super) const NO_SINGLE_NOTE: &str = "payment needs one Ironwood note large enough for amount and fee";
 
 /// Runs under `st.payment`.
@@ -1208,14 +1232,27 @@ fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value) -> Result<Va
     let _ = sync_control(st, data, pass, vault, &v);
     reconcile(data, pass, vault, v.slot, &mut w)?;
     let (anchor, expiry) = heights(&w, &v)?;
-    let funding = w.propose_with_confirmation_wait(address, Some(amount), memo_bytes.clone(), st.config.native)?;
-    let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
-    let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
-    let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
-    let note = funding.notes.iter().find(|note| note.value().inner() >= amount_zat.saturating_add(fee_zat))
-        .ok_or(NO_SINGLE_NOTE)?;
+    // Pick from every spendable, unreserved note (largest first), not only from the notes the
+    // wallet's multi-note selector would choose: the smallest one that covers amount and fee.
+    let spendable = w.spendability()?.spendable_notes;
+    let covering = |fee_zat: u64| spendable.iter().rev()
+        .find(|note| note.value().inner() >= amount_zat.saturating_add(fee_zat)).copied();
+    let quoted = match spendable.first() {
+        Some(note) => {
+            let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![*note], recipient: address, amount, memo: memo_bytes.clone(), change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
+            let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
+            covering(fee_zat).map(|note| (note, fee_zat))
+        }
+        None => None,
+    };
+    let Some((note, fee_zat)) = quoted else {
+        // Explain why: funds still confirming, or too little in total; otherwise only a
+        // multi-note payment could fund it.
+        w.propose_with_confirmation_wait(address, Some(amount), memo_bytes, st.config.native)?;
+        return Err(NO_SINGLE_NOTE.into());
+    };
+    let note = &note;
     let change_zat = note.value().inner().checked_sub(amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("note cannot cover amount and fee")?;
-    if funding.notes.len() == 1 && (funding.fee_zat != fee_zat || funding.change_zat != change_zat) { return Err("wallet funding differs from candidate fee or change".into()); }
     let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
     let attempt = hex::encode(random);
     let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
