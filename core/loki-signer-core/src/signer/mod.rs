@@ -189,6 +189,23 @@ pub struct CandidateRef {
     pub attempt_id: [u8; 32],
 }
 
+/// The signing reference for spend `spend` of hosted payment `attempt`. Spend 0 is the attempt
+/// itself (so a one-note payment keeps its nonce file name); later spends derive their own
+/// `attempt_id`, so every spend has its own single-use nonce id (`payment_id ‖ attempt_id`).
+/// The native host and the browser co-signer both derive it here.
+pub fn hosted_spend_ref(vault_id: [u8; 32], attempt: [u8; 32], spend: usize) -> CandidateRef {
+    let attempt_id = if spend == 0 {
+        attempt
+    } else {
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"Loki_hosted_spend_v1\0");
+        hash.update(&attempt);
+        hash.update(&(spend as u32).to_be_bytes());
+        *hash.finalize().as_bytes()
+    };
+    CandidateRef { vault_id, payment_id: attempt, attempt_id }
+}
+
 /// The PUBLIC payment effects the coordinator hands a signer to build an unsigned
 /// candidate. No viewing key, no note, no spend authority — just where the money goes,
 /// how much, the memo, and the validity window. The signer selects its own notes and

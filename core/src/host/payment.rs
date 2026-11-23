@@ -164,7 +164,7 @@ fn record_peer_failure(p: &mut Payment, peer: u16, native: bool, body: &Value) {
     } else {
         format!("Member {peer} refused or failed to complete this signing attempt.")
     };
-    p.error = Some(format!("{reason} Any member can replace it with a request that spends the same note."));
+    p.error = Some(format!("{reason} Any member can replace it with a request that spends the same notes."));
 }
 
 pub(super) struct Vault<Fvk = FullViewingKey> {
@@ -630,20 +630,8 @@ fn input_nullifiers(p: &Payment) -> Result<Vec<[u8; 32]>, String> {
 /// One signing reference per spent note. The first is the attempt itself; the others are derived
 /// from it, so every spend has its own single-use nonce id (`payment_id ‖ attempt_id`).
 fn spend_refs(p: &Payment) -> Result<Vec<CandidateRef>, String> {
-    let vault_id = hex32(&p.vault)?;
-    let attempt = hex32(&p.attempt)?;
-    Ok((0..p.note_selection.len()).map(|spend| {
-        let attempt_id = if spend == 0 {
-            attempt
-        } else {
-            let mut hash = blake3::Hasher::new();
-            hash.update(b"Loki_hosted_spend_v1\0");
-            hash.update(&attempt);
-            hash.update(&(spend as u32).to_be_bytes());
-            *hash.finalize().as_bytes()
-        };
-        CandidateRef { vault_id, payment_id: attempt, attempt_id }
-    }).collect())
+    let (vault_id, attempt) = (hex32(&p.vault)?, hex32(&p.attempt)?);
+    Ok((0..p.note_selection.len()).map(|spend| crate::signer::hosted_spend_ref(vault_id, attempt, spend)).collect())
 }
 
 fn check_replacement(data: &Path, pass: &str, v: &Vault, p: &Payment) -> Result<(), String> {
@@ -1670,7 +1658,7 @@ fn ensure_worker_with_signer(
     }
     if !finish && p.approval_started {
         p.phase = "failed".into();
-        p.error = Some("Signing was interrupted. Discard it if no share was released; otherwise replace it with a request that spends the same note.".into());
+        p.error = Some("Signing was interrupted. Discard it if no share was released; otherwise replace it with a request that spends the same notes.".into());
         save_payment(data, pass, &p)?;
         if let Ok(v) = load_vault(&st, data, pass, vault) {
             let _ = send_control(st, &v, &p, "failed", &members(&v));

@@ -95,7 +95,7 @@ String paymentPhase(Json payment) {
     'replaced' => 'Replaced',
     'spent_unverified' => 'Input spent · payment unverified',
     'failed' => 'Failed',
-    'discarding' => 'Releasing reserved input',
+    'discarding' => 'Releasing reserved notes',
     'cancelled' => 'Cancelled',
     'expired' => 'Expired',
     _ => 'Status unavailable',
@@ -758,7 +758,7 @@ class _SendPageState extends State<SendPage> {
           _Confirmation(
             title: 'Discard this draft?',
             message: const _PaymentNote(
-              'This releases the draft’s reserved input without sending it. You can prepare a new draft afterward.',
+              'This releases the draft’s reserved notes without sending it. You can prepare a new draft afterward.',
             ),
             action: 'Discard draft',
             confirm: _discardDraft,
@@ -964,13 +964,13 @@ class _HistoryPageState extends State<HistoryPage> {
         'Request cancellation',
         'Request approvals',
         'Discard draft',
-        'Propose spending the same note back to the vault, less the network fee. Your vault’s approval policy still applies.',
+        'Propose spending the same notes back to the vault, less the network fee. Your vault’s approval policy still applies.',
       ),
       _ => (
         'Retry payment',
         'Request approvals',
         'Discard draft',
-        'Propose paying the same recipient again using the same note. Your vault’s approval policy still applies.',
+        'Propose paying the same recipient again using the same notes. Your vault’s approval policy still applies.',
       ),
     };
     final vault = widget.vault!;
@@ -1004,7 +1004,7 @@ class _HistoryPageState extends State<HistoryPage> {
         if (draft != null)
           const _ReviewNotice(
             'The original payment may confirm first',
-            'Both transactions spend the same note, so only one can be mined. Requesting approvals does not stop the original payment.',
+            'Both transactions spend the same notes, so only one can be mined. Requesting approvals does not stop the original payment.',
             warning: true,
           ),
         _PaymentDetails(
@@ -1051,7 +1051,7 @@ class _HistoryPageState extends State<HistoryPage> {
           )
         else
           const _ReviewNotice(
-            'Releases the reserved input',
+            'Releases the reserved notes',
             'Discarding releases this payment’s reservation on the input. Nothing is sent.',
             warning: true,
           ),
@@ -1241,7 +1241,7 @@ class _HistoryPageState extends State<HistoryPage> {
             ),
           if (replaces != null)
             _PaymentNote(
-              '${replaces['cancel'] == true ? 'Cancellation' : 'Retry'} of payment ${_short(_text(replaces['attempt']) ?? 'request')}. Both spend the same note.',
+              '${replaces['cancel'] == true ? 'Cancellation' : 'Retry'} of payment ${_short(_text(replaces['attempt']) ?? 'request')}. Both spend the same notes.',
             ),
           if (!settled && payment['approvals'] is List)
             _ApprovalStatus(vault, payment),
@@ -1764,7 +1764,7 @@ class _PaymentReviewState extends State<PaymentReview> {
                   color: colors.gold,
                 ),
                 _PaymentNote(
-                  'Replaces ${_short(_text(replaces['attempt']) ?? 'an earlier payment')}. Both proposals spend the same note, so at most one can be mined.',
+                  'Replaces ${_short(_text(replaces['attempt']) ?? 'an earlier payment')}. Both proposals spend the same notes, so at most one can be mined.',
                 ),
                 if (_readZats(replaces['amount_zat']) != null)
                   ValueRow(

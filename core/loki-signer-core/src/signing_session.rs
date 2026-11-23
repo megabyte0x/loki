@@ -2045,3 +2045,22 @@ impl AttemptStore {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod hosted_body_tests {
+    use super::*;
+
+    #[test]
+    fn hosted_bodies_carry_one_to_eight_whole_values_and_nothing_else() {
+        let items = vec![vec![1u8; 32], vec![2u8; 5]];
+        let body = encode_hosted(&items).unwrap();
+        assert_eq!(decode_hosted(&body).unwrap(), vec![&items[0][..], &items[1][..]]);
+        assert!(encode_hosted(&[]).is_err());
+        assert!(encode_hosted(&vec![vec![0u8]; MAX_SPENDS + 1]).is_err());
+        // A relay cannot smuggle extra bytes, a truncated value, or a zero or oversized count.
+        assert!(decode_hosted(&[body.clone(), vec![0]].concat()).is_none());
+        assert!(decode_hosted(&body[..body.len() - 1]).is_none());
+        assert!(decode_hosted(&[0]).is_none());
+        assert!(decode_hosted(&[MAX_SPENDS as u8 + 1, 0, 0]).is_none());
+    }
+}

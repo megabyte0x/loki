@@ -65,8 +65,8 @@ async function loadFrostd() {
 // Claim this signature's nonce at BOTH external witnesses (fresh, pinned-key receipts verified
 // in wasm-transport), then tell the signer; the core's witness check in signApprove accepts
 // only that claim. A duplicate at either relay (a nonce already used) refuses the signature.
-async function claimAtWitnesses(signer, witnesses, attemptHex, packageHex, seedHex, sighashHex) {
-  const { cid, record, pins } = JSON.parse(signer.nonceClaim(attemptHex, packageHex, seedHex, sighashHex));
+async function claimAtWitnesses(signer, witnesses, attemptHex, spend, packageHex, seedHex, sighashHex) {
+  const { cid, record, pins } = JSON.parse(signer.nonceClaim(attemptHex, spend, packageHex, seedHex, sighashHex));
   const routes = pins.map((pin) => witnesses.find((w) =>
     ["key", "run", "mailbox"].every((field) => w[field].toLowerCase() === pin[field])));
   if (routes.some((w) => !w)) throw new Error("An original nonce witness is missing; start a new signing attempt");
@@ -741,17 +741,29 @@ async function drivePayment(signer, p, witnessPinsPath) {
   const fc = await frostdClient(signer, p);
   fc.useSession(terms.session_id);
 
-  // Pre-open this attempt's crash-safe nonce files (name = payment_id ++ attempt_id hex; the
-  // native host sets both to the attempt), so the synchronous commit/sign can persist.
-  const nonceId = attemptHex + attemptHex;
+  // One spend per input note, each with its own single-use nonce. Pre-open every spend's
+  // crash-safe nonce files (name = payment_id ++ attempt_id hex, derived as the native host
+  // does), so the synchronous commit/sign can persist.
+  const spends = terms.note_selection.length;
+  if (!Number.isInteger(spends) || spends < 1 || spends > 8) throw new Error("this payment spends an unsupported number of notes");
+  const spendIndexes = Array.from({ length: spends }, (_, i) => i);
   const dir = `loki/vaults/${await vaultPathId(vaultHex)}/signer`;
-  await opfsPreopenWrite(`${dir}/nonces/${nonceId}.nonce`);
-  await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
+  for (const i of spendIndexes) {
+    const nonceId = signer.spendNonceId(attemptHex, i);
+    await opfsPreopenWrite(`${dir}/nonces/${nonceId}.nonce`);
+    await opfsPreopenWrite(`${dir}/nonces/${nonceId}.burn`);
+  }
 
   const signersCsv = signers.join(",");
   const seal = (body, share) => signer.sealSigning(coordinator.signing, coordinator.encryption, signersCsv, attemptHex, body, share);
+  const perSpend = (bodyHex) => {
+    const values = JSON.parse(signer.hostedDecode(bodyHex));
+    if (values.length !== spends) throw new Error("the coordinator sent a different number of spends");
+    return values;
+  };
   await refresh();
-  await fc.sendToCoordinator(seal(signer.signCommit(attemptHex), false));
+  const commitments = spendIndexes.map((i) => signer.signCommit(attemptHex, i));
+  await fc.sendToCoordinator(seal(signer.hostedEncode(JSON.stringify(commitments)), false));
 
   // Accept one authenticated message of each expected kind, regardless of delivery order.
   const received = new Map();
@@ -769,13 +781,14 @@ async function drivePayment(signer, p, witnessPinsPath) {
     if (received.size === 3) break;
     await sleep(pollMs);
   }
-  const candidateHex = received.get("candidate"), packageHex = received.get("package"), seedHex = received.get("seed");
-  if (!candidateHex || !packageHex || !seedHex) {
+  const candidateHex = received.get("candidate"), packagesHex = received.get("package"), seedsHex = received.get("seed");
+  if (!candidateHex || !packagesHex || !seedsHex) {
     throw new Error("payment signing messages did not arrive before the deadline");
   }
+  const packages = perSpend(packagesHex), seeds = perSpend(seedsHex);
 
   // The signer's own parse of the candidate must be exactly the approved terms (network,
-  // expiry, the one input note, recipient, amount, memo, change, fee) — refused otherwise,
+  // expiry, the input notes, recipient, amount, memo, change, fee) — refused otherwise,
   // before the member is even asked. Then the member confirms that parse on the signer page
   // with a fresh passkey assertion (or the passphrase again), and signApprove releases the
   // share only for the sighash the member confirmed.
@@ -787,9 +800,14 @@ async function drivePayment(signer, p, witnessPinsPath) {
   await refresh();
   signer.reauth(consent.method, consent.passphrase, consent.prfSecret);
   await paymentRecord(key, { ...record, txid });
-  await claimAtWitnesses(signer, p.nonceWitnesses, attemptHex, packageHex, seedHex, review.sighash);
-  const share = signer.signApprove(attemptHex, candidateHex, packageHex, seedHex, review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry }));
-  await fc.sendToCoordinator(seal(share, true));
+  // Claim every spend's nonce at both witnesses before any share is made, then sign each spend
+  // under the one consent (every spend signs the same confirmed sighash).
+  for (const i of spendIndexes) {
+    await claimAtWitnesses(signer, p.nonceWitnesses, attemptHex, i, packages[i], seeds[i], review.sighash);
+  }
+  const shares = spendIndexes.map((i) =>
+    signer.signApprove(attemptHex, i, candidateHex, packages[i], seeds[i], review.sighash, JSON.stringify({ ...terms, tx_expiry: expiry })));
+  await fc.sendToCoordinator(seal(signer.hostedEncode(JSON.stringify(shares)), true));
   // Keep a terms-only approval or an interrupted share send retryable in the wallet.
   await paymentRecord(key, { approved: true, txid });
   return { approved: true, signed: true, review };
