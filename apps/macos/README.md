@@ -55,6 +55,16 @@ open "$app" --args --peer 1=https://creator-peer.example
 
 For legacy invites the joiner must configure the exact creator origin with `--peer`, even if that origin is also its paired coordinator. A pasted invite cannot set a new network destination. The Runner also accepts `--data /absolute/path` to select a different local profile. Quit the app before changing launch flags. Relay invites need none of these flags.
 
+### Several members on one Mac (testnet)
+
+To test a 2-of-3 vault alone, run one LokiSigner process per member profile:
+
+```sh
+apps/macos/scripts/run-members.sh 3   # or APP=/path/to/loki_signer.app apps/macos/scripts/run-members.sh 3
+```
+
+Member 1 uses the default profile and members 2 and up use `~/Library/Application Support/LokiSigner-memberN`. Once paired, each window is titled **LokiSigner — Member N** in Mission Control, the Window menu and the Dock. Each profile folder can be open in only one process at a time: a second LokiSigner on the same `--data` folder refuses to pair or unlock and says the profile is already open. The lock file sits next to the folder (`<folder>.lock`).
+
 ### Opening invite links in the app (operator setup)
 
 Pasting the link into **Join vault** always works. Opening `https://<coordinator>/#invite=…` directly in LokiSigner additionally needs a verified association between the coordinator's domain and a signed build; this repository does not ship one, and self-hosted coordinators without it keep using paste. There is deliberately no custom URL scheme for invites, because any app could claim it. To associate a domain you operate:
