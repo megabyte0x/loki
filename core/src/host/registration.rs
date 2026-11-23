@@ -559,7 +559,7 @@ const PAIRING_PENDING: &str = "pairing-registration-pending";
 
 /// True while a native pairing has written its profile but the coordinator never accepted the
 /// registration (for example, the pairing link expired). Such a profile has no recovery words yet.
-#[cfg(feature = "relay-communication")]
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) fn pairing_pending(data: &std::path::Path) -> bool {
     data.join(PAIRING_PENDING).exists()
 }

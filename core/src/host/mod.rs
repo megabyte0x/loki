@@ -43,7 +43,7 @@ pub use state::Config;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use connect::{ConnectAttempt, LocalConnect};
 pub use registration::RegistrationConfig;
-#[cfg(feature = "relay-communication")]
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use registration::pairing_pending;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
