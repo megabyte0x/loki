@@ -158,6 +158,19 @@ digest=$(printf '%s' "$grant" | openssl dgst -sha256 -r)
 export LOKI_ONBOARDING_GRANTS="{\"${digest%% *}\":null}"
 ```
 
+Grants can also live in the coordinator registry, which needs no restart. Use the same registry
+path as the coordinator:
+
+```sh
+LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts add [--slot N] [--origin https://wallet.example]
+LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts list    # digest prefix, slot, unused/pending/used
+LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts prune   # drop used grants
+```
+
+`add` prints the bearer (or the wallet link with `#onboarding=`) once and stores only its digest.
+At most 16 registry grants can be unused at once; pruning a used grant keeps its use recorded, so it
+can never admit again. `LOKI_ONBOARDING_GRANTS` remains for scripted test stacks.
+
 Share `${grant}` privately with the new member, not the digest. For the wallet, append
 `#onboarding=<grant>` to the wallet URL; the page holds it in memory after reading it.
 For headless onboarding, set `LOKI_ONBOARDING_GRANT` before running `join-loki.sh`.
@@ -276,9 +289,16 @@ LOKI_FROSTD_URL=http://127.0.0.1:2744 npm run signer   # signer origin  → http
 npm run dev                                           # wallet         → http://localhost:3001
 ```
 
-`next dev` points at `http://localhost:3002` by default. A production build **must** set
-`NEXT_PUBLIC_SIGNER_ORIGIN`. Without it, every signer call fails. There is no mock fallback in a
-browser.
+`next dev` points at `http://localhost:3002` by default. A production deploy **must** set
+`LOKI_SIGNER_ORIGIN` in the coordinator's environment. It is read at request time and rendered into
+the page, so moving the signer needs a restart, not a rebuild. `NEXT_PUBLIC_SIGNER_ORIGIN`, inlined
+at build, is still honoured as a fallback. Without either, every signer call fails. There is no
+mock fallback in a browser.
+
+`serve.mjs` listens on `127.0.0.1` unless `LOKI_SIGNER_HOST` says otherwise, so publish it through a
+reverse proxy or tunnel on the same host. It needs `core/loki-signer-wasm/pkg`; the browser relay
+transport (`core/wasm-transport/pkg`) is served only when it was built, which a deployment with
+only LokiSigner members can skip.
 
 What a deploy must provide on the signer server (`serve.mjs` env):
 
@@ -303,8 +323,7 @@ or inclusion. Use a lightwalletd backed by a node you trust for balances and min
 
 The coordinator (this app) serves the same values to the native signer at
 `GET /api/signer-config`: network, frostd, lightwalletd and the witnesses, read from
-`${NEXT_PUBLIC_SIGNER_ORIGIN}/config.json` on each request (the origin is inlined at build time,
-as for the browser signer). Nothing is copied into the wallet's own configuration. The route answers 502 with an error when the signer origin is unset,
+`${LOKI_SIGNER_ORIGIN}/config.json` on each request. Nothing is copied into the wallet's own configuration. The route answers 502 with an error when the signer origin is unset,
 unreachable, redirects, or serves a configuration it cannot validate, and it never serves
 mainnet. LokiSigner shows these values when it pairs and saves them (see
 `core/signer-app/README.md`).

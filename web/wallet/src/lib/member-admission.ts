@@ -27,20 +27,27 @@ export function grantDigest(value: unknown): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-function onboardingGrants(): [string, number | null][] {
+/** Grant digests and their pinned slot (`null` = lowest free slot), as stored in the registry. */
+export type RegisteredGrants = Record<string, number | null>;
+
+/** The grants the operator added with `scripts/grants.ts` (kept in the registry, so a new grant
+ *  needs no restart), plus any in LOKI_ONBOARDING_GRANTS for scripted test stacks. */
+function onboardingGrants(registered: RegisteredGrants): [string, number | null][] {
   const data: unknown = JSON.parse(process.env.LOKI_ONBOARDING_GRANTS ?? "{}");
   if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid onboarding configuration");
-  const grants = Object.entries(data);
-  if (grants.length > MAX_SLOT || grants.some(([key]) => !DIGEST.test(key))) throw new Error("invalid onboarding configuration");
-  return grants.map(([key, value]) => [key, value === null ? null : registrationSlot(value)]);
+  const configured = Object.entries(data);
+  if (configured.length > MAX_SLOT || configured.some(([key]) => !DIGEST.test(key))) throw new Error("invalid onboarding configuration");
+  const grants = new Map<string, number | null>(configured.map(([key, value]) => [key, value === null ? null : registrationSlot(value)]));
+  for (const [key, slot] of Object.entries(registered)) grants.set(key, slot);
+  return [...grants];
 }
 
-export function grantedSlot(digest: string): number | undefined {
-  const found = onboardingGrants().find(([key]) => key === digest);
+export function grantedSlot(digest: string, registered: RegisteredGrants): number | undefined {
+  const found = onboardingGrants(registered).find(([key]) => key === digest);
   if (!found) throw new Error("a valid onboarding grant is required");
   return found[1] ?? undefined;
 }
 
-export function otherPinnedSlots(digest: string): number[] {
-  return onboardingGrants().flatMap(([key, slot]) => key !== digest && slot !== null ? [slot] : []);
+export function otherPinnedSlots(digest: string, registered: RegisteredGrants): number[] {
+  return onboardingGrants(registered).flatMap(([key, slot]) => key !== digest && slot !== null ? [slot] : []);
 }
