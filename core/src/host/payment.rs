@@ -875,9 +875,30 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
     // applies the messages. Never wait here: callers may hold `st.payment`, which the background
     // receiver takes after this lock.
     let Ok(_receiving) = lock.try_lock() else { return Ok(()) };
-    let (batches, fetch_error) = fetch_control(st, v, target);
+    let (batches, fetch_error) = fetch_control(st, vault, v, target, &BTreeSet::new());
     apply_control(st, data, pass, vault, v, batches)?;
     fetch_error.map_or(Ok(()), Err)
+}
+
+/// Control sessions of payments that can't change any more. Their notices no longer matter, so
+/// the background sync stops draining them; frostd drops them 24 hours after their last message.
+/// A failed payment is still read until it expires, since a member may yet report on it.
+fn final_control_sessions(data: &Path, pass: &str, vault: &str) -> Result<BTreeSet<Uuid>, String> {
+    Ok(all_payments(data, pass, vault)?.iter()
+        .filter(|p| settled(p) && p.phase != "spent_unverified")
+        .filter_map(|p| p.control_session_id)
+        .collect())
+}
+
+/// The roster member who owns `session` if it is this vault's control mailbox: owned by a roster
+/// member, with exactly the roster as participants.
+fn control_owner(v: &Vault, participants: &[[u8; 32]], owner: [u8; 32]) -> Option<u16> {
+    let proposer = v.peers.values().find(|p| p.encryption == owner)?;
+    (participants.len() == v.peers.len()
+        && participants.contains(&v.identity.public().encryption)
+        && participants.contains(&owner)
+        && participants.iter().all(|k| v.peers.values().any(|p| &p.encryption == k)))
+        .then_some(proposer.id)
 }
 
 /// The per-vault lock held by whoever is receiving that vault's control messages.
@@ -895,7 +916,9 @@ struct ControlBatch {
 /// The network half of a control sync: lists this member's sessions and drains the roster-owned
 /// ones. Takes no payment lock. Batches already drained are returned with any later error, because
 /// the relay never delivers them twice.
-fn fetch_control(st: &AppState, v: &Vault, target: Option<(&FrostdTransport, &Payment)>) -> (Vec<ControlBatch>, Option<String>) {
+fn fetch_control(st: &AppState, vault: &str, v: &Vault, target: Option<(&FrostdTransport, &Payment)>,
+    skip: &BTreeSet<Uuid>,
+) -> (Vec<ControlBatch>, Option<String>) {
     let mut batches = Vec::new();
     let mut lease = None;
     let (tx, sessions) = if let Some((tx, p)) = target {
@@ -908,7 +931,12 @@ fn fetch_control(st: &AppState, v: &Vault, target: Option<(&FrostdTransport, &Pa
             Err(e) => return (batches, Some(e)),
         };
         match tx.list_sessions() {
-            Ok(sessions) => (tx, sessions),
+            Ok(sessions) => {
+                if let Ok(mut known) = st.control_sessions.lock() {
+                    known.retain(|(id, session), _| id != vault || sessions.contains(session));
+                }
+                (tx, sessions)
+            }
             Err(e) => return (batches, Some(e.to_string())),
         }
     };
@@ -917,16 +945,21 @@ fn fetch_control(st: &AppState, v: &Vault, target: Option<(&FrostdTransport, &Pa
         let (proposer, timeout) = if let Some((_, p)) = target {
             (p.proposer, Duration::from_secs(2))
         } else {
-            let Ok((participants, Some(owner))) = tx.session_details(session) else { continue };
-            let Some(proposer) = v.peers.values().find(|p| p.encryption == owner) else { continue };
-            if participants.len() != v.peers.len()
-                || !participants.contains(&v.identity.public().encryption)
-                || !participants.contains(&owner)
-                || !participants.iter().all(|k| v.peers.values().any(|p| &p.encryption == k))
-            {
-                continue;
-            }
-            (proposer.id, Duration::from_secs(30))
+            if skip.contains(&session) { continue; }
+            let key = (vault.to_owned(), session);
+            let known = st.control_sessions.lock().ok().and_then(|known| known.get(&key).copied());
+            let owner = match known {
+                Some(owner) => owner,
+                None => {
+                    // An unreadable session is retried next round rather than remembered.
+                    let Ok((participants, owner)) = tx.session_details(session) else { continue };
+                    let owner = owner.and_then(|owner| control_owner(v, &participants, owner));
+                    if let Ok(mut known) = st.control_sessions.lock() { known.insert(key, owner); }
+                    owner
+                }
+            };
+            let Some(proposer) = owner else { continue };
+            (proposer, Duration::from_secs(30))
         };
         match tx.recv_control_bounded(session, timeout) {
             Ok(messages) => batches.push(ControlBatch { session, proposer, messages }),
@@ -2662,7 +2695,11 @@ fn control_round(st: &Shared, data: &Path, pass: &str, vault: &str) {
         let fetch_error = {
             let lock = control_receiver(st, vault)?;
             let _receiving = lock.lock().map_err(|e| e.to_string())?;
-            let (batches, fetch_error) = fetch_control(st, &v, None);
+            let skip = {
+                let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+                final_control_sessions(data, pass, vault)?
+            };
+            let (batches, fetch_error) = fetch_control(st, vault, &v, None, &skip);
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
             apply_control(st, data, pass, vault, &v, batches)?;
             fetch_error

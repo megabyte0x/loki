@@ -447,6 +447,9 @@ pub struct AppState {
     pub(super) control_receivers: std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
     /// Per vault: the background control sync's state, reported to the wallet.
     pub(super) control_status: std::sync::Mutex<BTreeMap<String, super::payment::ControlStatus>>,
+    /// Per (vault, frostd session): the roster member who owns it, or `None` for a session that
+    /// isn't this vault's control mailbox. A session's owner and members never change.
+    pub(super) control_sessions: std::sync::Mutex<BTreeMap<(String, uuid::Uuid), Option<u16>>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
     pub(super) join_relay: std::sync::atomic::AtomicBool,
@@ -485,6 +488,7 @@ impl AppState {
             relays: std::sync::Mutex::new(BTreeMap::new()),
             control_receivers: std::sync::Mutex::new(BTreeMap::new()),
             control_status: std::sync::Mutex::new(BTreeMap::new()),
+            control_sessions: std::sync::Mutex::new(BTreeMap::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             join_relay: std::sync::atomic::AtomicBool::new(false),
             device_auth: std::sync::Mutex::new(None),
