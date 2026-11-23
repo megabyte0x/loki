@@ -89,6 +89,8 @@ class _WalletState extends State<_Wallet> {
   bool get canRecoverWalletKey =>
       macApi != null && profile['can_recover_wallet_key'] == true;
   bool get hasNativeFeedback => nativeStatus != null || canRecoverWalletKey;
+  // The profile was written but the coordinator never accepted its registration.
+  bool get pairingPending => profile['pairing_pending'] == true;
   bool get waitingForPreview =>
       previewRequestGeneration == generation && nativePrompt != true;
   int generation = 0;
@@ -207,7 +209,8 @@ class _WalletState extends State<_Wallet> {
       final current = await api.profile();
       if (!mounted || locking || epoch != generation) return;
       if (current['can_recover_wallet_key'] !=
-          profile['can_recover_wallet_key']) {
+              profile['can_recover_wallet_key'] ||
+          current['pairing_pending'] != profile['pairing_pending']) {
         setState(() => profile = current);
       }
       if (current['running'] != true) {
@@ -990,23 +993,7 @@ class _WalletState extends State<_Wallet> {
                   ],
                 ),
                 if (enteringLink)
-                  TextFormField(
-                    initialValue: pairingLink,
-                    autofocus: true,
-                    readOnly: busy,
-                    obscureText: true,
-                    autocorrect: false,
-                    enableSuggestions: false,
-                    style: lokiMono(13),
-                    onChanged: (text) => setState(() {
-                      pairingLink = text;
-                      actionError = null;
-                    }),
-                    decoration: const InputDecoration(
-                      hintText: 'Paste pairing link',
-                      prefixIcon: Icon(Icons.link, size: 17),
-                    ),
-                  )
+                  pairingLinkField()
                 else ...[
                   Text(
                     '01   Pair a new signer',
@@ -1061,15 +1048,7 @@ class _WalletState extends State<_Wallet> {
                 busy || (enteringLink && pairingLink.trim().isEmpty)
                     ? null
                     : enteringLink
-                    ? () {
-                        // The link is one-use: don't keep it once it has been submitted.
-                        final link = pairingLink.trim();
-                        setState(() {
-                          pairingLink = '';
-                          enteringLink = false;
-                        });
-                        act(() => api.pair(link));
-                      }
+                    ? submitPairingLink
                     : () => setState(() {
                         enteringLink = true;
                         actionError = null;
@@ -1082,6 +1061,82 @@ class _WalletState extends State<_Wallet> {
       ),
     );
   }
+
+  /// The one place a pairing link is typed, for a fresh profile or one whose
+  /// registration never finished. The link is one-use and is not kept.
+  Widget pairingLinkField() => TextFormField(
+    initialValue: pairingLink,
+    autofocus: true,
+    readOnly: busy,
+    obscureText: true,
+    autocorrect: false,
+    enableSuggestions: false,
+    style: lokiMono(13),
+    onChanged: (text) => setState(() {
+      pairingLink = text;
+      actionError = null;
+    }),
+    decoration: const InputDecoration(
+      hintText: 'Paste pairing link',
+      prefixIcon: Icon(Icons.link, size: 17),
+    ),
+  );
+
+  void submitPairingLink() {
+    final link = pairingLink.trim();
+    setState(() {
+      pairingLink = '';
+      enteringLink = false;
+    });
+    act(() => api.pair(link));
+  }
+
+  Widget unfinishedPairing() => Column(
+    crossAxisAlignment: CrossAxisAlignment.stretch,
+    spacing: 10,
+    children: [
+      const Notice(
+        'This Mac’s registration with the coordinator didn’t finish. If the pairing link expired, ask the wallet for a new link for the same slot and paste it here.',
+      ),
+      if (enteringLink) pairingLinkField(),
+      Wrap(
+        alignment: WrapAlignment.end,
+        spacing: 8,
+        runSpacing: 8,
+        children: [
+          if (macApi case final mac? when !enteringLink)
+            ActionChipButton(
+              'Remove this profile',
+              Icons.delete_outline,
+              busy ? null : () => act(mac.discardPendingProfile),
+            ),
+          if (enteringLink)
+            ActionChipButton(
+              'Cancel',
+              Icons.close,
+              busy
+                  ? null
+                  : () => setState(() {
+                      enteringLink = false;
+                      pairingLink = '';
+                    }),
+            ),
+          ActionChipButton(
+            enteringLink ? 'Continue' : 'Paste a new pairing link',
+            Icons.link,
+            busy || (enteringLink && pairingLink.trim().isEmpty)
+                ? null
+                : enteringLink
+                ? submitPairingLink
+                : () => setState(() {
+                    enteringLink = true;
+                    actionError = null;
+                  }),
+          ),
+        ],
+      ),
+    ],
+  );
 
   Widget locked() {
     final c = context.colors;
@@ -1101,7 +1156,11 @@ class _WalletState extends State<_Wallet> {
                 const LokiLabel('Shielded multisig'),
                 const SizedBox(height: 14),
                 Text(
-                  !loaded ? 'Opening LokiSigner…' : 'Unlock your signer',
+                  !loaded
+                      ? 'Opening LokiSigner…'
+                      : pairingPending
+                      ? 'Finish pairing'
+                      : 'Unlock your signer',
                   style: lokiSans(26, weight: 600, spacing: -1),
                 ),
                 const SizedBox(height: 12),
@@ -1117,6 +1176,10 @@ class _WalletState extends State<_Wallet> {
                     when message != nativeStatus) ...[
                   const SizedBox(height: 12),
                   Notice(message),
+                ],
+                if (loaded && pairingPending) ...[
+                  const SizedBox(height: 12),
+                  unfinishedPairing(),
                 ],
                 const SizedBox(height: 18),
                 Row(

@@ -131,7 +131,7 @@ final class WalletChannel {
         case "pendingInvite":
             guard noArgs else { result(invalid); return }
             result(takeInvite())
-        case "unlock", "pair", "restore", "recoverWalletKey":
+        case "unlock", "pair", "restore", "recoverWalletKey", "discardPendingProfile":
             let link = args?["link"] as? String
             guard call.method == "pair" ? (link != nil && args?.count == 1) : noArgs else { result(invalid); return }
             guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
@@ -150,6 +150,7 @@ final class WalletChannel {
             if let link { signer.pairWallet(link: link.trimmingCharacters(in: .whitespacesAndNewlines)) }
             else if call.method == "restore" { signer.restoreWallet() }
             else if call.method == "recoverWalletKey" { signer.recoverWalletKey() }
+            else if call.method == "discardPendingProfile" { signer.discardPendingProfile() }
             else { signer.unlockWallet() }
             #endif
         case "lock":

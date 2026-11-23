@@ -31,6 +31,9 @@ class MacWalletApi implements WalletApi {
   Future<String?> nativeNotice() =>
       _channel.invokeMethod<String>('nativeNotice');
   Future<void> recoverWalletKey() => _channel.invokeMethod('recoverWalletKey');
+  // Sets aside a profile whose pairing registration never finished.
+  Future<void> discardPendingProfile() =>
+      _channel.invokeMethod('discardPendingProfile');
 
   void onNativePromptChanged(
     void Function(bool)? onChanged, {

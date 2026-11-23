@@ -764,6 +764,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var attemptedPairingClaims: Set<String> = []
     private var startingOver = false
     private var recoveringKey = false
+    private var discardingPending = false
     fileprivate private(set) var lockingForAbsence = false
     fileprivate var showingRecoveryWords = false
     private var lockTimer: Timer?
@@ -1044,6 +1045,27 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         confirmSetAside(recover: true)
     }
 
+    /// A pairing whose registration never finished left a profile without recovery words or
+    /// vaults. Set it aside (renamed, not deleted) so the member can pair this Mac again.
+    func discardPendingProfile() {
+        prompting = true
+        let state = startupProfile()
+        guard !running, state["profile"] as? String == "profile", state["pairing_pending"] as? Bool == true else {
+            finishWalletOperation(.setAsideFailed)
+            return
+        }
+        guard canSetUp() else { return }
+        let r = SignerReview.self
+        presentPrompt(SignerReview(section: "Pairing", title: "Remove this unregistered profile?",
+            intro: "The coordinator never accepted this Mac’s registration, so this profile has no recovery words or vaults yet.",
+            content: [r.info("Nothing is deleted", "LokiSigner renames the local data folder and returns to Pair this Mac. Pair again with a new link from the wallet.")],
+            hint: "Cancel keeps this profile.", actions: ["Cancel", "Remove and pair again"], primary: 1, destructive: true)) { answer in
+            guard answer == .alertSecondButtonReturn else { self.finishWalletOperation(.cancelled); return }
+            self.discardingPending = true
+            self.setAside(recover: false)
+        }
+    }
+
     private func confirmSetAside(recover: Bool = false) {
         prompting = true
         guard canSetUp() else { return }
@@ -1084,6 +1106,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         let recover = recoveringKey
         recoveringKey = false
         let reply = profile(recover ? 3 : 2)
+        if discardingPending {
+            discardingPending = false
+            if reply["profile"] as? String == "fresh" { finishWalletOperation() }
+            else { retry(reply["error"] as? String == "vault" ? .protectedProfile : .setAsideFailed, link: nil) }
+            return
+        }
         if reply["profile"] as? String != "fresh" {
             retry(reply["error"] as? String == "vault" ? .protectedProfile : .setAsideFailed, link: retryLink)
         } else {

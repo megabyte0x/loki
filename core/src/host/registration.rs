@@ -556,6 +556,13 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
 }
 
 const PAIRING_PENDING: &str = "pairing-registration-pending";
+
+/// True while a native pairing has written its profile but the coordinator never accepted the
+/// registration (for example, the pairing link expired). Such a profile has no recovery words yet.
+#[cfg(feature = "relay-communication")]
+pub(crate) fn pairing_pending(data: &std::path::Path) -> bool {
+    data.join(PAIRING_PENDING).exists()
+}
 pub(super) const RESTORE_PENDING: &str = "restore-registration-pending";
 const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to the coordinator yet; it will retry without your recovery words.";
 
