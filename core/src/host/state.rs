@@ -441,6 +441,8 @@ pub struct AppState {
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
+    /// Logged-in relay connections for control messages, by login key (see `payment::RelayLease`).
+    pub(super) relays: std::sync::Mutex<BTreeMap<[u8; 32], super::payment::CachedRelay>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
     pub(super) join_relay: std::sync::atomic::AtomicBool,
@@ -476,6 +478,7 @@ impl AppState {
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
+            relays: std::sync::Mutex::new(BTreeMap::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             join_relay: std::sync::atomic::AtomicBool::new(false),
             device_auth: std::sync::Mutex::new(None),

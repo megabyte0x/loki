@@ -428,6 +428,61 @@ pub(super) fn payment_relay(st: &AppState, identity: &Identity, failure_notice: 
         .map_err(|e| e.to_string())
 }
 
+/// A logged-in relay connection kept between control syncs, so a poll reuses one TLS connection
+/// and one login instead of building a runtime, a client and a login every time.
+pub(super) struct CachedRelay {
+    transport: Option<FrostdTransport>,
+    logged_in: std::time::Instant,
+}
+
+impl Drop for CachedRelay {
+    fn drop(&mut self) {
+        if let Some(transport) = self.transport.take() { transport.close_in_background(); }
+    }
+}
+
+/// frostd access tokens last an hour; log in again well before that.
+const RELAY_LOGIN_FOR: Duration = Duration::from_secs(45 * 60);
+
+/// A control-message relay connection taken from the profile's cache, or a new one. Call `keep`
+/// after a successful use; a failed use (an expired token, a dropped connection) is closed, so the
+/// next use logs in afresh. Never used for the bounded failure notice sent during shutdown.
+struct RelayLease<'a> {
+    st: &'a AppState,
+    key: [u8; 32],
+    relay: CachedRelay,
+}
+
+impl<'a> RelayLease<'a> {
+    fn take(st: &'a AppState, identity: &Identity) -> Result<Self, String> {
+        let key = relay_login(identity)?.peer().0;
+        let cached = st.relays.lock().map_err(|e| e.to_string())?.remove(&key)
+            .filter(|relay| relay.logged_in.elapsed() < RELAY_LOGIN_FOR);
+        let relay = match cached {
+            Some(relay) => relay,
+            None => {
+                let transport = payment_relay(st, identity, false)?;
+                debug_assert_eq!(transport.login_peer(), key);
+                CachedRelay { transport: Some(transport), logged_in: std::time::Instant::now() }
+            }
+        };
+        Ok(Self { st, key, relay })
+    }
+
+    fn transport(&self) -> &FrostdTransport {
+        self.relay.transport.as_ref().expect("a leased relay holds its transport")
+    }
+
+    fn transport_mut(&mut self) -> &mut FrostdTransport {
+        self.relay.transport.as_mut().expect("a leased relay holds its transport")
+    }
+
+    fn keep(self) {
+        if self.st.is_stopping() { return; }
+        if let Ok(mut relays) = self.st.relays.lock() { relays.insert(self.key, self.relay); }
+    }
+}
+
 /// Checks a candidate or signed PCZT against the reviewed terms; returns its sighash.
 fn review_candidate(bytes: &[u8], payment: &Payment, vault: &Vault) -> Result<[u8; 32], SignerError> {
     let parsed = pczt::Pczt::parse(bytes).map_err(|e| format!("candidate: {e:?}"))?;
@@ -766,7 +821,19 @@ fn send_control_inner(st: &AppState, v: &Vault<impl Sized>, p: &Payment, kind: &
     let session = p
         .control_session_id
         .ok_or("missing payment control session; create a fresh payment")?;
-    let mut tx = payment_relay(st, &v.identity, kind == "failed")?;
+    if kind == "failed" {
+        // Bounded by its own deadline so it can still go out while the profile stops.
+        return send_control_on(&mut payment_relay(st, &v.identity, true)?, v, p, kind, slots, session);
+    }
+    let mut lease = RelayLease::take(st, &v.identity)?;
+    send_control_on(lease.transport_mut(), v, p, kind, slots, session)?;
+    lease.keep();
+    Ok(())
+}
+
+fn send_control_on(tx: &mut FrostdTransport, v: &Vault<impl Sized>, p: &Payment, kind: &str, slots: &[u16],
+    session: Uuid,
+) -> Result<(), String> {
     let ch = tx.join(session).map_err(|e| e.to_string())?;
     for slot in slots.iter().copied().filter(|s| *s != v.slot) {
         let peer = v.peers.get(&slot).ok_or("unknown control recipient")?;
@@ -807,13 +874,13 @@ fn sync_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault) 
 fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
     target: Option<(&FrostdTransport, &Payment)>,
 ) -> Result<(), String> {
-    let transport;
+    let mut lease = None;
     let (tx, sessions) = if let Some((tx, p)) = target {
         // This mailbox and its roster owner were authenticated when the terms were stored.
         (tx, vec![p.control_session_id.ok_or("missing payment control session")?])
     } else {
-        transport = payment_relay(st, &v.identity, false)?;
-        (&transport, transport.list_sessions().map_err(|e| e.to_string())?)
+        let tx = lease.insert(RelayLease::take(st, &v.identity)?).transport();
+        (tx, tx.list_sessions().map_err(|e| e.to_string())?)
     };
     for session in sessions {
         if st.is_stopping() { return Err("profile is locked".into()); }
@@ -1027,6 +1094,7 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
             }
         }
     }
+    if let Some(lease) = lease { lease.keep(); }
     Ok(())
 }
 
