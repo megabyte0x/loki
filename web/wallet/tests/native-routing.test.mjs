@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { api, pairDevice, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
 import * as members from '../src/lib/members.ts';
+import { admitGrant } from './grants.mjs';
 
 test('a tab paired with a native member routes member calls to it, with its capability', async () => {
   const sess = new Map();
@@ -56,7 +57,7 @@ test('the wallet asks for a pairing link, then for the same slot again only once
   const grant = '1a'.repeat(32);
   const otherGrant = '2b'.repeat(32);
   const digest = (token) => createHash('sha256').update(token).digest('hex');
-  process.env.LOKI_ONBOARDING_GRANTS = JSON.stringify({ [digest(grant)]: null, [digest(otherGrant)]: null });
+  for (const token of [grant, otherGrant]) admitGrant(digest(token));
   const bodies = [];
   let reply = null; // replaces the real coordinator for one request
   const originalFetch = globalThis.fetch;
@@ -155,6 +156,6 @@ test('the wallet asks for a pairing link, then for the same slot again only once
   } finally {
     globalThis.fetch = originalFetch;
     globalThis.window = originalWindow;
-    rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY; delete process.env.LOKI_ONBOARDING_GRANTS;
+    rmSync(dir, { recursive: true, force: true }); delete process.env.LOKI_REGISTRY;
   }
 });

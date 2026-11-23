@@ -110,13 +110,12 @@ for pid in "${relay_pids[@]}"; do wait "$pid"; done
 awk -v a="${relay_pids[0]}" -v b="${relay_pids[1]}" '$0 != a && $0 != b' "$root/pids" >"$root/pids.next"
 mv "$root/pids.next" "$root/pids"
 [[ -d $repo/web/wallet/node_modules ]] || ( cd "$repo/web/wallet" && { npm ci || npm ci --legacy-peer-deps; } )
-grants='{}'
 for n in 1 2 3; do
   onboarding[n]=$(openssl rand -hex 32)
   digest=$(printf '%s' "${onboarding[n]}" | openssl dgst -sha256 -r)
-  grants=$(jq --arg digest "${digest%% *}" --argjson slot "$n" '.[$digest] = $slot' <<<"$grants")
+  ( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" node scripts/grants.ts register "${digest%% *}" --slot "$n" )
 done
-( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 LOKI_ONBOARDING_GRANTS="$grants" \
+( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 \
     exec nohup npx next dev --hostname 127.0.0.1 --port "$web_port" ) >"$root/coordinator.log" 2>&1 &
 echo $! >>"$root/pids"
 wait_for 180 "coordinator did not start; see $root/coordinator.log" curl -sf -m 5 "$coord/api/members" -o /dev/null

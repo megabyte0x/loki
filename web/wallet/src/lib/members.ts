@@ -448,17 +448,22 @@ function grantState(state: Registry, digest: string): GrantRow["state"] {
   return state.challenges.some((c) => c.grant === digest) ? "pending" : "unused";
 }
 
-/** Adds a grant and returns the bearer string, which is never stored: only its digest is. At most
- *  16 grants may be unused at once. Takes effect on the next request; no restart. */
-export async function addOnboardingGrant(slot?: number): Promise<string> {
+/** Admits the grant whose SHA-256 digest is `digest`. At most 16 grants may be unused at once.
+ *  Takes effect on the next request; no restart. */
+export async function registerOnboardingGrant(digest: string, slot?: number): Promise<void> {
   const pinned = slot === undefined ? null : registrationSlot(slot);
-  const bearer = randomBytes(32).toString("hex");
-  const digest = grantDigest(bearer);
+  if (!/^[0-9a-f]{64}$/.test(digest)) throw new Error("a grant digest is 64 lowercase hex characters");
   await changeRegistry((state) => {
-    const open = Object.keys(state.onboarding).filter((d) => grantState(state, d) !== "used").length;
+    const open = Object.keys(state.onboarding).filter((d) => d !== digest && grantState(state, d) !== "used").length;
     if (open >= MAX_SLOT) return new Error("16 grants are already unused; prune or use some first");
     state.onboarding[digest] = pinned;
   });
+}
+
+/** Creates a grant and returns its bearer string, which is never stored: only its digest is. */
+export async function addOnboardingGrant(slot?: number): Promise<string> {
+  const bearer = randomBytes(32).toString("hex");
+  await registerOnboardingGrant(grantDigest(bearer), slot);
   return bearer;
 }
 

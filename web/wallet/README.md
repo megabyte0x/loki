@@ -147,29 +147,20 @@ independent custody against that OS operator.
 
 ### Onboarding grants
 
-The coordinator admits at most 16 active members in slots 1–16. Configure
-`LOKI_ONBOARDING_GRANTS` as a JSON object of SHA-256 digests of the lowercase hex bearer
-strings. A value of `null` lets the coordinator pick the lowest free slot; set an integer
-from 1 to 16 only when the operator wants to pin that grant. For one automatic grant:
-
-```sh
-grant=$(openssl rand -hex 32)
-digest=$(printf '%s' "$grant" | openssl dgst -sha256 -r)
-export LOKI_ONBOARDING_GRANTS="{\"${digest%% *}\":null}"
-```
-
-Grants can also live in the coordinator registry, which needs no restart. Use the same registry
-path as the coordinator:
+The coordinator admits at most 16 active members in slots 1–16. Onboarding grants live in the
+coordinator registry, so adding one needs no restart. Use the same registry path as the
+coordinator:
 
 ```sh
 LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts add [--slot N] [--origin https://wallet.example]
+LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts register <sha256 digest> [--slot N]   # scripts with their own bearer
 LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts list    # digest prefix, slot, unused/pending/used
 LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts prune   # drop used grants
 ```
 
 `add` prints the bearer (or the wallet link with `#onboarding=`) once and stores only its digest.
 At most 16 registry grants can be unused at once; pruning a used grant keeps its use recorded, so it
-can never admit again. `LOKI_ONBOARDING_GRANTS` remains for scripted test stacks.
+can never admit again. Without `--slot` the coordinator picks the lowest free slot.
 
 Share `${grant}` privately with the new member, not the digest. For the wallet, append
 `#onboarding=<grant>` to the wallet URL; the page holds it in memory after reading it.

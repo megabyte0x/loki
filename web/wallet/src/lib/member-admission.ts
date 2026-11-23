@@ -30,16 +30,10 @@ export function grantDigest(value: unknown): string {
 /** Grant digests and their pinned slot (`null` = lowest free slot), as stored in the registry. */
 export type RegisteredGrants = Record<string, number | null>;
 
-/** The grants the operator added with `scripts/grants.ts` (kept in the registry, so a new grant
- *  needs no restart), plus any in LOKI_ONBOARDING_GRANTS for scripted test stacks. */
+/** The grants the operator added with `scripts/grants.ts`. They live in the registry, so a new
+ *  grant needs no restart. */
 function onboardingGrants(registered: RegisteredGrants): [string, number | null][] {
-  const data: unknown = JSON.parse(process.env.LOKI_ONBOARDING_GRANTS ?? "{}");
-  if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid onboarding configuration");
-  const configured = Object.entries(data);
-  if (configured.length > MAX_SLOT || configured.some(([key]) => !DIGEST.test(key))) throw new Error("invalid onboarding configuration");
-  const grants = new Map<string, number | null>(configured.map(([key, value]) => [key, value === null ? null : registrationSlot(value)]));
-  for (const [key, slot] of Object.entries(registered)) grants.set(key, slot);
-  return [...grants];
+  return Object.entries(registered);
 }
 
 export function grantedSlot(digest: string, registered: RegisteredGrants): number | undefined {
