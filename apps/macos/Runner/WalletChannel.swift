@@ -11,6 +11,11 @@ final class WalletChannel {
     private let channel: FlutterMethodChannel
     private let signer: NativeSigner
     private let validLaunch: Bool
+    /// Why this launch can't open a profile, shown instead of pairing or unlocking.
+    private let launchProblem: String?
+    private weak var window: NSWindow?
+    /// Held for the life of the process; see `lockProfile`.
+    private static var profileLock: Int32 = -1
     // At most one invite claim from an associated-domain link, held in memory only and never
     // logged. It is bound to the pinned coordinator and slot and never invokes a wallet method.
     private var claim: (code: String, coordinator: String, slot: Int)?
@@ -25,8 +30,26 @@ final class WalletChannel {
         #else
         let args = Self.launchArguments(CommandLine.arguments.dropFirst())
         #endif
-        validLaunch = args != nil
-        signer = NativeSigner(args: nativeSignerArguments(args ?? []), link: nil, walletWindow: window)
+        let signerArgs = nativeSignerArguments(args ?? [])
+        if args == nil {
+            launchProblem = "Invalid LokiSigner launch arguments."
+        } else if let index = signerArgs.firstIndex(of: "--data"), index + 1 < signerArgs.count,
+                  !Self.lockProfile(signerArgs[index + 1]) {
+            launchProblem = "This profile is already open in another LokiSigner window. Use that window, or quit it first."
+        } else {
+            launchProblem = nil
+        }
+        validLaunch = launchProblem == nil
+        self.window = window
+        #if !LOKI_VISUAL_ONLY
+        // TEMPORARY: capture the member's verbose stderr per profile (see VerboseLog).
+        if let index = signerArgs.firstIndex(of: "--data"), index + 1 < signerArgs.count {
+            VerboseLog.start(dataFolder: signerArgs[index + 1])
+        }
+        // Connects the member's fixed diagnostic events to ~/Library/Logs/LokiSigner.
+        SignerLog.start()
+        #endif
+        signer = NativeSigner(args: signerArgs, link: nil, walletWindow: window)
         signer.promptChanged = { [weak channel] active in
             channel?.invokeMethod("nativePromptChanged", arguments: active)
         }
@@ -85,6 +108,19 @@ final class WalletChannel {
         return held.code
     }
 
+    /// One process per profile folder: two LokiSigners on one profile would run two signers on the
+    /// same nonce and payment state. The lock file sits beside the folder, so a fresh folder stays
+    /// fresh. Returns false only when another process holds the lock.
+    private static func lockProfile(_ data: String) -> Bool {
+        let path = (data as NSString).standardizingPath + ".lock"
+        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
+        // A folder whose parent can't hold a lock file fails later with its own error.
+        guard fd >= 0 else { return true }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return false }
+        profileLock = fd
+        return true
+    }
+
     private static func launchArguments(_ arguments: ArraySlice<String>) -> [String]? {
         // Only process launch arguments may configure peers; ignore Flutter/Launch Services flags.
         var flags: [String] = []
@@ -117,20 +153,23 @@ final class WalletChannel {
             result(signer.walletNotice)
         case "profile":
             guard noArgs else { result(invalid); return }
-            guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
+            guard validLaunch else { result(failure(400, launchProblem ?? "Invalid LokiSigner launch arguments.")); return }
             var profile = signer.walletProfile()
             profile["can_recover_wallet_key"] = signer.canRecoverWalletKey
             profile["reduce_motion"] = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
             if #available(macOS 26, *) { profile["liquid_glass"] = true }
+            // Several signers on one Mac: name each window by its member slot (Mission Control,
+            // the Window menu and the Dock list it even though the title bar hides it).
+            window?.title = (profile["slot"] as? NSNumber).map { "LokiSigner — Member \($0)" } ?? "LokiSigner"
             if profile["profile"] is String { result(profile) }
             else { result(failure(500, SignerStartFailure.dataFolderUnavailable.message)) }
         case "pendingInvite":
             guard noArgs else { result(invalid); return }
             result(takeInvite())
-        case "unlock", "pair", "restore", "recoverWalletKey":
+        case "unlock", "pair", "restore", "recoverWalletKey", "discardPendingProfile":
             let link = args?["link"] as? String
             guard call.method == "pair" ? (link != nil && args?.count == 1) : noArgs else { result(invalid); return }
-            guard validLaunch else { result(failure(400, "Invalid LokiSigner launch arguments.")); return }
+            guard validLaunch else { result(failure(400, launchProblem ?? "Invalid LokiSigner launch arguments.")); return }
             #if LOKI_VISUAL_ONLY
             result(failure(403, "This visual-only build cannot unlock, pair or restore a signer."))
             #else
@@ -146,6 +185,7 @@ final class WalletChannel {
             if let link { signer.pairWallet(link: link.trimmingCharacters(in: .whitespacesAndNewlines)) }
             else if call.method == "restore" { signer.restoreWallet() }
             else if call.method == "recoverWalletKey" { signer.recoverWalletKey() }
+            else if call.method == "discardPendingProfile" { signer.discardPendingProfile() }
             else { signer.unlockWallet() }
             #endif
         case "lock":
@@ -231,7 +271,9 @@ final class WalletChannel {
             let status = reply["status"] as? Int ?? 500
             let data = reply["data"] as? [String: Any] ?? [:]
             if (200..<300).contains(status) { complete(data) }
-            else { result(self.failure(status, data["error"] as? String ?? "LokiSigner request failed.")) }
+            // Backend text can quote a relay or lightwalletd; neutralise it before Flutter shows it.
+            else { result(self.failure(status, untrustedText(data["error"] as? String ?? "LokiSigner request failed."),
+                                       code: data["code"] as? String)) }
         }
     }
 
@@ -243,11 +285,70 @@ final class WalletChannel {
         }) { result(failure(401, "LokiSigner is locked.")) }
     }
 
-    private func failure(_ status: Int, _ message: String) -> FlutterError {
-        FlutterError(code: String(status), message: message, details: nil)
+    /// `code` is the host's stable error code; the wallet maps it to its own wording.
+    private func failure(_ status: Int, _ message: String, code: String? = nil) -> FlutterError {
+        FlutterError(code: String(status), message: message, details: code)
     }
 
     private func isHexID(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }
+    }
+}
+
+
+/// TEMPORARY verbose diagnostics. Everything this process writes to stdout and stderr (the
+/// member's own `eprintln!` lines, Swift and Flutter prints) goes to
+/// ~/Library/Logs/LokiSigner/<profile folder>.verbose.log, one timestamped line at a time.
+/// Unlike LokiSigner.log it can contain coordinator and relay error text and payment ids, so it
+/// stays private (0600 in a 0700 folder) and must be removed before release.
+enum VerboseLog {
+    private final class Lines: @unchecked Sendable {
+        var pending = Data()
+        let formatter: ISO8601DateFormatter = {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions.insert(.withFractionalSeconds)
+            return formatter
+        }()
+    }
+
+    private static var pipe: Pipe?
+    private static let limit: UInt64 = 50 * 1024 * 1024
+
+    static func start(dataFolder: String) {
+        guard pipe == nil else { return }
+        let profile = URL(fileURLWithPath: dataFolder).lastPathComponent
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/LokiSigner", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let url = directory.appendingPathComponent("\(profile).verbose.log")
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > limit {
+            let older = directory.appendingPathComponent("\(profile).verbose.previous.log")
+            try? FileManager.default.removeItem(at: older)
+            try? FileManager.default.moveItem(at: url, to: older)
+        }
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        let pipe = Pipe()
+        setvbuf(stdout, nil, _IOLBF, 0)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO)
+        self.pipe = pipe
+        let lines = Lines()
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            lines.pending.append(chunk)
+            while let newline = lines.pending.firstIndex(of: 0x0A) {
+                let line = lines.pending[lines.pending.startIndex..<newline]
+                lines.pending.removeSubrange(lines.pending.startIndex...newline)
+                var stamped = Data("\(lines.formatter.string(from: Date())) ".utf8)
+                stamped.append(line)
+                stamped.append(0x0A)
+                try? file.write(contentsOf: stamped)
+            }
+        }
+        FileHandle.standardError.write(Data("[verbose] LokiSigner \(ProcessInfo.processInfo.processIdentifier) started for profile \(profile)\n".utf8))
     }
 }

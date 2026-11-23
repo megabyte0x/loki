@@ -372,6 +372,9 @@ pub struct LocalSigner<SE: SecureElement> {
     session_origin: Option<String>,
     /// Rendered payments, keyed by candidate attempt id, for `rendered_payment`.
     rendered: BTreeMap<[u8; 32], PaymentView>,
+    /// The (payment, sighash) the member last approved. Every spend of a multi-note payment
+    /// signs the same sighash, so one decision covers them all.
+    approved: Option<([u8; 32], [u8; 32])>,
     /// This signer's own spendable vault notes (scanned member-side with its own fvk). The
     /// proposer selects from these when it builds a candidate; the coordinator never sees
     /// them. Empty until set by the signer's owner (`set_candidate_notes`).
@@ -416,6 +419,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
             session: None,
             session_origin: None,
             rendered: BTreeMap::new(),
+            approved: None,
             candidate_notes: Vec::new(),
         }
     }
@@ -852,6 +856,7 @@ impl<SE: SecureElement> LocalSigner<SE> {
     /// Install the decision for an attempt after its signing group and expiry are fixed.
     pub fn set_approval_policy(&mut self, approval: ApprovalPolicy) {
         self.approval = approval;
+        self.approved = None;
     }
 
     /// Give this signer the vault notes it may spend. These are scanned member-side with
@@ -861,24 +866,25 @@ impl<SE: SecureElement> LocalSigner<SE> {
         self.candidate_notes = notes;
     }
 
-    /// Build the IO-finalized, unsigned single-note candidate under `params`, the signer's
-    /// OWN fvk, its OWN selected note, and the coordinator-supplied `alpha`. The `P` is the
-    /// signer's own network parameters — never supplied by the coordinator.
-    fn build_single_note_pczt<P: zcash_protocol::consensus::Parameters + Clone>(
+    /// Build the IO-finalized, unsigned candidate under `params`, the signer's OWN fvk, the
+    /// notes its owner selected (`set_candidate_notes`), and one coordinator-supplied alpha per
+    /// note. The `P` is the signer's own network parameters — never supplied by the coordinator.
+    fn build_pczt<P: zcash_protocol::consensus::Parameters + Clone>(
         &self,
         params_net: &P,
         params: &crate::signer::PublicPaymentParams,
-        alpha: &[u8; 32],
+        alphas: &[[u8; 32]],
     ) -> Result<Vec<u8>, SignerError> {
-        // ponytail: first-note selection; swap for real coin selection when multi-note lands.
-        let note = *self
-            .candidate_notes
-            .first()
-            .ok_or_else(|| SignerError::Other("signer holds no spendable note".into()))?;
+        if self.candidate_notes.is_empty() {
+            return Err(SignerError::Other("signer holds no spendable note".into()));
+        }
+        if self.candidate_notes.len() != alphas.len() {
+            return Err(SignerError::Other("the coordinator sent a randomiser count that differs from the payment's notes".into()));
+        }
         // The PCZT build is share-free; it lives in `crate::builder` so the untrusted
-        // server-side builder (W4) runs this identical path. Only note selection and the
-        // viewing key stay here.
-        crate::builder::build_unsigned(self.fvk()?, params_net, params, note, alpha)
+        // server-side builder (W4) runs this identical path. Only the notes and the viewing
+        // key stay here.
+        crate::builder::build_unsigned(self.fvk()?, params_net, params, &self.candidate_notes, alphas)
             .map_err(SignerError::Other)
     }
 
@@ -1532,16 +1538,16 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
         session: &Session,
         _cand: &CandidateRef,
         params: &crate::signer::PublicPaymentParams,
-        alpha: &[u8; 32],
+        alphas: &[[u8; 32]],
     ) -> Result<CandidatePczt, Self::Error> {
         self.check_session(session)?;
         self.require_ready()?;
         // Build under the signer's OWN network parameters: the coordinator supplied neither
         // the fvk nor a `Parameters` instance.
         match self.network {
-            Network::Regtest => self.build_single_note_pczt(&crate::candidate::Regtest, params, alpha),
+            Network::Regtest => self.build_pczt(&crate::candidate::Regtest, params, alphas),
             Network::Testnet => {
-                self.build_single_note_pczt(&zcash_protocol::consensus::TEST_NETWORK, params, alpha)
+                self.build_pczt(&zcash_protocol::consensus::TEST_NETWORK, params, alphas)
             }
         }
         .map(CandidatePczt)
@@ -1625,9 +1631,11 @@ impl<SE: SecureElement> Signer for LocalSigner<SE> {
 
         // 3. The member decides on THAT render + candidate + sighash (policy/biometric).
         //    Refusal is first-class.
-        if !(self.approval)(&ApprovalRequest { candidate: cand, sighash: local_sighash, view: &view }) {
+        let decided = self.approved == Some((cand.payment_id, local_sighash));
+        if !decided && !(self.approval)(&ApprovalRequest { candidate: cand, sighash: local_sighash, view: &view }) {
             return Err(SignerError::MemberRefused);
         }
+        self.approved = Some((cand.payment_id, local_sighash));
 
         // 4. BINDING (the must-fix): require the SigningPackage to name exactly that sighash.
         //    Done BEFORE the nonce/share is touched, so a mismatched package can never consume

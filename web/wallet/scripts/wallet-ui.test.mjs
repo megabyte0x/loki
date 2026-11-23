@@ -21,7 +21,7 @@ test("pending payments never look sent and internal phase names stay hidden", ()
   assert.equal(paymentLabel("confirmed", false, true), "Confirmed");
   assert.equal(paymentLabel("not_selected", false, false), "Other members are signing");
   assert.equal(paymentLabel("failed", true, true), "Failed · not sent");
-  assert.equal(paymentLabel("discarding", true, true), "Releasing reserved input");
+  assert.equal(paymentLabel("discarding", true, true), "Releasing reserved notes");
   assert.equal(paymentLabel("cancelled", true, true), "Cancelled");
   assert.equal(paymentLabel("expired", true, true), "Expired");
   assert.equal(paymentLabel("signed", false, false), "Signed · not sent yet");

@@ -1609,7 +1609,7 @@ function VaultOverview({
                     <p className="font-mono text-base font-semibold">{zatToTaz(p.amount_zat)} TAZ</p>
                     <p className="truncate font-mono text-[11px] text-muted">to {short(p.recipient, 12, 8)}</p>
                     <p className="mt-1 flex items-center gap-2 text-[11px] text-muted"><MemberAvatar slot={p.proposer} size={22} /> Proposed by Member {p.proposer}</p>
-                    {p.replaces && <p className="mt-1 text-[11px] text-amber">{p.replaces.cancel ? "Cancels" : "Retries"} stuck payment {short(p.replaces.attempt, 6, 4)} with the same note</p>}
+                    {p.replaces && <p className="mt-1 text-[11px] text-amber">{p.replaces.cancel ? "Cancels" : "Retries"} stuck payment {short(p.replaces.attempt, 6, 4)} with the same notes</p>}
                   </div>
                   <button
                     onClick={() => onApprove(p)}
@@ -2095,7 +2095,7 @@ function ReviewApprove({
           {review.replaces.amount_zat && review.replaces.recipient ? <> ({zatToTaz(review.replaces.amount_zat)} TAZ to <span className="font-mono">{short(review.replaces.recipient, 10, 6)}</span>)</> : null}.
         </p>
         <p className="mt-1 text-xs text-muted">
-          It spends the same note, so only one of the two can ever be mined.{review.replaces.cancel ? " The note returns to the vault, less one fee." : ""}
+          It spends the same notes, so only one of the two can ever be mined.{review.replaces.cancel ? " The notes return to the vault, less one fee." : ""}
         </p>
       </GlassCard>}
       <GlassCard className="mb-4">
@@ -2155,7 +2155,7 @@ function ReplacePanel({ vault, payment, onStarted }: {
   return <div className="mt-3 rounded-xl border border-amber/40 bg-amber/10 p-3">
     <p className="text-sm font-semibold text-amber">This payment looks stuck</p>
     <p className="mt-1 text-xs text-muted">
-      Any member can replace it with a new request that spends the same note. It needs {vault.threshold} approvals.
+      Any member can replace it with a new request that spends the same notes. It needs {vault.threshold} approvals.
       A note can be spent only once, so whichever transaction is mined first wins and the recipient is never paid twice.
     </p>
     <div className="mt-3 flex flex-col gap-2 sm:flex-row">

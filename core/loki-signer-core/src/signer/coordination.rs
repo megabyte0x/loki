@@ -102,7 +102,7 @@ where
         let proposer = &quorum[0];
         proposer
             .signer
-            .build_candidate(&proposer.session, cand, intent, &alpha_bytes)
+            .build_candidate(&proposer.session, cand, intent, &[alpha_bytes])
             .map_err(|e| format!("proposer {:?} build_candidate: {e}", proposer.id))?
             .0
     };

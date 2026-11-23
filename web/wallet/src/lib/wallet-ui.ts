@@ -20,7 +20,7 @@ export function paymentLabel(phase: string, ready: boolean, sending: boolean): s
   if (phase === "broadcast") return "Awaiting confirmation";
   if (phase === "expired") return "Expired";
   if (phase === "failed") return "Failed · not sent";
-  if (phase === "discarding") return "Releasing reserved input";
+  if (phase === "discarding") return "Releasing reserved notes";
   if (phase === "cancelled") return "Cancelled";
   if (sending) return "Sending";
   if (ready) return "Ready to send";

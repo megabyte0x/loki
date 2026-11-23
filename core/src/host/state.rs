@@ -441,6 +441,15 @@ pub struct AppState {
     pub ceremony: std::sync::Mutex<()>,
     pub payment: std::sync::Mutex<()>,
     pub active_payments: std::sync::Mutex<BTreeSet<String>>,
+    /// Logged-in relay connections for control messages, by login key (see `payment::RelayLease`).
+    pub(super) relays: std::sync::Mutex<BTreeMap<[u8; 32], super::payment::CachedRelay>>,
+    /// Per vault: held while that vault's control mailbox is being drained and applied.
+    pub(super) control_receivers: std::sync::Mutex<BTreeMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    /// Per vault: the background control sync's state, reported to the wallet.
+    pub(super) control_status: std::sync::Mutex<BTreeMap<String, super::payment::ControlStatus>>,
+    /// Per (vault, frostd session): the roster member who owns it, or `None` for a session that
+    /// isn't this vault's control mailbox. A session's owner and members never change.
+    pub(super) control_sessions: std::sync::Mutex<BTreeMap<(String, uuid::Uuid), Option<u16>>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
     pub(super) join_relay: std::sync::atomic::AtomicBool,
@@ -460,11 +469,32 @@ pub struct AppState {
     pub(super) wallet_tabs: Option<super::connect::WalletTabs>,
     /// Each opened vault's viewing key; `None` means a cancelled open needs an explicit retry.
     pub(super) viewing_keys: std::sync::Mutex<BTreeMap<String, Option<orchard::keys::FullViewingKey>>>,
+    /// True until the first registration attempt after unlock finishes. Its device-key Touch ID
+    /// prompt comes first; vault opens wait so two prompts never race (and cancel each other).
+    pub(super) first_registration: (std::sync::Mutex<bool>, std::sync::Condvar),
+    /// Per vault: deposits seen by the last wallet scan, listed in History.
+    pub(super) received: std::sync::Mutex<BTreeMap<String, Vec<crate::wallet_store::Received>>>,
     /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
 
 impl AppState {
+    /// Marks whether the first registration attempt after unlock is still running.
+    pub(super) fn set_first_registration(&self, running: bool) {
+        let (lock, changed) = &self.first_registration;
+        if let Ok(mut flag) = lock.lock() { *flag = running; }
+        changed.notify_all();
+    }
+
+    /// Waits (at most `limit`) for the first registration attempt, so its Touch ID prompt is
+    /// answered before another one appears.
+    pub(super) fn after_first_registration(&self, limit: std::time::Duration) {
+        let (lock, changed) = &self.first_registration;
+        if let Ok(flag) = lock.lock() {
+            let _ = changed.wait_timeout_while(flag, limit, |running| *running && !self.is_stopping());
+        }
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             config,
@@ -476,6 +506,10 @@ impl AppState {
             ceremony: std::sync::Mutex::new(()),
             payment: std::sync::Mutex::new(()),
             active_payments: std::sync::Mutex::new(BTreeSet::new()),
+            relays: std::sync::Mutex::new(BTreeMap::new()),
+            control_receivers: std::sync::Mutex::new(BTreeMap::new()),
+            control_status: std::sync::Mutex::new(BTreeMap::new()),
+            control_sessions: std::sync::Mutex::new(BTreeMap::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             join_relay: std::sync::atomic::AtomicBool::new(false),
             device_auth: std::sync::Mutex::new(None),
@@ -486,6 +520,8 @@ impl AppState {
             roster_refused: std::sync::Mutex::new(BTreeSet::new()),
             wallet_tabs: None,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
+            first_registration: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            received: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
     }

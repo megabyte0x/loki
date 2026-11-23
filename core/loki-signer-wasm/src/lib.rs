@@ -23,7 +23,8 @@ use loki_signer_core::signer::local::{
 };
 use loki_signer_core::vault::orchard_receiver_from_ua;
 use loki_signer_core::verify::{check_candidate, Expectations, Refusal};
-use loki_signer_core::signer::PublicPaymentParams;
+use loki_signer_core::signer::{hosted_spend_ref, PublicPaymentParams};
+use loki_signer_core::signing_session::{decode_hosted, encode_hosted, MAX_SPENDS};
 use loki_signer_core::signing_session::{
     nonce_claim_id, nonce_claim_record, valid_witness_pins, witness_fingerprint, NonceWitness,
     WitnessPins,
@@ -774,9 +775,40 @@ impl Signer {
     /// Round 1: the PUBLIC signing commitment for `attempt_hex` (hex). The secret nonce is
     /// persisted crash-safe to OPFS and never returned. The Worker must pre-open this attempt's
     /// `nonces/<id>.nonce` + `.burn` paths first. Reopen the vault first.
+    /// `spend` is the index of the spent note: each spend commits under its own nonce.
     #[wasm_bindgen(js_name = signCommit)]
-    pub fn sign_commit(&mut self, attempt_hex: &str) -> Result<String, JsError> {
-        self.sign_commit_impl(attempt_hex).map_err(|e| JsError::new(&e))
+    pub fn sign_commit(&mut self, attempt_hex: &str, spend: u32) -> Result<String, JsError> {
+        self.sign_commit_impl(attempt_hex, spend).map_err(|e| JsError::new(&e))
+    }
+
+    /// The crash-safe nonce file id (`payment_id ‖ attempt_id`, hex) of spend `spend`, so the
+    /// Worker can pre-open `nonces/<id>.nonce` and `.burn` before committing.
+    #[wasm_bindgen(js_name = spendNonceId)]
+    pub fn spend_nonce_id(&self, attempt_hex: &str, spend: u32) -> Result<String, JsError> {
+        let (cand, _) = self.candidate_ref(attempt_hex, spend).map_err(|e| JsError::new(&e))?;
+        Ok(hex::encode(cand.payment_id) + &hex::encode(cand.attempt_id))
+    }
+
+    /// Encodes one hex value per spend (a JSON array) as a hosted message body (hex).
+    #[wasm_bindgen(js_name = hostedEncode)]
+    pub fn hosted_encode(&self, items_json: &str) -> Result<String, JsError> {
+        let encode = || -> Result<String, String> {
+            let items: Vec<String> = serde_json::from_str(items_json).map_err(|e| e.to_string())?;
+            let items = items.iter().map(|item| hex::decode(item).map_err(|e| e.to_string())).collect::<Result<Vec<_>, _>>()?;
+            encode_hosted(&items).map(hex::encode)
+        };
+        encode().map_err(|e| JsError::new(&e))
+    }
+
+    /// The per-spend values (a JSON array of hex) of a hosted message body (hex).
+    #[wasm_bindgen(js_name = hostedDecode)]
+    pub fn hosted_decode(&self, body_hex: &str) -> Result<String, JsError> {
+        let decode = || -> Result<String, String> {
+            let body = hex::decode(body_hex).map_err(|e| e.to_string())?;
+            let items = decode_hosted(&body).ok_or("invalid hosted message")?;
+            Ok(serde_json::to_string(&items.into_iter().map(hex::encode).collect::<Vec<_>>()).map_err(|e| e.to_string())?)
+        };
+        decode().map_err(|e| JsError::new(&e))
     }
 
     /// Open the expected sender's candidate, package, or seed for this hosted attempt.
@@ -878,8 +910,8 @@ impl Signer {
     /// `nonce_claim_record` over the confirmed sighash and the randomizer seed). The Worker
     /// claims it at both witnesses, then reports `nonceClaimed`.
     #[wasm_bindgen(js_name = nonceClaim)]
-    pub fn nonce_claim(&self, attempt_hex: &str, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, JsError> {
-        self.nonce_claim_impl(attempt_hex, package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
+    pub fn nonce_claim(&self, attempt_hex: &str, spend: u32, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, JsError> {
+        self.nonce_claim_impl(attempt_hex, spend, package_hex, seed_hex, sighash_hex).map_err(|e| JsError::new(&e))
     }
 
     /// Authorize this exact request inside the signer; the identity never leaves WASM.
@@ -917,13 +949,14 @@ impl Signer {
     pub fn sign_approve(
         &mut self,
         attempt_hex: &str,
+        spend: u32,
         candidate_hex: &str,
         package_hex: &str,
         seed_hex: &str,
         confirmed_sighash_hex: &str,
         terms_json: &str,
     ) -> Result<String, JsError> {
-        self.sign_approve_impl(attempt_hex, candidate_hex, package_hex, seed_hex, confirmed_sighash_hex, terms_json)
+        self.sign_approve_impl(attempt_hex, spend, candidate_hex, package_hex, seed_hex, confirmed_sighash_hex, terms_json)
             .map_err(|e| JsError::new(&e))
     }
 }
@@ -1186,12 +1219,12 @@ fn check_against_terms(
     if *parsed.global().consensus_branch_id() != branch || *parsed.global().expiry_height() != terms.tx_expiry {
         return Err("candidate network or expiry differs from the approved terms".into());
     }
-    let [note] = terms.note_selection.as_slice() else {
-        return Err("the approved terms must spend exactly one note".into());
-    };
+    if terms.note_selection.is_empty() || terms.note_selection.len() > MAX_SPENDS {
+        return Err("the approved terms must spend 1 to 8 notes".into());
+    }
     let recipient = orchard_receiver_from_ua(&terms.recipient, net.network_type())?;
     let expected = Expectations {
-        input_nullifiers: vec![hex32(note)?],
+        input_nullifiers: terms.note_selection.iter().map(|n| hex32(n)).collect::<Result<_, _>>()?,
         recipient: recipient.to_raw_address_bytes(),
         amount_zat: terms.amount_zat,
         memo: terms.memo.as_bytes().to_vec(),
@@ -1320,20 +1353,13 @@ impl Signer {
         Ok(())
     }
 
-    /// This payment's candidate reference. The native host uses `payment_id == attempt_id ==
-    /// attempt`, which also fixes the crash-safe nonce file name; mirror it.
-    fn candidate_ref(&self, attempt_hex: &str) -> Result<(CandidateRef, [u8; 32]), String> {
+    /// The reference of spend `spend` of this payment, derived exactly as the native host does
+    /// (`hosted_spend_ref`), which also fixes the crash-safe nonce file name.
+    fn candidate_ref(&self, attempt_hex: &str, spend: u32) -> Result<(CandidateRef, [u8; 32]), String> {
         let vs = self.vault.as_ref().ok_or("no active vault — call vaultJoin first")?;
         browser_network(vs.signer.network())?;
-        let attempt = hex32(attempt_hex)?;
-        Ok((
-            CandidateRef {
-                vault_id: vs.vref.vault_id,
-                payment_id: attempt,
-                attempt_id: attempt,
-            },
-            vs.vref.vault_id,
-        ))
+        let spend = usize::try_from(spend).ok().filter(|s| *s < MAX_SPENDS).ok_or("spend index out of range")?;
+        Ok((hosted_spend_ref(vs.vref.vault_id, hex32(attempt_hex)?, spend), vs.vref.vault_id))
     }
 
     fn payment_review_impl(&self, candidate_hex: &str) -> Result<String, String> {
@@ -1357,8 +1383,8 @@ impl Signer {
         .to_string())
     }
 
-    fn nonce_claim_impl(&self, attempt_hex: &str, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, String> {
-        let (candidate, _) = self.candidate_ref(attempt_hex)?;
+    fn nonce_claim_impl(&self, attempt_hex: &str, spend: u32, package_hex: &str, seed_hex: &str, sighash_hex: &str) -> Result<String, String> {
+        let (candidate, _) = self.candidate_ref(attempt_hex, spend)?;
         let vs = self.vault.as_ref().ok_or("no active vault — call vaultOpen first")?;
         let package = frost::SigningPackage::deserialize(&hex::decode(package_hex).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
@@ -1401,11 +1427,11 @@ impl Signer {
         Ok(review.to_string())
     }
 
-    fn sign_commit_impl(&mut self, attempt_hex: &str) -> Result<String, String> {
+    fn sign_commit_impl(&mut self, attempt_hex: &str, spend: u32) -> Result<String, String> {
         if self.witness_pins.is_none() {
             return Err("browser signing requires two approved nonce witnesses".into());
         }
-        let (cand, _) = self.candidate_ref(attempt_hex)?;
+        let (cand, _) = self.candidate_ref(attempt_hex, spend)?;
         let vs = self.vault.as_mut().ok_or("no active vault — call vaultJoin first")?;
         let commit = vs.signer.sign_commit(&vs.session, &cand).map_err(|e| e.to_string())?;
         commit.serialize().map(hex::encode).map_err(|e| e.to_string())
@@ -1493,6 +1519,7 @@ impl Signer {
     fn sign_approve_impl(
         &mut self,
         attempt_hex: &str,
+        spend: u32,
         candidate_hex: &str,
         package_hex: &str,
         seed_hex: &str,
@@ -1502,7 +1529,7 @@ impl Signer {
         if self.witness_pins.is_none() {
             return Err("browser signing requires two nonce witnesses; none are configured".into());
         }
-        let (cand, _) = self.candidate_ref(attempt_hex)?;
+        let (cand, _) = self.candidate_ref(attempt_hex, spend)?;
         let terms: Terms = serde_json::from_str(terms_json).map_err(|e| format!("payment terms: {e}"))?;
         let candidate = hex::decode(candidate_hex).map_err(|e| e.to_string())?;
         let package = frost::SigningPackage::deserialize(

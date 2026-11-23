@@ -5,18 +5,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import * as members from '../src/lib/members.ts';
+import { admitGrant } from './grants.mjs';
 
 const origin = 'http://localhost:3001';
 function grant(slot = null) {
   const onboarding_grant = randomBytes(32).toString('hex');
-  const digest = createHash('sha256').update(onboarding_grant).digest('hex');
-  process.env.LOKI_ONBOARDING_GRANTS = JSON.stringify({ ...JSON.parse(process.env.LOKI_ONBOARDING_GRANTS ?? '{}'), [digest]: slot });
+  admitGrant(createHash('sha256').update(onboarding_grant).digest('hex'), slot);
   return { onboarding_grant };
 }
 function cleanup(dir) {
   rmSync(dir, { recursive: true, force: true });
   delete process.env.LOKI_REGISTRY;
-  delete process.env.LOKI_ONBOARDING_GRANTS;
 }
 function relayProof(d, { challenge, relay_challenge_pubkey }) {
   const publicKey = createPublicKey({ key: { kty: 'OKP', crv: 'X25519', x: Buffer.from(relay_challenge_pubkey, 'hex').toString('base64url') }, format: 'jwk' });

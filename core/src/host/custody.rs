@@ -134,13 +134,20 @@ pub(super) fn viewing_key(
     mode: VaultOpen,
     open: impl FnOnce() -> Result<SignerViewingKey, String>,
 ) -> Result<FullViewingKey, String> {
+    if !matches!(mode, VaultOpen::Payment) {
+        // One Touch ID prompt at a time: the signer's own registration prompt first.
+        st.after_first_registration(std::time::Duration::from_secs(90));
+    }
     let mut cache = st.viewing_keys.lock().map_err(|e| e.to_string())?;
     if let Some(Some(fvk)) = cache.get(vault) {
         return Ok(fvk.clone());
     }
+    let mode_name = match mode { VaultOpen::Read => "read", VaultOpen::Retry => "retry", VaultOpen::Payment => "payment" };
     if matches!(mode, VaultOpen::Read) && cache.contains_key(vault) {
+        eprintln!("[verbose] vault {}: key closed after a cancelled Touch ID; a {mode_name} open needs a retry", &vault[..8.min(vault.len())]);
         return Err(NEEDS_TOUCH_ID.into());
     }
+    eprintln!("[verbose] vault {}: opening the viewing key ({mode_name}); Touch ID may prompt", &vault[..8.min(vault.len())]);
     let key = (|| {
         if is_legacy(sealed) {
             migrate(st, data, pass, vault, slot, sealed)?;
@@ -148,6 +155,7 @@ pub(super) fn viewing_key(
         open()
     })().map_err(|error| {
         // Keep the cancellation under the same lock as the open so queued reads can't reprompt.
+        eprintln!("[verbose] vault {}: viewing key open ({mode_name}) failed: {error}", &vault[..8.min(vault.len())]);
         if !matches!(mode, VaultOpen::Payment) && st.config.native && st.config.secure_element == "apple"
             && error.rsplit(": ").next() == Some(CANCELLED_TOUCH_ID)
         {
@@ -157,6 +165,7 @@ pub(super) fn viewing_key(
         error
     })?;
     key.checked_address(sealed, VaultNetwork::parse(sealed["network"].as_str().unwrap_or(""))?)?;
+    eprintln!("[verbose] vault {}: viewing key opened ({mode_name})", &vault[..8.min(vault.len())]);
     cache.insert(vault.to_owned(), Some(key.fvk.clone()));
     Ok(key.fvk)
 }

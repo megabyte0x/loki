@@ -102,14 +102,16 @@ export function chainPaymentSession(r: {
 
 // ─── the signer origin (iframe + postMessage) ────────────────────────────────
 
-/** The signer origin, fixed at build (NEXT_PUBLIC_SIGNER_ORIGIN); never overridable from the page.
- *  `next dev` defaults to the local signer server on :3002. A production build without one
- *  fails closed: every signer call rejects. */
+/** The signer origin from the coordinator's runtime configuration (LOKI_SIGNER_ORIGIN), rendered
+ *  into the page's head by the server layout, else the build's NEXT_PUBLIC_SIGNER_ORIGIN. Never
+ *  taken from the URL. `next dev` defaults to the local signer server on :3002. A production
+ *  deploy without one fails closed: every signer call rejects. */
 function signerOrigin(): string {
-  const configured = process.env.NEXT_PUBLIC_SIGNER_ORIGIN;
+  const rendered = document.head.querySelector('meta[name="loki-signer-origin"]')?.getAttribute("content");
+  const configured = rendered || process.env.NEXT_PUBLIC_SIGNER_ORIGIN;
   if (configured) return new URL(configured).origin;
   if (process.env.NODE_ENV !== "production") return "http://localhost:3002";
-  throw new ApiError("This build has no signer origin (NEXT_PUBLIC_SIGNER_ORIGIN), so the signer is unavailable", 503);
+  throw new ApiError("This deploy has no signer origin (LOKI_SIGNER_ORIGIN), so the signer is unavailable", 503);
 }
 
 const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this browser (first-paint hint only)

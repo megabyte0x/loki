@@ -185,6 +185,17 @@ impl FrostdTransport {
         Ok(t)
     }
 
+    /// The relay address this transport logged in as.
+    pub(crate) fn login_peer(&self) -> [u8; 32] {
+        self.me.0
+    }
+
+    /// Shuts the owned runtime down without blocking, so a transport kept between requests can be
+    /// dropped from any thread, including inside another runtime.
+    pub(crate) fn close_in_background(self) {
+        self.runtime.shutdown_background();
+    }
+
     fn run<T>(&self, request: impl Future<Output = Result<T, TransportError>>) -> Result<T, TransportError> {
         self.runtime.block_on(async {
             tokio::select! {

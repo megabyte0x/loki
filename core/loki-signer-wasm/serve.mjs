@@ -27,12 +27,14 @@
 //   LOKI_SIGNER_PORT      listen port (default 3002)
 import { createServer } from "node:http";
 import { createHash } from "node:crypto";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const port = Number(process.env.LOKI_SIGNER_PORT || 3002);
+// Loopback by default: a tunnel or reverse proxy on this host publishes the origin.
+const host = process.env.LOKI_SIGNER_HOST || "127.0.0.1";
 const walletOrigin = new URL(process.env.LOKI_WALLET_ORIGIN || "http://localhost:3001").origin;
 const frostdUrl = process.env.LOKI_FROSTD_URL || "";
 const rpId = process.env.LOKI_RP_ID || "";
@@ -57,7 +59,10 @@ const bundle = new Map();
 for (const name of ["signer.html", "signer-page.js", "signer-page.css", "signer-worker.js", "lightwalletd.js", "control-inbox.js", "vault-list.js", "storage-guard.js"]) {
   bundle.set(`/${name}`, readFileSync(join(here, name)));
 }
-for (const [prefix, dir] of [["/pkg/", resolve(here, "pkg")], ["/wasm-transport/pkg/", resolve(here, "../wasm-transport/pkg")]]) {
+// The signer pkg is required. The browser relay transport is served only when it was built: a
+// native-only deployment (LokiSigner members only) needs just /config.json from this origin.
+const transportPkg = resolve(here, "../wasm-transport/pkg");
+for (const [prefix, dir] of [["/pkg/", resolve(here, "pkg")], ...(existsSync(transportPkg) ? [["/wasm-transport/pkg/", transportPkg]] : [])]) {
   for (const name of readdirSync(dir, { recursive: true })) {
     if (statSync(join(dir, name)).isFile() && !name.endsWith(".gitignore")) bundle.set(`${prefix}${name}`, readFileSync(join(dir, name)));
   }
@@ -119,4 +124,4 @@ createServer((req, res) => {
     "Content-Security-Policy": `${csp}; worker-src ${topLevelOnly ? "'none'" : "'self'"}; frame-ancestors ${topLevelOnly ? "'none'" : walletOrigin}`,
   });
   res.end(req.method === "HEAD" ? undefined : body ?? "not found");
-}).listen(port, () => console.log(`loki signer origin on http://localhost:${port} (wallet ${walletOrigin}) build ${build.bundle}`));
+}).listen(port, host, () => console.log(`loki signer origin on http://${host}:${port} (wallet ${walletOrigin}) build ${build.bundle}`));

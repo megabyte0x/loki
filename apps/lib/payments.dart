@@ -46,6 +46,14 @@ String _withUnit(Object? zats, {bool fixed = false}) {
   return value == '—' ? value : '$value TAZ';
 }
 
+/// Unix seconds as `YYYY-MM-DD HH:MM:SS UTC`, or null.
+String? _utc(Object? seconds) {
+  if (seconds is! int || seconds <= 0) return null;
+  final t = DateTime.fromMillisecondsSinceEpoch(seconds * 1000, isUtc: true);
+  String two(int n) => n.toString().padLeft(2, '0');
+  return '${t.year}-${two(t.month)}-${two(t.day)} ${two(t.hour)}:${two(t.minute)}:${two(t.second)} UTC';
+}
+
 String? _text(Object? value) =>
     value is String && value.isNotEmpty ? value : null;
 String? _id(Object? value) =>
@@ -95,7 +103,7 @@ String paymentPhase(Json payment) {
     'replaced' => 'Replaced',
     'spent_unverified' => 'Input spent · payment unverified',
     'failed' => 'Failed',
-    'discarding' => 'Releasing reserved input',
+    'discarding' => 'Releasing reserved notes',
     'cancelled' => 'Cancelled',
     'expired' => 'Expired',
     _ => 'Status unavailable',
@@ -351,6 +359,15 @@ class _SendPageState extends State<SendPage> {
   String? _busy, _error;
   bool? _editAfterDiscard;
   bool _publishUncertain = false;
+  // What the vault can pay now, from the signer's local wallet (`balance`).
+  Json? _funds;
+  bool _fundsLoading = false, _fundsFailed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFunds();
+  }
 
   @override
   void didUpdateWidget(covariant SendPage oldWidget) {
@@ -363,6 +380,60 @@ class _SendPageState extends State<SendPage> {
     _busy = _error = null;
     _editAfterDiscard = null;
     _publishUncertain = false;
+    _funds = null;
+    _loadFunds();
+  }
+
+  Future<void> _loadFunds() async {
+    final vault = _text(widget.vault['vault']);
+    if (vault == null || _fundsLoading) return;
+    setState(() => _fundsLoading = true);
+    try {
+      final funds = await widget.request('balance', {'vault': vault});
+      if (!_current(vault)) return;
+      setState(() {
+        _funds = funds;
+        _fundsFailed = false;
+      });
+    } catch (_) {
+      if (_current(vault)) setState(() => _fundsFailed = true);
+    } finally {
+      if (_current(vault)) setState(() => _fundsLoading = false);
+    }
+  }
+
+  /// Why the entered amount can't be funded right now, or null if it can or
+  /// the amounts aren't known. The signer still decides when drafting.
+  String? _fundingBlock() {
+    final funds = _funds, entered = _amountZats(_amount.text);
+    if (funds == null || entered == null) return null;
+    final amount = BigInt.parse(entered),
+        max = _readZats(funds['max_payment_zat']),
+        fee = _readZats(funds['max_payment_fee_zat']) ?? BigInt.zero,
+        spendable = _readZats(funds['spendable_zat']),
+        total = _readZats(funds['balance_zat']),
+        pending = _readZats(funds['pending_zat']) ?? BigInt.zero,
+        reserved = _readZats(funds['reserved_zat']) ?? BigInt.zero;
+    if (max == null || spendable == null || total == null) return null;
+    if (amount <= max) return null;
+    final needed = amount + fee;
+    if (needed > total) {
+      return 'This is more than the vault holds. With the network fee it needs ${_withUnit(needed.toString())}; the vault holds ${_withUnit(total.toString())}.';
+    }
+    if (needed > spendable) {
+      final waiting = pending > BigInt.zero
+          ? '${_withUnit(pending.toString())} is still waiting for ${funds['confirmations_required'] ?? 'more'} confirmations'
+          : null;
+      final held = reserved > BigInt.zero
+          ? '${_withUnit(reserved.toString())} is held by an open payment'
+          : null;
+      final why = [waiting, held].whereType<String>().join(' and ');
+      return 'Not spendable yet${why.isEmpty ? '' : ': $why'}. Spendable now: ${_withUnit(spendable.toString())}.';
+    }
+    final inputs = funds['max_inputs'];
+    return inputs == 1
+        ? 'No single note covers this amount plus the network fee. The largest payment right now is ${_withUnit(max.toString())}.'
+        : 'A payment can combine at most $inputs notes. The largest payment right now is ${_withUnit(max.toString())}.';
   }
 
   @override
@@ -412,11 +483,12 @@ class _SendPageState extends State<SendPage> {
         _draft = draft;
         if (!_hasQuote(draft)) _error = 'The signer did not return a complete quote. Discard the draft and prepare it again.';
       });
-    } catch (_) {
+    } catch (e) {
       if (_current(vault)) {
         setState(
-          () => _error = 'Could not prepare the payment. Check the address, available funds, and History before trying again.',
+          () => _error = walletErrorWith('Could not prepare the payment.', e),
         );
+        _loadFunds();
       }
     } finally {
       if (_current(vault)) setState(() => _busy = null);
@@ -442,11 +514,14 @@ class _SendPageState extends State<SendPage> {
         'attempt': attempt,
       });
       if (_current(vault)) widget.published(attempt);
-    } catch (_) {
+    } catch (e) {
       if (_current(vault)) {
         setState(() {
           _publishUncertain = true;
-          _error = 'Could not confirm publication. Go back and check this payment in History before acting on it again.';
+          _error = walletErrorWith(
+            'Could not confirm publication. Go back and check this payment in History before acting on it again.',
+            e,
+          );
         });
       }
     } finally {
@@ -485,11 +560,13 @@ class _SendPageState extends State<SendPage> {
         _error = null;
       });
       if (!edit) widget.back();
-    } catch (_) {
+    } catch (e) {
       if (_current(vault)) {
         setState(
-          () => _error =
-              'Could not confirm that the draft was discarded. Check History.',
+          () => _error = walletErrorWith(
+            'Could not confirm that the draft was discarded. Check History.',
+            e,
+          ),
         );
       }
     } finally {
@@ -557,9 +634,53 @@ class _SendPageState extends State<SendPage> {
     );
   }
 
+  Widget _funding() {
+    final funds = _funds;
+    if (funds == null) {
+      return _PaymentNote(
+        _fundsFailed
+            ? 'Could not read the spendable balance. The signer still checks funds when you prepare the draft.'
+            : 'Reading the spendable balance…',
+        error: _fundsFailed,
+      );
+    }
+    final spendable = _readZats(funds['spendable_zat']),
+        total = _readZats(funds['balance_zat']),
+        pending = _readZats(funds['pending_zat']) ?? BigInt.zero,
+        reserved = _readZats(funds['reserved_zat']) ?? BigInt.zero,
+        max = _readZats(funds['max_payment_zat']);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      spacing: 8,
+      children: [
+        ValueRow('Spendable now', _withUnit(spendable?.toString()), mono: true),
+        if (total != spendable)
+          ValueRow('Total balance', _withUnit(total?.toString()), mono: true),
+        if (pending > BigInt.zero)
+          _PaymentNote(
+            '${_withUnit(pending.toString())} waiting for ${funds['confirmations_required'] ?? 'more'} confirmations.',
+          ),
+        if (reserved > BigInt.zero)
+          _PaymentNote(
+            '${_withUnit(reserved.toString())} held by an open payment.',
+          ),
+        if (max != null && spendable != null && max < spendable)
+          ValueRow(
+            'Largest payment now',
+            _withUnit(max.toString()),
+            mono: true,
+          ),
+        _PaymentNote(
+          'As of block ${funds['scanned_height'] ?? '—'}, as reported by the chain provider.',
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final policy = _policy(widget.vault);
+    final block = _draft == null ? _fundingBlock() : null;
     final details = Surface(
       padding: const EdgeInsets.all(18),
       child: Column(
@@ -593,6 +714,16 @@ class _SendPageState extends State<SendPage> {
         children: [
           const LokiLabel('Transaction summary'),
           _AmountHeading(_amountZats(_amount.text), pending: true),
+          const Divider(height: 1),
+          _funding(),
+          Align(
+            alignment: Alignment.centerLeft,
+            child: ActionChipButton(
+              _fundsLoading ? 'Refreshing…' : 'Refresh balance',
+              Icons.refresh,
+              _fundsLoading || _busy != null ? null : _loadFunds,
+            ),
+          ),
           const Divider(height: 1),
           ValueRow('Network fee', _withUnit(_draft?['fee_zat']), mono: true),
           ValueRow('Change', _withUnit(_draft?['change_zat']), mono: true),
@@ -634,11 +765,12 @@ class _SendPageState extends State<SendPage> {
                 ),
         ),
         if (_error case final error?) _PaymentNote(error, error: true),
+        if (block != null && _error == null) _PaymentNote(block, error: true),
         if (_editAfterDiscard != null)
           _Confirmation(
             title: 'Discard this draft?',
             message: const _PaymentNote(
-              'This releases the draft’s reserved input without sending it. You can prepare a new draft afterward.',
+              'This releases the draft’s reserved notes without sending it. You can prepare a new draft afterward.',
             ),
             action: 'Discard draft',
             confirm: _discardDraft,
@@ -669,7 +801,7 @@ class _SendPageState extends State<SendPage> {
                   _busy != null || _text(widget.vault['vault']) == null
                       ? null
                       : _draft == null
-                      ? _prepare
+                      ? (block == null ? _prepare : null)
                       : _hasQuote(_draft!)
                       ? _publish
                       : null,
@@ -844,13 +976,13 @@ class _HistoryPageState extends State<HistoryPage> {
         'Request cancellation',
         'Request approvals',
         'Discard draft',
-        'Propose spending the same note back to the vault, less the network fee. Your vault’s approval policy still applies.',
+        'Propose spending the same notes back to the vault, less the network fee. Your vault’s approval policy still applies.',
       ),
       _ => (
         'Retry payment',
         'Request approvals',
         'Discard draft',
-        'Propose paying the same recipient again using the same note. Your vault’s approval policy still applies.',
+        'Propose paying the same recipient again using the same notes. Your vault’s approval policy still applies.',
       ),
     };
     final vault = widget.vault!;
@@ -859,8 +991,7 @@ class _HistoryPageState extends State<HistoryPage> {
         latest != null &&
         switch (action) {
           // The draft remains actionable if the original merely expires.
-          'retry' ||
-          'cancel' => !{
+          'retry' || 'cancel' => !{
             'confirmed',
             'replaced',
             'spent_unverified',
@@ -884,7 +1015,7 @@ class _HistoryPageState extends State<HistoryPage> {
         if (draft != null)
           const _ReviewNotice(
             'The original payment may confirm first',
-            'Both transactions spend the same note, so only one can be mined. Requesting approvals does not stop the original payment.',
+            'Both transactions spend the same notes, so only one can be mined. Requesting approvals does not stop the original payment.',
             warning: true,
           ),
         _PaymentDetails(
@@ -931,7 +1062,7 @@ class _HistoryPageState extends State<HistoryPage> {
           )
         else
           const _ReviewNotice(
-            'Releases the reserved input',
+            'Releases the reserved notes',
             'Discarding releases this payment’s reservation on the input. Nothing is sent.',
             warning: true,
           ),
@@ -1056,6 +1187,7 @@ class _HistoryPageState extends State<HistoryPage> {
     final replaces = _object(payment['replaces']),
         replacedBy = _id(payment['replaced_by']);
     final hasError = _text(payment['error']) != null;
+    final failure = hasError ? paymentFailure(payment) : null;
     final signers = payment['signers'], slot = vault['my_slot'];
     final canReview =
         phase == 'signing' &&
@@ -1094,6 +1226,8 @@ class _HistoryPageState extends State<HistoryPage> {
           const Divider(height: 1),
           if (fee != null)
             ValueRow('Network fee', _withUnit(fee.toString()), mono: true),
+          if (_utc(payment['created_at']) case final created?)
+            ValueRow('Created', created, mono: true),
           if (confirmed && height is int && height > 0)
             ValueRow(
               'Block height',
@@ -1120,15 +1254,11 @@ class _HistoryPageState extends State<HistoryPage> {
             ),
           if (replaces != null)
             _PaymentNote(
-              '${replaces['cancel'] == true ? 'Cancellation' : 'Retry'} of payment ${_short(_text(replaces['attempt']) ?? 'request')}. Both spend the same note.',
+              '${replaces['cancel'] == true ? 'Cancellation' : 'Retry'} of payment ${_short(_text(replaces['attempt']) ?? 'request')}. Both spend the same notes.',
             ),
           if (!settled && payment['approvals'] is List)
             _ApprovalStatus(vault, payment),
-          if (!settled && hasError)
-            const _PaymentNote(
-              'The signer reported a problem with this payment.',
-              error: true,
-            ),
+          if (!settled && failure != null) _PaymentNote(failure, error: true),
           if (recipient != null) ...[
             const Divider(height: 1),
             _identifier(attempt, 'Recipient', recipient),
@@ -1205,12 +1335,13 @@ class _HistoryPageState extends State<HistoryPage> {
         ? 'Received'
         : payment['amount_is_net'] == true
         ? 'Net outflow'
+        // Once mined, a retry is simply a sent payment; its details still name what it replaced.
+        : confirmed
+        ? (replaces?['cancel'] == true ? 'Cancelled payment' : 'Sent')
         : replaces != null
         ? (replaces['cancel'] == true
               ? 'Cancellation request'
               : 'Retry request')
-        : confirmed
-        ? 'Sent'
         : 'Payment proposal';
     final recipient = _text(payment['recipient']);
     final status = paymentPhase(payment);
@@ -1235,7 +1366,11 @@ class _HistoryPageState extends State<HistoryPage> {
                       ? colors.mint.withValues(alpha: .09)
                       : colors.secondary,
                   child: Icon(
-                    confirmed ? Icons.north_east : Icons.draw_outlined,
+                    payment['direction'] == 'received'
+                        ? Icons.south_west
+                        : confirmed
+                        ? Icons.north_east
+                        : Icons.draw_outlined,
                     size: 15,
                     color: selected
                         ? colors.mint
@@ -1257,9 +1392,10 @@ class _HistoryPageState extends State<HistoryPage> {
                           fontWeight: FontWeight.w600,
                         ),
                       ),
-                      if (recipient != null)
+                      // A deposit has no recipient to show; name its transaction instead.
+                      if (recipient ?? _id(payment['txid']) case final shown?)
                         Text(
-                          _short(recipient),
+                          _short(shown),
                           overflow: TextOverflow.ellipsis,
                           maxLines: 1,
                           style: lokiMono(10, color: colors.muted),
@@ -1332,11 +1468,7 @@ class _HistoryPageState extends State<HistoryPage> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       spacing: 24,
       children: [
-        LokiHead(
-          vault == null ? 'Workspace' : _vaultName(vault),
-          'History',
-          'Outgoing payments and proposals from this vault.',
-        ),
+        LokiHead(vault == null ? 'Workspace' : _vaultName(vault), 'History'),
         LayoutBuilder(
           builder: (context, bounds) {
             final sideBySide = selected != null && bounds.maxWidth >= 610;
@@ -1646,7 +1778,7 @@ class _PaymentReviewState extends State<PaymentReview> {
                   color: colors.gold,
                 ),
                 _PaymentNote(
-                  'Replaces ${_short(_text(replaces['attempt']) ?? 'an earlier payment')}. Both proposals spend the same note, so at most one can be mined.',
+                  'Replaces ${_short(_text(replaces['attempt']) ?? 'an earlier payment')}. Both proposals spend the same notes, so at most one can be mined.',
                 ),
                 if (_readZats(replaces['amount_zat']) != null)
                   ValueRow(
@@ -1677,8 +1809,8 @@ class _PaymentReviewState extends State<PaymentReview> {
             error: true,
           ),
         if (status?['error'] != null)
-          const _PaymentNote(
-            'The signer reported a problem. Check History for available actions.',
+          _PaymentNote(
+            '${paymentFailure(status) ?? 'The signer reported a problem.'} Check History for available actions.',
             error: true,
           ),
         if (_approvalUnknown && !_alreadyRequested && !noLongerOpen)

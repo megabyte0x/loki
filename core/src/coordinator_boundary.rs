@@ -176,7 +176,7 @@ mod tests {
                 _: &Session,
                 _: &crate::signer::CandidateRef,
                 _: &crate::signer::PublicPaymentParams,
-                _: &[u8; 32],
+                _: &[[u8; 32]],
             ) -> Result<crate::signer::CandidatePczt, ()> {
                 Err(())
             }

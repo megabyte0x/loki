@@ -200,6 +200,59 @@ private final class ReviewDisclosure: NSButton {
     }
 }
 
+/// When a native prompt may take input, kept apart from AppKit. Input counts only after the window
+/// has stayed key for `delay` (anti-clickjacking), and a click that focuses the window or starts the
+/// delay never reaches a control.
+struct PromptArming {
+    static let delay: TimeInterval = 1
+
+    /// Uptime from which input counts; infinity until armed.
+    private(set) var acceptsInput = TimeInterval.infinity
+    private var pending: TimeInterval?
+
+    enum Click: Equatable {
+        /// The window isn't key: make it key and drop the click.
+        case focusWindow
+        /// The window is key but the delay never started (a missed notification): start it and drop the click.
+        case arm
+        case deliver
+        case drop
+    }
+
+    var armed: Bool { acceptsInput.isFinite }
+
+    /// The window became key at `now`. Returns how long to wait before calling `delayElapsed`.
+    mutating func becameKey(at now: TimeInterval) -> TimeInterval {
+        acceptsInput = .infinity
+        pending = now + Self.delay
+        return Self.delay
+    }
+
+    /// Arms only if the window is still key and visible when the delay ends. Otherwise the delay is
+    /// spent, so the next click in a key window starts a new one instead of being dropped forever.
+    mutating func delayElapsed(windowIsKey: Bool, visible: Bool) -> Bool {
+        guard let deadline = pending else { return false }
+        pending = nil
+        guard windowIsKey, visible else { return false }
+        acceptsInput = deadline
+        return true
+    }
+
+    mutating func resignedKey() {
+        pending = nil
+        acceptsInput = .infinity
+    }
+
+    func accepts(_ time: TimeInterval) -> Bool { time >= acceptsInput }
+
+    /// A mouse-down inside the prompt, at event time `time`.
+    func click(at time: TimeInterval, windowIsKey: Bool) -> Click {
+        guard windowIsKey else { return .focusWindow }
+        if accepts(time) { return .deliver }
+        return armed || pending != nil ? .drop : .arm
+    }
+}
+
 /// A regular document view in the wallet window. No modal session or Flutter decision channel.
 final class SignerPromptPage: NSView {
     private let fields: [NSTextField]
@@ -207,7 +260,11 @@ final class SignerPromptPage: NSView {
     private let expiry: TimeInterval
     private let escape: NSApplication.ModalResponse?
     private var complete: ((NSApplication.ModalResponse) -> Void)?
-    private var acceptsInput = TimeInterval.infinity
+    private var arming = PromptArming()
+    private let hint: NSTextField
+    private let readyHint: String
+    /// Shown while the prompt ignores input, so a locked prompt says how to unlock it.
+    static let waitingHint = "Click here to review this request."
     private var enable: Timer?
     private var timeout: Timer?
     private var monitor: Any?
@@ -224,6 +281,8 @@ final class SignerPromptPage: NSView {
         requiresAcknowledgment = escape == nil
         self.complete = complete
         expiry = timeout.map { ProcessInfo.processInfo.systemUptime + $0 } ?? .infinity
+        readyHint = review.hint
+        hint = SignerReview.label(Self.waitingHint, size: 11, tone: SignerReview.muted)
         buttons = review.actions.enumerated().map { index, title in
             let button = NSButton(title: title, target: nil, action: nil)
             button.tag = index
@@ -261,7 +320,6 @@ final class SignerPromptPage: NSView {
         actions.spacing = 10
         actions.setHuggingPriority(.required, for: .horizontal)
         actions.translatesAutoresizingMaskIntoConstraints = false
-        let hint = SignerReview.label(review.hint, size: 11, tone: SignerReview.muted)
         hint.translatesAutoresizingMaskIntoConstraints = false
         for button in buttons {
             button.target = self
@@ -313,6 +371,10 @@ final class SignerPromptPage: NSView {
             center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: parent, queue: nil) { [weak self] _ in self?.arm() },
             center.addObserver(forName: NSWindow.didResignKeyNotification, object: parent, queue: nil) { [weak self] _ in self?.disarm() },
             center.addObserver(forName: NSWindow.willCloseNotification, object: parent, queue: nil) { [weak self] _ in self?.finish(.abort) },
+            // A prompt that became key while minimized couldn't arm; arm when it is shown again.
+            center.addObserver(forName: NSWindow.didDeminiaturizeNotification, object: parent, queue: nil) { [weak self, weak parent] _ in
+                if parent?.isKeyWindow == true { self?.arm() }
+            },
         ]
         for field in fields where field is NSSecureTextField {
             observers.append(center.addObserver(forName: NSControl.textDidBeginEditingNotification, object: field, queue: nil) { _ in
@@ -333,16 +395,20 @@ final class SignerPromptPage: NSView {
             timeout = timer
             RunLoop.main.add(timer, forMode: .common)
         }
-        if parent.isKeyWindow { arm() }
+        if parent.isKeyWindow {
+            arm()
+        } else {
+            SignerLog.write("A LokiSigner prompt is waiting for its window to be focused.")
+        }
     }
 
     private func arm() {
         disarm()
         window?.makeFirstResponder((fields.first as NSView?) ?? self)
-        let deadline = ProcessInfo.processInfo.systemUptime + 1
-        let timer = Timer(timeInterval: 1, repeats: false) { [weak self] _ in
-            guard let self, window?.isKeyWindow == true, window?.isVisible == true else { return }
-            acceptsInput = deadline
+        hint.stringValue = readyHint
+        let wait = arming.becameKey(at: ProcessInfo.processInfo.systemUptime)
+        let timer = Timer(timeInterval: wait, repeats: false) { [weak self] _ in
+            guard let self, arming.delayElapsed(windowIsKey: window?.isKeyWindow == true, visible: window?.isVisible == true) else { return }
             buttons.forEach { $0.isEnabled = true }
         }
         enable = timer
@@ -351,27 +417,42 @@ final class SignerPromptPage: NSView {
 
     private func disarm() {
         enable?.invalidate()
-        acceptsInput = .infinity
+        arming.resignedKey()
         buttons.forEach { $0.isEnabled = false }
+        hint.stringValue = Self.waitingHint
+    }
+
+    /// Makes the prompt's window key in response to the user's own click. The click is dropped;
+    /// `didBecomeKey` then starts the usual delay. Unsolicited prompts never call this.
+    private func focusWindow(_ window: NSWindow) {
+        if !NSApp.isActive { NSApp.activate(ignoringOtherApps: true) }
+        window.makeKeyAndOrderFront(nil)
     }
 
     private func filtered(_ event: NSEvent) -> NSEvent? {
         guard let window, event.window === window else { return event }
         if event.type != .keyDown {
             guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return event }
-            return event.timestamp >= acceptsInput ? event : nil
+            let click = arming.click(at: event.timestamp, windowIsKey: window.isKeyWindow)
+            guard event.type == .leftMouseDown else { return click == .deliver ? event : nil }
+            switch click {
+            case .deliver: return event
+            case .drop: return nil
+            case .focusWindow: focusWindow(window); return nil
+            case .arm: arm(); return nil
+            }
         }
         if event.modifierFlags.contains(.command), event.keyCode == 12 || event.keyCode == 13 {
             return requiresAcknowledgment ? nil : event // Quit / Close
         }
         if event.keyCode == 53 { // Escape never accepts.
-            if let escape, event.timestamp >= acceptsInput, !event.isARepeat { finish(escape) }
+            if let escape, arming.accepts(event.timestamp), !event.isARepeat { finish(escape) }
             return nil
         }
         let focused = window.firstResponder
         let editing = fields.first { $0 === focused || (focused != nil && $0.currentEditor() === focused) }
         guard editing != nil || focused === self || (focused as? NSView)?.isDescendant(of: self) == true else { return event }
-        guard event.timestamp >= acceptsInput else { return nil }
+        guard arming.accepts(event.timestamp) else { return nil }
         switch event.keyCode {
         case 36, 76: return nil // Never default to a decision.
         case 48:
@@ -396,7 +477,7 @@ final class SignerPromptPage: NSView {
 
     @objc private func choose(_ sender: NSButton) {
         let now = ProcessInfo.processInfo.systemUptime
-        guard now >= acceptsInput, window?.isKeyWindow == true else { return }
+        guard arming.accepts(now), window?.isKeyWindow == true else { return }
         finish(now >= expiry ? .abort : NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + sender.tag))
     }
 

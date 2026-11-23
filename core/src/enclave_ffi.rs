@@ -283,7 +283,10 @@ pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char
             2 | 3 => crate::host::native_set_aside(&data, action == 3)?,
             _ => return Err("unknown profile action".into()),
         }
-        let mut reply = serde_json::json!({ "profile": crate::host::native_profile_state(&data)? });
+        let mut reply = serde_json::json!({
+            "profile": crate::host::native_profile_state(&data)?,
+            "pairing_pending": crate::host::pairing_pending(&data),
+        });
         if let Ok(paired) = crate::host::RegistrationConfig::resume(&data, config.development_http) {
             reply["slot"] = serde_json::json!(paired.slot);
             // Local only: binds a pending invite link to the pinned coordinator while locked.

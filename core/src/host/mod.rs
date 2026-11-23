@@ -3,7 +3,25 @@
 //! coordinator only publishes public artifacts. This process drives the audited library. All library calls run on `spawn_blocking` because the hosted relay
 //! stack blocks on its own runtime (see `setup_relay::shared_runtime`).
 
+/// Records a fixed diagnostic event in the native app's log. A no-op for other members and builds.
+/// `$event` is only compiled where the native log exists.
+macro_rules! native_event {
+    ($st:expr, $event:expr) => {{
+        let state: &crate::host::state::AppState = $st;
+        if state.config.native {
+            #[allow(unused_imports)]
+            use crate::host::diagnostics::{DraftRefusal, Event, PaymentFailure};
+            let event: Event = $event;
+            #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+            crate::host::native_member::emit_for(state, event);
+            #[cfg(not(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))))]
+            let _ = event;
+        }
+    }};
+}
+
 mod ceremony;
+mod diagnostics;
 mod connect;
 mod custody;
 mod device;
@@ -25,6 +43,8 @@ pub use state::Config;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use connect::{ConnectAttempt, LocalConnect};
 pub use registration::RegistrationConfig;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use registration::pairing_pending;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
