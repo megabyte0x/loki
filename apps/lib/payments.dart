@@ -1468,11 +1468,7 @@ class _HistoryPageState extends State<HistoryPage> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       spacing: 24,
       children: [
-        LokiHead(
-          vault == null ? 'Workspace' : _vaultName(vault),
-          'History',
-          'Outgoing payments and proposals from this vault.',
-        ),
+        LokiHead(vault == null ? 'Workspace' : _vaultName(vault), 'History'),
         LayoutBuilder(
           builder: (context, bounds) {
             final sideBySide = selected != null && bounds.maxWidth >= 610;
