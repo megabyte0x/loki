@@ -832,12 +832,13 @@ impl VaultWallet {
                 };
                 propose(&mut self.db, confirmations, NoteSelection::PreferConsolidation)
                     .map_err(|error| {
-                        // The native host can sign only one input. Check whether lowering just
-                        // the confirmation depths would fund it, without reserving any notes.
+                        // A hosted payment spends at most MAX_SPENDS notes. Check whether lowering
+                        // just the confirmation depths would fund it, without reserving any notes.
                         let covers_one_note = |db: &mut Database, policy| {
                             propose(db, policy, NoteSelection::PreferSingle).is_ok_and(|proposal| {
-                                proposal.steps().first().shielded_inputs()
-                                    .is_some_and(|inputs| inputs.notes().len() == 1)
+                                proposal.steps().first().shielded_inputs().is_some_and(|inputs| {
+                                    inputs.notes().len() <= loki_signer_core::signing_session::MAX_SPENDS
+                                })
                             })
                         };
                         if explain_wait && matches!(error, FundingError::InsufficientFunds { .. })

@@ -30,10 +30,10 @@ pub(super) fn err(code: StatusCode, message: impl Into<String>) -> Reply {
 /// A stable code for the host's own error sentences, so the wallet can show its own wording
 /// instead of the text. Errors without a code are shown only after sanitizing.
 pub(super) fn error_code(error: &str) -> Option<&'static str> {
-    use payment::{ENOUGH_APPROVED, NO_SINGLE_NOTE, REPEATED_APPROVAL};
+    use payment::{ENOUGH_APPROVED, REPEATED_APPROVAL, TOO_MANY_NOTES};
     Some(match error {
         e if e.starts_with(crate::wallet_store::FUNDS_WAITING) => "funds_pending_confirmation",
-        e if e == NO_SINGLE_NOTE || e == "note cannot cover amount and fee" => "no_single_note",
+        e if e == TOO_MANY_NOTES || e == "notes cannot cover amount and fee" => "too_many_notes",
         e if e.starts_with("fund payment:") => "insufficient_funds",
         e if e.starts_with("not a unified address") || e.starts_with("that address ")
             || e == "the Orchard receiver is not a valid address" => "invalid_address",

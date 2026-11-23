@@ -279,17 +279,17 @@ pub trait Signer {
     ) -> Result<frost::round1::SigningCommitments, Self::Error>;
 
     /// Build the UNSIGNED candidate PCZT for this payment, under the coordinator-supplied
-    /// rerandomizer `alpha` (its canonical 32-byte encoding, derived from the round-1
-    /// commitments). The signer uses its OWN held viewing key and selects its OWN notes;
-    /// the coordinator supplies only the public effects (`params`) and `alpha`. Returns the
-    /// serialized, IO-finalized candidate bytes that round 2 then renders and signs. The
-    /// coordinator never sees the viewing key or chooses the note.
+    /// rerandomizers `alphas` (canonical 32-byte encodings, derived from the round-1
+    /// commitments), one per spent note. The signer uses its OWN held viewing key and its OWN
+    /// notes; the coordinator supplies only the public effects (`params`) and `alphas`. Returns
+    /// the serialized, IO-finalized candidate bytes that round 2 then renders and signs. The
+    /// coordinator never sees the viewing key or chooses the notes.
     fn build_candidate(
         &self,
         session: &Session,
         cand: &CandidateRef,
         params: &PublicPaymentParams,
-        alpha: &[u8; 32],
+        alphas: &[[u8; 32]],
     ) -> Result<CandidatePczt, Self::Error>;
 
     /// Round 2 (rerandomized): BLOCKS on in-signer parse + render + approval + sighash

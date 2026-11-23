@@ -135,8 +135,8 @@ String walletErrorWith(String lead, Object error) {
 const _errorSentences = <String, String>{
   'funds_pending_confirmation':
       'These funds are still waiting for confirmations. Try again after a few more blocks.',
-  'no_single_note':
-      'No single spendable note covers this amount plus the network fee. Send a smaller amount.',
+  'too_many_notes':
+      'This amount needs more notes than one payment can combine. Send a smaller amount.',
   'insufficient_funds':
       'The vault does not have enough spendable funds for this amount plus the network fee.',
   'invalid_address': 'That is not a valid Orchard address for this network.',

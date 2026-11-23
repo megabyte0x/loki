@@ -591,7 +591,8 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     hex32(&p.vault)?;
     hex32(&p.attempt)?;
     if !v.peers.contains_key(&p.proposer)
-        || p.note_selection.len() != 1
+        || p.note_selection.is_empty()
+        || p.note_selection.len() > MAX_INPUTS
         || p.amount_zat == 0
         || p.expiry_height <= p.target_height
         || p.expiry_height > draft_expiry(p.target_height.saturating_add(2), v.network)?
@@ -603,7 +604,10 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
     MemoBytes::from_bytes(p.memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
     Zatoshis::from_u64(p.amount_zat).map_err(|e| format!("amount: {e:?}"))?;
     Zatoshis::from_u64(p.change_zat).map_err(|e| format!("change: {e:?}"))?;
-    hex32(&p.note_selection[0])?;
+    let inputs = input_nullifiers(p)?;
+    if inputs.iter().enumerate().any(|(i, n)| inputs[..i].contains(n)) {
+        return Err("payment spends one note twice".into());
+    }
     if let Some(r) = &p.replaces {
         hex32(&r.attempt)?;
     }
@@ -618,6 +622,30 @@ fn check_intent(p: &Payment, v: &Vault) -> Result<(), String> {
 /// A replacement spends the note of the payment it replaces, and a Retry keeps its terms. A
 /// member that holds the replaced payment checks that; one that never saw it relies on the
 /// candidate review alone.
+/// The nullifiers of every note this payment spends.
+fn input_nullifiers(p: &Payment) -> Result<Vec<[u8; 32]>, String> {
+    p.note_selection.iter().map(|n| hex32(n)).collect()
+}
+
+/// One signing reference per spent note. The first is the attempt itself; the others are derived
+/// from it, so every spend has its own single-use nonce id (`payment_id ‖ attempt_id`).
+fn spend_refs(p: &Payment) -> Result<Vec<CandidateRef>, String> {
+    let vault_id = hex32(&p.vault)?;
+    let attempt = hex32(&p.attempt)?;
+    Ok((0..p.note_selection.len()).map(|spend| {
+        let attempt_id = if spend == 0 {
+            attempt
+        } else {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"Loki_hosted_spend_v1\0");
+            hash.update(&attempt);
+            hash.update(&(spend as u32).to_be_bytes());
+            *hash.finalize().as_bytes()
+        };
+        CandidateRef { vault_id, payment_id: attempt, attempt_id }
+    }).collect())
+}
+
 fn check_replacement(data: &Path, pass: &str, v: &Vault, p: &Payment) -> Result<(), String> {
     let Some(r) = &p.replaces else { return Ok(()) };
     let Ok(old) = read_payment(data, pass, &p.vault, &r.attempt) else { return Ok(()) };
@@ -1262,9 +1290,14 @@ fn reconcile(data: &Path, pass: &str, vault: &str, slot: u16, w: &mut VaultWalle
     for attempt in local_attempts(data, vault)? {
         let Ok(before) = read_payment(data, pass, vault, &attempt) else { continue };
         if matches!(before.phase.as_str(), "cancelled" | "dismissed") { continue; }
-        let note = hex32(before.note_selection.first().ok_or("payment has no input note")?)?;
+        let notes = input_nullifiers(&before)?;
+        if notes.is_empty() { return Err("payment has no input note".into()); }
         let mut p = before.clone();
-        let spend_id = w.mined_spend(&note)?;
+        // A mined spend of any input settles the payment, or shows it was replaced.
+        let mut spend_id = None;
+        for note in &notes {
+            if let Some(txid) = w.mined_spend(note)? { spend_id = Some(txid); break; }
+        }
         let mined = spend_id.map(|txid| txid.to_string());
         if !p.tx_verified && (p.raw_tx.is_some() || mined.is_some()) {
             if let Some(hash) = pinned_sighash(data, pass, &p)? {
@@ -1308,9 +1341,13 @@ fn reconcile(data: &Path, pass: &str, vault: &str, slot: u16, w: &mut VaultWalle
             && (p.proposer == slot || p.approval_requested || p.broadcast_requested)
             && (p.target_height <= tip || p.approval_started || p.broadcast_requested)
             && expiry > tip
-            && live.get(&note).is_none_or(|&(_, held_expiry)| expiry > held_expiry)
         {
-            live.insert(note, (zcash_client_backend::wallet::LockOwner::new(hex32(&p.attempt)?), expiry));
+            // Every input stays reserved while the payment can still go out.
+            for note in notes {
+                if live.get(&note).is_none_or(|&(_, held_expiry)| expiry > held_expiry) {
+                    live.insert(note, (zcash_client_backend::wallet::LockOwner::new(hex32(&p.attempt)?), expiry));
+                }
+            }
         }
     }
     w.set_reservations(&live)
@@ -1326,9 +1363,10 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
         let (w, _, _) = wallet(&st, &data, &pass, vault, &v)?;
         let s = w.spendability()?;
         let largest = s.spendable_notes.first().copied();
-        // The hosted signer spends one note per payment, so the largest note bounds a payment.
-        let fee = largest.map(|note| payment_fee(&v, &w, note)).transpose()?;
-        let max_payment = largest.zip(fee).map_or(0, |(note, fee)| note.value().inner().saturating_sub(fee));
+        // One payment combines at most MAX_INPUTS notes, so the largest of them bound it.
+        let top = &s.spendable_notes[..s.spendable_notes.len().min(MAX_INPUTS)];
+        let fee = (!top.is_empty()).then(|| payment_fee(&v, &w, top)).transpose()?;
+        let max_payment = fee.map_or(0, |fee| notes_value(top).saturating_sub(fee));
         Ok(json!({
             "balance_zat": s.total_zat, "spendable_zat": s.spendable_zat,
             "pending_zat": s.pending_zat, "reserved_zat": s.reserved_zat,
@@ -1353,25 +1391,52 @@ fn draft_refusal(error: &str) -> super::diagnostics::DraftRefusal {
     use super::diagnostics::DraftRefusal;
     match super::routes::error_code(error) {
         Some("funds_pending_confirmation") => DraftRefusal::WaitingForConfirmations,
-        Some("no_single_note") => DraftRefusal::NoSingleNote,
+        Some("too_many_notes") => DraftRefusal::NoSingleNote,
         Some("insufficient_funds") => DraftRefusal::InsufficientFunds,
         _ => DraftRefusal::Other,
     }
 }
 
-/// Notes one hosted payment can spend.
-const MAX_INPUTS: usize = 1;
+/// Notes one hosted payment can spend: each is its own action, nonce and signature share.
+pub(super) const MAX_INPUTS: usize = crate::signing_session::MAX_SPENDS;
 
-/// The ZIP-317 fee of a payment spending `note`, priced by the same builder as the draft.
-fn payment_fee(v: &Vault, w: &VaultWallet, note: orchard::note::Note) -> Result<u64, String> {
+/// The ZIP-317 fee of a payment spending `notes`, priced by the same builder as the draft.
+fn payment_fee(v: &Vault, w: &VaultWallet, notes: &[orchard::note::Note]) -> Result<u64, String> {
     let (anchor, expiry) = heights(w, v)?;
     let own = v.fvk.address_at(0u64, orchard::keys::Scope::External);
-    let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![note], recipient: own, amount: Zatoshis::ZERO,
+    let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: notes.to_vec(), recipient: own, amount: Zatoshis::ZERO,
         memo: MemoBytes::empty(), change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
     Ok(quote_fee(&v.network, &inputs)?.into())
 }
 
-pub(super) const NO_SINGLE_NOTE: &str = "payment needs one Ironwood note large enough for amount and fee";
+fn notes_value(notes: &[orchard::note::Note]) -> u64 {
+    notes.iter().map(|note| note.value().inner()).fold(0u64, u64::saturating_add)
+}
+
+/// The notes a payment of `amount_zat` spends, with their fee. `spendable` is largest first.
+/// The smallest single note that covers amount and fee is cheapest; otherwise the fewest of the
+/// largest notes, up to `MAX_INPUTS`. `None` if no such set covers it.
+fn select_notes(
+    spendable: &[orchard::note::Note],
+    amount_zat: u64,
+    fee_of: impl Fn(&[orchard::note::Note]) -> Result<u64, String>,
+) -> Result<Option<(Vec<orchard::note::Note>, u64)>, String> {
+    let Some(first) = spendable.first() else { return Ok(None) };
+    let single_fee = fee_of(&[*first])?;
+    if let Some(note) = spendable.iter().rev().find(|n| n.value().inner() >= amount_zat.saturating_add(single_fee)) {
+        return Ok(Some((vec![*note], single_fee)));
+    }
+    for count in 2..=spendable.len().min(MAX_INPUTS) {
+        let notes = &spendable[..count];
+        let fee = fee_of(notes)?;
+        if notes_value(notes) >= amount_zat.saturating_add(fee) {
+            return Ok(Some((notes.to_vec(), fee)));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) const TOO_MANY_NOTES: &str = "payment needs more Ironwood notes than one payment can spend";
 
 /// Scans the wallet without `st.payment`, then prepares the draft under it, so a long lightwalletd
 /// scan never blocks approvals or status. Reconciling and reserving still happen under the lock,
@@ -1399,35 +1464,28 @@ fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value, v: Vault, mu
     reconcile(data, pass, vault, v.slot, &mut w)?;
     let (anchor, expiry) = heights(&w, &v)?;
     // Pick from every spendable, unreserved note (largest first), not only from the notes the
-    // wallet's multi-note selector would choose: the smallest one that covers amount and fee.
+    // wallet's own selector would choose.
     let spendable = w.spendability()?.spendable_notes;
-    let covering = |fee_zat: u64| spendable.iter().rev()
-        .find(|note| note.value().inner() >= amount_zat.saturating_add(fee_zat)).copied();
-    let quoted = match spendable.first() {
-        Some(note) => {
-            let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![*note], recipient: address, amount, memo: memo_bytes.clone(), change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
-            let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
-            covering(fee_zat).map(|note| (note, fee_zat))
-        }
-        None => None,
+    let fee_of = |notes: &[orchard::note::Note]| -> Result<u64, String> {
+        let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: notes.to_vec(), recipient: address, amount, memo: memo_bytes.clone(), change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
+        Ok(quote_fee(&v.network, &inputs)?.into())
     };
-    let Some((note, fee_zat)) = quoted else {
-        // Explain why: funds still confirming, or too little in total; otherwise only a
-        // multi-note payment could fund it.
+    let Some((notes, fee_zat)) = select_notes(&spendable, amount_zat, fee_of)? else {
+        // Explain why: funds still confirming, or too little in total; otherwise it would
+        // take more notes than one payment can spend.
         w.propose_with_confirmation_wait(address, Some(amount), memo_bytes, st.config.native)?;
-        return Err(NO_SINGLE_NOTE.into());
+        return Err(TOO_MANY_NOTES.into());
     };
-    let note = &note;
-    let change_zat = note.value().inner().checked_sub(amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("note cannot cover amount and fee")?;
+    let change_zat = notes_value(&notes).checked_sub(amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("notes cannot cover amount and fee")?;
     let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
     let attempt = hex::encode(random);
-    let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
+    let note_selection = notes.iter().map(|note| hex::encode(note.nullifier(&v.fvk).to_bytes())).collect();
     // No signing group yet: the request is open to every member (`signing_group`).
     let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, phase: "draft".into(), ..Default::default() };
     check_intent(&p, &v)?;
-    let nullifier = [hex32(&p.note_selection[0])?];
-    w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
-    if let Err(e) = save_payment(data, pass, &p) { let _ = w.release_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier); return Err(e); }
+    let nullifiers = input_nullifiers(&p)?;
+    w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifiers, expiry)?;
+    if let Err(e) = save_payment(data, pass, &p) { let _ = w.release_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifiers); return Err(e); }
     Ok(json!({"attempt":attempt,"fee_zat":fee_zat.to_string(),"change_zat":change_zat.to_string()}))
 }
 
@@ -1923,7 +1981,7 @@ fn prepare_sign<'a>(
         // proposer rebuilds the same candidate the quorum reviewed; the witness here is unused.
         let height = p.target_height;
         let (frontier, _) = frontier(&w, &mut client, &rt, height)?;
-        let selected = [hex32(&p.note_selection[0])?];
+        let selected = input_nullifiers(p)?;
         let notes = w
             .ironwood_inputs_at(BlockHeight::from_u32(height), frontier, &selected)?
             .into_iter()
@@ -2019,11 +2077,8 @@ fn sign_with_opened(
         .connect("hosted payment", signer_network, p.attempt.as_bytes())
         .map_err(|e| e.to_string())?
         .session;
-    let candidate = CandidateRef {
-        vault_id: hex32(&p.vault)?,
-        payment_id: hex32(&p.attempt)?,
-        attempt_id: hex32(&p.attempt)?,
-    };
+    // One reference, and so one single-use nonce, per spent note.
+    let candidates = spend_refs(p)?;
     // Every signer checks its candidate against the request it reviewed; the proposer also
     // builds from it.
     let params = PublicPaymentParams {
@@ -2057,7 +2112,7 @@ fn sign_with_opened(
         &ch,
         &mut signer,
         &session,
-        &candidate,
+        &candidates,
         &v.public,
         frost::Identifier::try_from(v.slot).map_err(|e| e.to_string())?,
         &params,
@@ -2190,13 +2245,13 @@ fn payment_approval(
     Ok(Box::new(move |request| {
         let approved = || -> Result<bool, String> {
             require_consent(&data, &pass, &p)?;
-            let attempt = hex32(&p.attempt)?;
-            let candidate = CandidateRef { vault_id: hex32(&p.vault)?, payment_id: attempt, attempt_id: attempt };
+            // Any of this payment's spends; one approval covers them all (same sighash).
+            let candidates = spend_refs(&p)?;
             let pinned = payment_dir(&data, &p.vault)?
                 .read_sealed(&format!("{}.consent-sighash", p.attempt), &pass)
                 .map_err(|e| e.to_string())?;
             let view = request.view;
-            Ok(*request.candidate == candidate
+            Ok(candidates.contains(request.candidate)
                 && pinned == request.sighash
                 && view.to == to
                 && view.amount_zat == p.amount_zat
@@ -2325,6 +2380,7 @@ fn aggregate(
         &ids,
         &peer_of,
         v.threshold,
+        p.note_selection.len(),
         OsRng,
         &coord,
         &signing_context(p)?,
@@ -2368,20 +2424,25 @@ fn build_transaction(
         .shielded_sighash();
     let height = p.target_height;
     let (tree, anchor) = frontier(w, client, rt, height)?;
-    let selected = [hex32(&p.note_selection[0])?];
-    let witness = w
-        .ironwood_inputs_at(BlockHeight::from_u32(height), tree, &selected)?
-        .into_iter()
-        .next()
-        .ok_or("missing payment note")?
-        .1;
-    let index = pczt
-        .ironwood()
-        .actions()
+    let selected = input_nullifiers(p)?;
+    // `ironwood_inputs_at` answers in the order asked, so each witness pairs with its nullifier.
+    let inputs = w.ironwood_inputs_at(BlockHeight::from_u32(height), tree, &selected)?;
+    if inputs.len() != selected.len() {
+        return Err("missing payment note".into());
+    }
+    let witnesses = selected
         .iter()
-        .position(|a| a.spend().nullifier() == &selected[0])
-        .ok_or("signed candidate spends a different note")?;
-    let (raw, txid) = prove(pczt, sighash, vec![(index, witness)], anchor)?;
+        .zip(inputs)
+        .map(|(nullifier, (_, witness))| {
+            pczt.ironwood()
+                .actions()
+                .iter()
+                .position(|a| a.spend().nullifier() == nullifier)
+                .map(|index| (index, witness))
+                .ok_or("signed candidate spends a different note")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let (raw, txid) = prove(pczt, sighash, witnesses, anchor)?;
     Ok((raw, txid.to_string()))
 }
 
@@ -2571,7 +2632,10 @@ pub(super) async fn replace(State(st): State<Shared>, Json(body): Json<Value>) -
         if !stuck(&data, &v, &old, &all_payments(&data, &pass, &vault)?)? {
             return Err("only a stuck payment can be replaced".into());
         }
-        let note = w.unspent_note(&hex32(&old.note_selection[0])?)?;
+        let notes = input_nullifiers(&old)?
+            .iter()
+            .map(|nullifier| w.unspent_note(nullifier))
+            .collect::<Result<Vec<_>, _>>()?;
         let (recipient, memo) = if cancel {
             (vault::unified_address(&v.fvk, v.network.network_type()), String::new())
         } else {
@@ -2583,13 +2647,15 @@ pub(super) async fn replace(State(st): State<Shared>, Json(body): Json<Value>) -
         // A retry keeps the bound members approved for the payment it replaces, so a member
         // that approved that payment approves this one by itself (`approved_before`).
         let expiry = if !cancel && old.expiry_height > anchor { old.expiry_height } else { fresh };
-        let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![note], recipient: address, amount: Zatoshis::from_u64(old.amount_zat).map_err(|e| format!("amount: {e:?}"))?, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
+        // A replacement spends exactly the same notes, so it and the stuck payment can never both
+        // be mined. A Cancel sends all of them back to the vault.
+        let value = notes_value(&notes);
+        let inputs = CandidateInputs { vault_fvk: &v.fvk, notes, recipient: address, amount: Zatoshis::from_u64(old.amount_zat).map_err(|e| format!("amount: {e:?}"))?, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
         let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
-        let value = note.value().inner();
         let (amount_zat, change_zat) = if cancel {
-            (value.checked_sub(fee_zat).filter(|n| *n > 0).ok_or("note cannot cover the fee")?, 0)
+            (value.checked_sub(fee_zat).filter(|n| *n > 0).ok_or("notes cannot cover the fee")?, 0)
         } else {
-            (old.amount_zat, value.checked_sub(old.amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("note cannot cover amount and fee")?)
+            (old.amount_zat, value.checked_sub(old.amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("notes cannot cover amount and fee")?)
         };
         let mut random = [0u8; 32];
         OsRng.fill_bytes(&mut random);
@@ -2791,10 +2857,13 @@ fn discardable(data: &Path, p: &Payment) -> Result<(), String> {
         return Err("only an open request, a failed unsigned payment or a draft can be discarded".into());
     }
     let dir = member_dir(data, &p.vault)?;
-    let burn = format!("{}{}.burn", p.attempt, p.attempt);
-    for nonces in ["signer/nonces", "signer-nonces"] {
-        if dir.path().join(nonces).join(&burn).try_exists().map_err(|e| e.to_string())? {
-            return Err("a signature share was released; keep the input reserved for recovery".into());
+    // A share released for any spend keeps every input reserved.
+    for spend in spend_refs(p)? {
+        let burn = format!("{}{}.burn", hex::encode(spend.payment_id), hex::encode(spend.attempt_id));
+        for nonces in ["signer/nonces", "signer-nonces"] {
+            if dir.path().join(nonces).join(&burn).try_exists().map_err(|e| e.to_string())? {
+                return Err("a signature share was released; keep the inputs reserved for recovery".into());
+            }
         }
     }
     Ok(())
@@ -2884,7 +2953,7 @@ pub(super) async fn discard(State(st): State<Shared>, Json(body): Json<Value>) -
         let (mut w, _, _) = wallet(&st, &data, &pass, &vault, &v)?;
         w.release_inputs(
             zcash_client_backend::wallet::LockOwner::new(hex32(&attempt)?),
-            &[hex32(&p.note_selection[0])?],
+            &input_nullifiers(&p)?,
         )?;
         p.phase = "cancelled".into();
         save_payment(&data, &pass, &p)?;
@@ -3048,7 +3117,7 @@ mod tests {
         use crate::host::diagnostics::DraftRefusal;
         assert_eq!(draft_refusal(&format!("{} Incoming deposits need 3 confirmations before they can be spent.", crate::wallet_store::FUNDS_WAITING)),
             DraftRefusal::WaitingForConfirmations);
-        assert_eq!(draft_refusal(NO_SINGLE_NOTE), DraftRefusal::NoSingleNote);
+        assert_eq!(draft_refusal(TOO_MANY_NOTES), DraftRefusal::NoSingleNote);
         assert_eq!(draft_refusal("fund payment: insufficient balance"), DraftRefusal::InsufficientFunds);
         assert_eq!(draft_refusal("invalid amount_zat"), DraftRefusal::Other);
     }

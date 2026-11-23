@@ -397,7 +397,7 @@ where
     // The proposer's app answers the build request with the signer's candidate.
     let candidate = members[0]
         .signer
-        .build_candidate(&members[0].session, &cand, &intent, &alpha)
+        .build_candidate(&members[0].session, &cand, &intent, &[alpha])
         .unwrap();
     let sighash = pczt::roles::signer::Signer::new(pczt::Pczt::parse(candidate.as_bytes()).unwrap())
         .unwrap()

@@ -65,7 +65,7 @@ impl Event {
             Event::WalletSynced => ("LokiSigner scanned the chain again.", Kind::Recovered),
             Event::DraftRefused(reason) => (match reason {
                 DraftRefusal::WaitingForConfirmations => "Payment draft refused: the funds are waiting for confirmations.",
-                DraftRefusal::NoSingleNote => "Payment draft refused: no single spendable note covers the amount and fee.",
+                DraftRefusal::NoSingleNote => "Payment draft refused: it needs more notes than one payment can spend.",
                 DraftRefusal::InsufficientFunds => "Payment draft refused: not enough spendable funds.",
                 DraftRefusal::Other => "Payment draft refused.",
             }, Kind::Info),

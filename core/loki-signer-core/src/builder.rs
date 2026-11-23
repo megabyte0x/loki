@@ -41,14 +41,20 @@ pub fn build_unsigned<P: Parameters + Clone>(
     vault_fvk: &FullViewingKey,
     params_net: &P,
     params: &PublicPaymentParams,
-    note: Note,
-    alpha: &[u8; 32],
+    notes: &[Note],
+    alphas: &[[u8; 32]],
 ) -> Result<Vec<u8>, String> {
-    let alpha = alpha_from_canonical_bytes(alpha).ok_or("noncanonical alpha")?;
+    if notes.is_empty() || notes.len() != alphas.len() {
+        return Err("each spent note needs exactly one randomiser".into());
+    }
+    let alphas = alphas
+        .iter()
+        .map(|alpha| alpha_from_canonical_bytes(alpha).ok_or("noncanonical alpha"))
+        .collect::<Result<Vec<_>, _>>()?;
 
     let mut inputs = CandidateInputs {
         vault_fvk,
-        notes: vec![note],
+        notes: notes.to_vec(),
         recipient: params.recipient,
         amount: params.amount,
         memo: params.memo.clone(),
@@ -57,19 +63,22 @@ pub fn build_unsigned<P: Parameters + Clone>(
         expiry_height: params.expiry_height,
     };
     let fee = u64::from(quote_fee(params_net, &inputs)?);
-    let spend = note.value().inner();
+    let spend = notes
+        .iter()
+        .try_fold(0u64, |sum, note| sum.checked_add(note.value().inner()))
+        .ok_or("note values overflow")?;
     let amount = u64::from(params.amount);
     let change = spend
         .checked_sub(amount)
         .and_then(|r| r.checked_sub(fee))
-        .ok_or("note does not cover amount + fee")?;
+        .ok_or("notes do not cover amount + fee")?;
     inputs.change =
         zcash_protocol::value::Zatoshis::from_u64(change).map_err(|e| format!("{e:?}"))?;
 
     let built = build_candidate(
         params_net,
         &inputs,
-        &[alpha],
+        &alphas,
         rand_zp::rand_core::UnwrapErr(rand_zp::rngs::SysRng),
     )?;
     let candidate = pczt::roles::creator::Creator::build_from_parts(built.pczt_parts)
@@ -96,14 +105,14 @@ pub fn build_candidate_for_vault(
 ) -> Result<(Vec<u8>, [u8; 32]), String> {
     let pczt = match network {
         VaultNetwork::Regtest => {
-            build_unsigned(vault_fvk, &crate::candidate::Regtest, params, note, alpha)
+            build_unsigned(vault_fvk, &crate::candidate::Regtest, params, &[note], &[*alpha])
         }
         VaultNetwork::Testnet => build_unsigned(
             vault_fvk,
             &zcash_protocol::consensus::TEST_NETWORK,
             params,
-            note,
-            alpha,
+            &[note],
+            &[*alpha],
         ),
     }?;
     let sighash = wysiwys::sighash_of_pczt(&pczt, vault_fvk)?;

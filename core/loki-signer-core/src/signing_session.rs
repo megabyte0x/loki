@@ -117,6 +117,46 @@ impl TryFrom<u8> for MessageKind {
     }
 }
 
+/// Notes one hosted payment may spend. Each spend is its own Orchard action with its own nonce,
+/// randomiser, signing package and signature share, all carried in one round.
+pub const MAX_SPENDS: usize = 8;
+
+/// Encodes one value per spend as a hosted message body: a count, then each value with a
+/// two-byte big-endian length.
+pub fn encode_hosted(items: &[Vec<u8>]) -> Result<Vec<u8>, String> {
+    if items.is_empty() || items.len() > MAX_SPENDS {
+        return Err(format!("a hosted round carries 1 to {MAX_SPENDS} spends"));
+    }
+    let mut body = vec![items.len() as u8];
+    for item in items {
+        let len = u16::try_from(item.len()).map_err(|_| "hosted value too large")?;
+        body.extend_from_slice(&len.to_be_bytes());
+        body.extend_from_slice(item);
+    }
+    Ok(body)
+}
+
+/// The per-spend values of a hosted message body, or `None` unless it holds 1 to
+/// [`MAX_SPENDS`] values and nothing else.
+pub fn decode_hosted(body: &[u8]) -> Option<Vec<&[u8]>> {
+    let (&count, mut rest) = body.split_first()?;
+    if count == 0 || usize::from(count) > MAX_SPENDS {
+        return None;
+    }
+    let mut items = Vec::with_capacity(usize::from(count));
+    for _ in 0..count {
+        let (len, tail) = rest.split_first_chunk::<2>()?;
+        let len = usize::from(u16::from_be_bytes(*len));
+        if tail.len() < len {
+            return None;
+        }
+        let (item, tail) = tail.split_at(len);
+        items.push(item);
+        rest = tail;
+    }
+    rest.is_empty().then_some(items)
+}
+
 impl MessageKind {
     pub(crate) fn permits(self, context: &SessionContext, sender: u16, recipient: u16) -> bool {
         if sender == recipient {
@@ -135,22 +175,26 @@ impl MessageKind {
 
     /// Check the encoding before a hosted message counts toward round progress.
     pub fn valid_hosted_body(self, context: &SessionContext, body: &[u8]) -> bool {
-        match self {
-            Self::HostedCommitment => frost::round1::SigningCommitments::deserialize(body).is_ok(),
-            Self::HostedAlpha => <&[u8; 32]>::try_from(body).is_ok_and(|alpha| {
+        if self == Self::Candidate {
+            return pczt::Pczt::parse(body).is_ok();
+        }
+        // Every other hosted kind carries one value per spend.
+        let Some(items) = decode_hosted(body) else { return false };
+        items.into_iter().all(|item| match self {
+            Self::HostedCommitment => frost::round1::SigningCommitments::deserialize(item).is_ok(),
+            Self::HostedAlpha => <&[u8; 32]>::try_from(item).is_ok_and(|alpha| {
                 crate::candidate::alpha_from_canonical_bytes(alpha).is_some()
             }),
-            Self::HostedSeed => body.len() == 32,
-            Self::HostedPackage => frost::SigningPackage::deserialize(body).is_ok_and(|package| {
+            Self::HostedSeed => item.len() == 32,
+            Self::HostedPackage => frost::SigningPackage::deserialize(item).is_ok_and(|package| {
                 let commitments = package.signing_commitments();
                 commitments.len() == context.signers.len() && context.signers.iter().all(|slot| {
                     frost::Identifier::try_from(*slot).is_ok_and(|id| commitments.contains_key(&id))
                 })
             }),
-            Self::HostedShare => frost::round2::SignatureShare::deserialize(body).is_ok(),
-            Self::Candidate => pczt::Pczt::parse(body).is_ok(),
+            Self::HostedShare => frost::round2::SignatureShare::deserialize(item).is_ok(),
             _ => false,
-        }
+        })
     }
 
     pub fn max_body(self) -> usize {
@@ -161,7 +205,8 @@ impl MessageKind {
             }
             Self::Receipt | Self::Abort | Self::PeerRequest => 1024,
             Self::HostedCommitment | Self::HostedPackage => 64 * 1024,
-            Self::HostedAlpha | Self::HostedSeed | Self::HostedShare => 32,
+            // A count, then per spend a two-byte length and 32 bytes.
+            Self::HostedAlpha | Self::HostedSeed | Self::HostedShare => 1 + MAX_SPENDS * (2 + 32),
         }
     }
 }

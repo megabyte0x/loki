@@ -74,8 +74,8 @@ impl Transport for MemoryTransport {
     }
 }
 
-fn vault_note(fvk: &FullViewingKey) -> orchard::Note {
-    let rho = Rho::from_bytes(&[1u8; 32]).unwrap();
+fn vault_note(fvk: &FullViewingKey, index: u8) -> orchard::Note {
+    let rho = Rho::from_bytes(&[1 + index; 32]).unwrap();
     let rseed = RandomSeed::from_bytes([2u8; 32], &rho).unwrap();
     orchard::Note::from_parts(
         fvk.address_at(0u64, Scope::External),
@@ -93,6 +93,7 @@ fn two_of_three_payment_pczt_verifies_over_frostd() {
     roundtrip(
         Identity::new(0),
         VaultNetwork::Regtest,
+        1,
         |identity| {
             let secret: [u8; 32] = identity.to_secret_bytes()[34..].try_into().unwrap();
             FrostdTransport::new(&url, FrostdLoginKey::from_secret_bytes(secret)).unwrap()
@@ -111,6 +112,7 @@ fn two_of_three_payment_pczt_verifies_in_memory() {
     let fvk = roundtrip(
         coordinator,
         VaultNetwork::Regtest,
+        1,
         |identity| MemoryTransport {
             me: Peer(identity.public().encryption),
             coordinator: coordinator_peer.clone(),
@@ -134,6 +136,25 @@ fn two_of_three_payment_pczt_verifies_in_memory() {
 }
 
 #[test]
+fn three_note_payment_signs_every_spend_in_one_round() {
+    let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
+    let coordinator = Identity::new(0);
+    let coordinator_peer = Peer(coordinator.public().encryption);
+    roundtrip(
+        coordinator,
+        VaultNetwork::Regtest,
+        3,
+        |identity| MemoryTransport {
+            me: Peer(identity.public().encryption),
+            coordinator: coordinator_peer.clone(),
+            inboxes: inboxes.clone(),
+            relayed: Arc::new(Mutex::new(Vec::new())),
+        },
+        |channel| *channel,
+    );
+}
+
+#[test]
 fn testnet_payment_uses_nu7_over_in_memory_transport() {
     let inboxes = Arc::new(Mutex::new(BTreeMap::new()));
     let coordinator = Identity::new(0);
@@ -141,6 +162,7 @@ fn testnet_payment_uses_nu7_over_in_memory_transport() {
     roundtrip(
         coordinator,
         VaultNetwork::Testnet,
+        1,
         |identity| MemoryTransport {
             me: Peer(identity.public().encryption),
             coordinator: coordinator_peer.clone(),
@@ -154,6 +176,7 @@ fn testnet_payment_uses_nu7_over_in_memory_transport() {
 fn roundtrip<T: Transport + Send>(
     coordinator: Identity,
     network: VaultNetwork,
+    spends: u8,
     make_transport: impl Fn(&Identity) -> T,
     session_id: impl Fn(&T::Channel) -> Uuid,
 ) -> FullViewingKey
@@ -179,10 +202,10 @@ where
         .try_into()
         .unwrap();
     let fvk = zip2005::frost_viewing_key(&ak, &[42u8; 32]).unwrap();
-    let note = vault_note(&fvk);
+    let notes: Vec<_> = (0..spends).map(|i| vault_note(&fvk, i)).collect();
     let mut inputs = CandidateInputs {
         vault_fvk: &fvk,
-        notes: vec![note],
+        notes: notes.clone(),
         recipient: fvk.address_at(7u64, Scope::External),
         amount: Zatoshis::const_from_u64(40_000_000),
         memo: MemoBytes::from_bytes(b"loki u2").unwrap(),
@@ -199,7 +222,7 @@ where
         },
     };
     let fee = quote_fee(&network, &inputs).unwrap();
-    inputs.change = Zatoshis::const_from_u64(625_000_000 - 40_000_000 - u64::from(fee));
+    inputs.change = Zatoshis::const_from_u64(625_000_000 * u64::from(spends) - 40_000_000 - u64::from(fee));
 
     let ids: Vec<_> = (1u16..=2)
         .map(|id| frost::Identifier::try_from(id).unwrap())
@@ -226,7 +249,10 @@ where
     let session = session_id(&channel);
     let member_transports: Vec<_> = identities.iter().map(make_transport).collect();
     let signer_network = if network == VaultNetwork::Testnet { Network::Testnet } else { Network::Regtest };
-    let candidate = CandidateRef { vault_id: [1; 32], payment_id: [7; 32], attempt_id: [9; 32] };
+    // One reference per spend, so each spend commits under its own nonce id.
+    let candidates: Vec<_> = (0..spends)
+        .map(|i| CandidateRef { vault_id: [1; 32], payment_id: [7; 32], attempt_id: [9 + i; 32] })
+        .collect();
     let params = PublicPaymentParams {
         recipient: inputs.recipient, amount: inputs.amount, memo: inputs.memo.clone(),
         target_height: inputs.target_height, expiry_height: inputs.expiry_height,
@@ -249,7 +275,8 @@ where
                 let public_bytes = public.serialize().unwrap();
                 let signer_public = public.clone();
                 let signer_fvk = fvk.clone();
-                let candidate = candidate.clone();
+                let candidates = candidates.clone();
+                let notes = notes.clone();
                 scope.spawn(move || {
                     let channel = member_tx.join(session).unwrap();
                     let nonce_dir = std::env::temp_dir().join(format!("loki-payment-{}-{}", std::process::id(), rand_core::RngCore::next_u64(&mut rand_core::OsRng)));
@@ -258,12 +285,12 @@ where
                         SoftwareSecureElement::generate(), &key.serialize().unwrap(),
                         public_bytes, signer_fvk, nonce_dir, Box::new(|_| true),
                     ).unwrap();
-                    signer.set_candidate_notes(vec![note]);
+                    signer.set_candidate_notes(notes);
                     let signer_session = signer.connect("payment test", signer_network, b"test").unwrap().session;
                     signer_loop(
                         &member_tx,
                         &channel,
-                        &mut signer, &signer_session, &candidate, &signer_public, id,
+                        &mut signer, &signer_session, &candidates, &signer_public, id,
                         request, &identity, &context, &proposer, &coordinator, &other_signers,
                         &|| Ok(()),
                         &|| Ok(()),
@@ -279,7 +306,7 @@ where
             })
             .collect();
         let signed =
-            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, rand_core::OsRng, &coordinator, &context, &|| Ok(()), || {
+            coordinate(&tx, &channel, &public, &ids, &peer_of, 2, usize::from(spends), rand_core::OsRng, &coordinator, &context, &|| Ok(()), || {
                 Ok(handoff.lock().unwrap().clone())
             })
             .unwrap();
@@ -298,22 +325,25 @@ where
         let sighash = pczt::roles::signer::Signer::new(parsed.clone())
             .unwrap()
             .shielded_sighash();
-        let action = parsed
-            .ironwood()
-            .actions()
-            .iter()
-            .find(|action| action.spend().nullifier() == &note.nullifier(&fvk).to_bytes())
+        // Every spent note carries its own valid signature under its own randomized key.
+        for note in &notes {
+            let action = parsed
+                .ironwood()
+                .actions()
+                .iter()
+                .find(|action| action.spend().nullifier() == &note.nullifier(&fvk).to_bytes())
+                .unwrap();
+            let signature = action.spend().spend_auth_sig().expect("signed spend");
+            let rk = orchard::primitives::redpallas::VerificationKey::<
+                orchard::primitives::redpallas::SpendAuth,
+            >::try_from(*action.spend().rk())
             .unwrap();
-        let signature = action.spend().spend_auth_sig().expect("signed spend");
-        let rk = orchard::primitives::redpallas::VerificationKey::<
-            orchard::primitives::redpallas::SpendAuth,
-        >::try_from(*action.spend().rk())
-        .unwrap();
-        rk.verify(
-            &sighash,
-            &orchard::primitives::redpallas::Signature::from(signature),
-        )
-        .unwrap();
+            rk.verify(
+                &sighash,
+                &orchard::primitives::redpallas::Signature::from(signature),
+            )
+            .unwrap();
+        }
     });
     fvk
 }
