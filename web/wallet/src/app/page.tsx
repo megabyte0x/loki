@@ -83,7 +83,7 @@ type View =
   | { id: "ceremony"; vault: string }
   | { id: "overview"; vault: VaultSummary }
   | { id: "send"; vault: VaultSummary }
-  | { id: "review"; vault: VaultSummary; attempt: string; proposedHere?: boolean }
+  | { id: "review"; vault: VaultSummary; attempt: string; proposer?: number; proposedHere?: boolean }
   | { id: "history"; vault: VaultSummary };
 
 // ─── root ─────────────────────────────────────────────────────────────────────
@@ -346,7 +346,10 @@ function ViewRouter({
           vault={view.vault}
           onSend={() => onNavigate({ id: "send", vault: view.vault })}
           onHistory={() => onNavigate({ id: "history", vault: view.vault })}
-          onApprove={(attempt) => onNavigate({ id: "review", vault: view.vault, attempt, proposedHere: false })}
+          onApprove={({ attempt, proposer }) => onNavigate({
+            id: "review", vault: view.vault, attempt,
+            proposer: signerKind() === "browser" ? proposer : undefined, proposedHere: false,
+          })}
           onBack={() => onNavigate({ id: "home" })}
         />
       );
@@ -365,6 +368,7 @@ function ViewRouter({
           proposedHere={view.proposedHere}
           vault={view.vault}
           attempt={view.attempt}
+          proposer={view.proposer}
           onBack={() => onNavigate({ id: "history", vault: view.vault })}
         />
       );
@@ -1583,7 +1587,7 @@ function VaultOverview({
   vault: VaultSummary;
   onSend: () => void;
   onHistory: () => void;
-  onApprove: (attempt: string) => void;
+  onApprove: (payment: PendingApproval) => void;
   onBack: () => void;
 }) {
   const [address, setAddress] = useState<string | null>(null);
@@ -1734,7 +1738,7 @@ function VaultOverview({
           <GlassCard className="border-2 border-amber/60 bg-amber/10 ring-4 ring-amber/15">
             <div className="space-y-3">
               {pending.map((p) => (
-                <div key={p.attempt} className="flex flex-col gap-3 border-b border-[var(--border)] pb-3 last:border-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
+                <div key={`${p.proposer}:${p.attempt}`} className="flex flex-col gap-3 border-b border-[var(--border)] pb-3 last:border-0 last:pb-0 sm:flex-row sm:items-center sm:justify-between">
                   <div className="min-w-0">
                     <p className="font-mono text-base font-semibold">{zatToTaz(p.amount_zat)} TAZ</p>
                     <p className="truncate font-mono text-[11px] text-muted">to {short(p.recipient, 12, 8)}</p>
@@ -1742,7 +1746,7 @@ function VaultOverview({
                     {p.replaces && <p className="mt-1 text-[11px] text-amber">{p.replaces.cancel ? "Cancels" : "Retries"} stuck payment {short(p.replaces.attempt, 6, 4)} with the same note</p>}
                   </div>
                   <button
-                    onClick={() => onApprove(p.attempt)}
+                    onClick={() => onApprove(p)}
                     className="btn-primary shrink-0 rounded-full px-5 py-2.5 text-sm font-semibold"
                   >
                     Review &amp; approve →
@@ -2068,12 +2072,14 @@ function ReviewApprove({
   proposedHere,
   vault,
   attempt,
+  proposer,
   onBack,
 }: {
   profileId?: string;
   proposedHere?: boolean;
   vault: VaultSummary;
   attempt: string;
+  proposer?: number;
   onBack: () => void;
 }) {
   const [review, setReview] = useState<PaymentReview | null>(null);
@@ -2088,11 +2094,13 @@ function ReviewApprove({
 
   const fetchSession = useCallback(async () => {
     try {
-      const value = await api<PaymentSession>(`payment-status?vault=${vault.vault}&attempt=${attempt}`);
+      const query = new URLSearchParams({ vault: vault.vault, attempt });
+      if (proposer !== undefined) query.set("proposer", String(proposer));
+      const value = await api<PaymentSession>(`payment-status?${query}`);
       setSession(value);
       setSessionError(null);
     } catch (e) { setSessionError((e as Error).message); }
-  }, [vault.vault, attempt]);
+  }, [vault.vault, attempt, proposer]);
   useEffect(() => {
     setOwnSlot(rememberedVaultSlot(profileId, vault.vault));
   }, [profileId, vault.vault]);
@@ -2104,7 +2112,7 @@ function ReviewApprove({
 
   const fetchReview = useCallback(async () => {
     try {
-      const r = await api<PaymentReview>("payment-review", { vault: vault.vault, attempt });
+      const r = await api<PaymentReview>("payment-review", { vault: vault.vault, attempt, proposer });
       setReview(r);
       setErr(null);
     } catch (e) {
@@ -2113,7 +2121,7 @@ function ReviewApprove({
       triesRef.current += 1;
       if (triesRef.current >= 10) setErr((e as Error).message);
     }
-  }, [vault.vault, attempt]);
+  }, [vault.vault, attempt, proposer]);
 
   useEffect(() => {
     if (approved) return;
@@ -2134,7 +2142,7 @@ function ReviewApprove({
     if (!review) return;
     setBusy(true); setErr(null);
     try {
-      await api("payment-approve", { vault: vault.vault, attempt, review_token: review.review_token, intent_hash: review.intent_hash });
+      await api("payment-approve", { vault: vault.vault, attempt, proposer, review_token: review.review_token, intent_hash: review.intent_hash });
       await fetchSession();
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }

@@ -404,13 +404,13 @@ impl DbHandle {
         mailbox: Id32,
         cid: Id32,
         challenge: Id32,
-        wire: &[u8],
+        record_hash: Id32,
         proof: &ClaimProof,
     ) -> RelayResult<()> {
         if self.stopping.load(Ordering::Acquire) {
             return Err(RelayError::StorageUnavailable);
         }
-        RelayStore::authenticate_committed_nonce(&self.root, mailbox, cid, challenge, wire, proof)
+        RelayStore::authenticate_committed_nonce(&self.root, mailbox, cid, challenge, record_hash, proof)
     }
 
     pub fn create(

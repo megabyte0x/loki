@@ -168,7 +168,7 @@ fn authenticate_nonce(
     mailbox: Id32,
     cid: Id32,
     challenge: Id32,
-    wire: &[u8],
+    record_hash: Id32,
     proof: &ClaimProof,
 ) -> RelayResult<(u64, u64)> {
     let enrolled: bool = connection.query_row(
@@ -188,7 +188,7 @@ fn authenticate_nonce(
     ed25519_dalek::VerifyingKey::from_bytes(&who.key)
         .and_then(|key| {
             key.verify_strict(
-                &nonce::claim_input(who, pin, mailbox, cid, challenge, wire),
+                &nonce::claim_input_for_hash(who, pin, mailbox, cid, challenge, record_hash),
                 &ed25519_dalek::Signature::from_bytes(&proof.signature),
             )
         })
@@ -324,7 +324,7 @@ impl RelayStore {
         mailbox: Id32,
         cid: Id32,
         challenge: Id32,
-        wire: &[u8],
+        record_hash: Id32,
         proof: &ClaimProof,
     ) -> RelayResult<()> {
         let connection = open_committed_readonly(&root.join("relay.sqlite3"))?;
@@ -333,7 +333,7 @@ impl RelayStore {
             [],
             |row| Ok(RelayPin { key: row.get(0)?, run: row.get(1)? }),
         )?;
-        authenticate_nonce(&connection, &pin, mailbox, cid, challenge, wire, proof)?;
+        authenticate_nonce(&connection, &pin, mailbox, cid, challenge, record_hash, proof)?;
         Ok(())
     }
 
@@ -354,9 +354,9 @@ impl RelayStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pin = RelayPin { key: self.root.public_key, run: self.root.run_id };
-        let (used, quota) = authenticate_nonce(&tx, &pin, mailbox, cid, challenge, wire, proof)?;
-        let who = proof.claimant;
         let record_hash: Id32 = Sha256::digest(wire).into();
+        let (used, quota) = authenticate_nonce(&tx, &pin, mailbox, cid, challenge, record_hash, proof)?;
+        let who = proof.claimant;
         let old: Option<(Vec<u8>, Vec<u8>)> = tx
             .query_row(
                 "SELECT record_hash,wire FROM nonce_uses WHERE mailbox=?1 AND cid=?2

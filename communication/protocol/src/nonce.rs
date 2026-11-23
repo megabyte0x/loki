@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 pub const SIGNATURE_DOMAIN: &[u8] = b"Loki_Relay_Nonce_v1\0";
 pub const MAX_RECORD: usize = 65_536;
 pub const CLAIM_SCHEME: &str = "LokiNonce ";
+pub const RECORD_HASH_HEADER: &str = "x-loki-record-sha256";
 pub const CLAIM_PROOF_LEN: usize = 130;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,6 +57,26 @@ pub fn claim_input(
     challenge: Id32,
     record: &[u8],
 ) -> Vec<u8> {
+    claim_input_for_hash(
+        who,
+        pin,
+        mailbox,
+        cid,
+        challenge,
+        Sha256::digest(record).into(),
+    )
+}
+
+/// Verify a claim proof against the advertised digest before reading the record.
+/// The caller must still check that the received record hashes to this digest.
+pub fn claim_input_for_hash(
+    who: Claimant,
+    pin: &RelayPin,
+    mailbox: Id32,
+    cid: Id32,
+    challenge: Id32,
+    record_hash: Id32,
+) -> Vec<u8> {
     let mut input = b"Loki_Relay_NonceClaim_v1\0".to_vec();
     input.extend_from_slice(&who.slot.to_be_bytes());
     for field in [
@@ -66,7 +87,7 @@ pub fn claim_input(
         mailbox,
         cid,
         challenge,
-        Sha256::digest(record).into(),
+        record_hash,
     ] {
         input.extend_from_slice(&field);
     }

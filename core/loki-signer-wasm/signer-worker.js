@@ -382,7 +382,7 @@ const reviewedTxid = (review) => review.sighash.match(/../g).reverse().join("");
 async function paymentStatus(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notice, start, signed } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const { notice, start, signed } = await findPayment(signer, control, vault, p);
   const terms = notice.intent;
   const ended = notice.kind === "cancelled" || notice.kind === "failed" ? notice.kind : null;
   const signers = start?.intent.signers ?? [];
@@ -410,7 +410,7 @@ async function paymentStatus(signer, p) {
 async function paymentTerms(signer, p) {
   const vault = await openVault(signer, p.vaultHex);
   const control = await frostdClient(signer, p);
-  const { notice: { intent: t } } = await findPayment(signer, control, vault, p.attemptHex, p);
+  const { notice: { intent: t } } = await findPayment(signer, control, vault, p);
   return { review_token: p.attemptHex, recipient: t.recipient, amount_zat: String(t.amount_zat), fee_zat: String(t.fee_zat), memo: t.memo };
 }
 
@@ -587,7 +587,11 @@ async function controlSessions(control, scope) {
 }
 
 // A signing session has a one-shot coordinator, not a confirmed vault member.
-async function findPayment(signer, control, vault, attemptHex, p) {
+async function findPayment(signer, control, vault, p) {
+  const { attemptHex, proposer } = p;
+  if (!Number.isInteger(proposer) || proposer === vault.slot || !vault.members.some((m) => m.id === proposer)) {
+    throw new Error("a payment lookup requires a valid proposer from this vault");
+  }
   const scope = controlScope(signer, p);
   const skip = new Set();
   const pollMs = Number(p.findPollMs) || 2000;
@@ -598,12 +602,12 @@ async function findPayment(signer, control, vault, attemptHex, p) {
       control.useSession(sessionId);
       const info = JSON.parse(await control.sessionInfo());
       const owner = controlOwner(vault, info);
-      if (!owner) {
+      if (owner?.id !== proposer) {
         skip.add(sessionId);
         continue;
       }
       const state = await readControl(signer, control, vault, sessionId, owner, scope, info);
-      if (state?.notice.intent.attempt === attemptHex) {
+      if (state?.notice.from === proposer && state.notice.intent.attempt === attemptHex) {
         if (state.blocked) throw new Error("this payment's notice history exceeded the inbox limit");
         return { controlSessionId: sessionId, ...state };
       }
@@ -631,9 +635,10 @@ async function listPending(signer, vaultHex, p) {
     if (!state) continue;
     const { notice: m } = state;
     const i = m.intent;
-    if (state.blocked || endsRequest(m, vault.slot)) { pending.set(i.attempt, null); continue; }
-    if (pending.get(i.attempt) === null) continue;
-    pending.set(i.attempt, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: m.from, note: i.note_selection[0] });
+    const key = `${m.from}:${i.attempt}`;
+    if (state.blocked || endsRequest(m, vault.slot)) { pending.set(key, null); continue; }
+    if (pending.get(key) === null) continue;
+    pending.set(key, { attempt: i.attempt, amount_zat: String(i.amount_zat), recipient: i.recipient, proposer: m.from, note: i.note_selection[0] });
   }
   const requests = [...pending.values()].filter(Boolean);
   if (!requests.length) return [];
@@ -689,6 +694,9 @@ async function drivePayment(signer, p, witnessPinsPath) {
   if (!Array.isArray(p.nonceWitnesses) || p.nonceWitnesses.length !== 2) {
     throw new Error("This signer has no nonce witnesses configured, so it cannot sign");
   }
+  const vault = await openVault(signer, vaultHex);
+  const control = await frostdClient(signer, p);
+  const { controlSessionId, notice: announced, start } = await findPayment(signer, control, vault, p);
   const pins = JSON.stringify(p.nonceWitnesses.map(({ key, run, mailbox }) => ({ key, run, mailbox })));
   await opfsPreopenRead(witnessPinsPath);
   if (!signer.setNonceWitnesses(pins)) {
@@ -697,9 +705,6 @@ async function drivePayment(signer, p, witnessPinsPath) {
     await opfsPreopenWrite(witnessPinsPath);
     signer.setNonceWitnesses(pins, consent.fingerprint);
   }
-  const vault = await openVault(signer, vaultHex);
-  const control = await frostdClient(signer, p);
-  const { controlSessionId, notice: announced, start } = await findPayment(signer, control, vault, attemptHex, p);
   const proposer = vault.members.find((m) => m.id === announced.from);
   const terms = announced.intent;
   // Trust the key in the authenticated payment terms, never signing-session metadata.

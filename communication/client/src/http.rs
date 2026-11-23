@@ -98,6 +98,7 @@ impl RelayHttp {
             .header(AUTHORIZATION, format!("{}{}", nonce::CLAIM_SCHEME, hex::encode(proof.to_bytes())))
             .header(CONTENT_TYPE, "application/octet-stream")
             .header("x-loki-challenge", hex::encode(challenge))
+            .header(nonce::RECORD_HASH_HEADER, hex::encode(Sha256::digest(wire)))
             .body(wire.to_vec())
             .send()
             .await?;

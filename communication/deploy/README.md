@@ -94,6 +94,16 @@ provision the mailboxes with `core/examples/provision_nonce_witnesses.rs`. For a
 pair, **reuse both relay roots and their existing mailboxes**; do not run `init` again,
 replace the output configuration, or restore an older copy of `relay.sqlite3`.
 
+When moving from receipt format v1 to v2, pause signing for the entire upgrade. All clients
+and both witnesses must support the same receipt format before signing can resume.
+
+First, allow the signer origin, `PUT`, and the `Authorization`, `Content-Type`,
+`X-Loki-Challenge`, and `X-Loki-Record-SHA256` headers at each witness TLS proxy. Next,
+upgrade the native clients and both browser WASM packages. Only then upgrade the witness
+relays: the upgraded relays immediately require the digest header and `Content-Length`.
+The claim signature format is unchanged. Do not forward chunked nonce claims or log the
+claim authorization.
+
 Stop both witnesses before upgrading. At each stopped relay, enroll each signer using the
 vault ID, FROST slot and Ed25519 signing key from the member-confirmed vault roster (not an
 unverified coordinator registry or a relay login key). Use that relay's existing mailbox ID
@@ -116,14 +126,10 @@ without changing the root. A repeat with the same key can leave or increase its 
 but cannot replace that key or reset its usage. If a legacy ledger is already over budget,
 keep it intact and keep signing paused rather than creating an empty replacement.
 
-Restart the upgraded witnesses and update the native clients and both browser WASM packages
-before resuming signing. Receipt format v2 requires a lockstep upgrade of both witnesses and
-all native and browser clients; mixed versions cannot sign. The public configuration contains
+Restart the upgraded witnesses before resuming signing. The public configuration contains
 only endpoints and pins. A `read` field in an old witness file is ignored by signing clients;
 the provisioning tool can still use it to check the mailbox. Read capabilities no longer
-authorize claims. For browser use, the witness TLS proxy must allow the signer origin, `PUT`,
-and the `Authorization`,
-`Content-Type`, and `X-Loki-Challenge` headers. Do not downgrade or roll either witness back.
+authorize claims. Do not downgrade or roll either witness back.
 
 ## frostd behind TLS + CORS for the in-browser signer (`frostd-tls.sh`)
 
@@ -320,10 +326,12 @@ Each of the three relay stores has its own persistent root, signing key, run ide
 The owned relay and admission listeners cap open HTTP/1 connections at 128 each,
 request headers at 16 KiB, and header reads at five seconds. Admission gives
 unverified body reads up to three seconds in a separate pool (four per TCP peer).
+The relay authenticates nonce claim headers before reserving witness body capacity.
 `/health` does not use the request or body pools, but shares the connection cap.
 The backend counts the socket peer, not `Forwarded` or `X-Forwarded-For`, so
 clients behind a proxy share its backend allowance. Enforce per-client connection
-and body limits at the TLS proxy using client identity established at that boundary.
+and body limits at the TLS proxy using a trusted client-address source established
+at that boundary, not forwarding headers supplied by clients.
 
 The admission service requires a signed operator bundle, its trusted configuration key, its own signing key and the three provisioning files. Keep operator capabilities exclusively on the service hosts, outside any member data root. Give them mode 0600 and their parent directories mode 0700. Admission provisioning records contain owner-generated verifiers; the service never creates member read/admin secrets. Store the admission SQLite database and its tombstones on durable encrypted storage. Back up the database coherently, including its WAL or a SQLite backup, and test recovery before operating it. Reusing an operation ID with changed bytes is refused.
 

@@ -413,6 +413,7 @@ pub async fn claim_nonce(
         .header("authorization", token)
         .header("content-type", "application/octet-stream")
         .header("x-loki-challenge", hex::encode(challenge))
+        .header(nonce::RECORD_HASH_HEADER, hex::encode(sha2::Sha256::digest(record)))
         .body(record.to_vec());
     let (status, raw) = fetch_bounded(request, RECEIPT_CAP).await.map_err(|e| format!("nonce witness: {e}"))?;
     let status = status.as_u16();
