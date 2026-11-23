@@ -423,6 +423,12 @@ class _VaultFormState extends State<VaultForm> {
                   count('approvals', threshold, 2, members - 1, (n) {
                     setState(() => threshold = n);
                   }),
+                  Text(
+                    members == 3
+                        ? 'A vault needs 3 to 16 members, and fewer approvals than members, so one lost device never locks the funds. With 3 members, 2 approvals is the only choice: add a member to require more.'
+                        : 'A vault needs 3 to 16 members, and fewer approvals than members, so one lost device never locks the funds. Up to ${members - 1} approvals with $members members.',
+                    style: lokiSans(11, color: context.colors.muted),
+                  ),
                   const Divider(),
                   ValueRow('Vault policy', '$threshold of $members approvals'),
                   const ValueRow('Network', 'Testnet'),
