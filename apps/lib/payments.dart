@@ -1333,12 +1333,13 @@ class _HistoryPageState extends State<HistoryPage> {
         ? 'Received'
         : payment['amount_is_net'] == true
         ? 'Net outflow'
+        // Once mined, a retry is simply a sent payment; its details still name what it replaced.
+        : confirmed
+        ? (replaces?['cancel'] == true ? 'Cancelled payment' : 'Sent')
         : replaces != null
         ? (replaces['cancel'] == true
               ? 'Cancellation request'
               : 'Retry request')
-        : confirmed
-        ? 'Sent'
         : 'Payment proposal';
     final recipient = _text(payment['recipient']);
     final status = paymentPhase(payment);

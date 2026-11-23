@@ -1410,9 +1410,10 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     final pending = approvals
         .where((a) => a.vault['vault'] == v['vault'])
         .toList();
+    // The newest confirmed payments; History lists every record.
     final recent = payments
         .where((p) => p['phase'] == 'confirmed')
-        .take(2)
+        .take(5)
         .toList();
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
