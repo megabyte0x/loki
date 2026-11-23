@@ -1552,7 +1552,11 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                                   style: lokiSans(12, weight: 600),
                                 ),
                                 Text(
-                                  shortId(p['recipient'] as String? ?? ''),
+                                  shortId(
+                                    (p['recipient'] as String?)?.isNotEmpty == true
+                                        ? p['recipient'] as String
+                                        : p['txid'] as String? ?? '',
+                                  ),
                                   style: lokiMono(9, color: c.muted),
                                 ),
                               ],

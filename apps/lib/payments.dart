@@ -1386,9 +1386,10 @@ class _HistoryPageState extends State<HistoryPage> {
                           fontWeight: FontWeight.w600,
                         ),
                       ),
-                      if (recipient != null)
+                      // A deposit has no recipient to show; name its transaction instead.
+                      if (recipient ?? _id(payment['txid']) case final shown?)
                         Text(
-                          _short(recipient),
+                          _short(shown),
                           overflow: TextOverflow.ellipsis,
                           maxLines: 1,
                           style: lokiMono(10, color: colors.muted),

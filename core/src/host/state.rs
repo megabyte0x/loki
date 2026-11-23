@@ -472,6 +472,8 @@ pub struct AppState {
     /// True until the first registration attempt after unlock finishes. Its device-key Touch ID
     /// prompt comes first; vault opens wait so two prompts never race (and cancel each other).
     pub(super) first_registration: (std::sync::Mutex<bool>, std::sync::Condvar),
+    /// Per vault: deposits seen by the last wallet scan, listed in History.
+    pub(super) received: std::sync::Mutex<BTreeMap<String, Vec<crate::wallet_store::Received>>>,
     /// LokiSigner's confirmed launch snapshot. Fresh settings without overrides are saved on unlock.
     pub(super) fetched_config: Option<super::FetchedConfig>,
 }
@@ -519,6 +521,7 @@ impl AppState {
             wallet_tabs: None,
             viewing_keys: std::sync::Mutex::new(BTreeMap::new()),
             first_registration: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+            received: std::sync::Mutex::new(BTreeMap::new()),
             fetched_config: None,
         }
     }

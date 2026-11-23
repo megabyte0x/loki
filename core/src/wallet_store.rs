@@ -60,6 +60,18 @@ type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng
 /// The start of the draft error for funds that are not yet confirmed deeply enough to spend.
 pub const FUNDS_WAITING: &str = "Funds for this payment are waiting for confirmations.";
 
+/// A deposit into the vault: a mined transaction that pays the vault without spending any of its
+/// notes (so the vault's own payments, their change and cancellations are not counted).
+#[derive(Debug, Clone)]
+pub struct Received {
+    /// Display (big-endian) hex, as explorers show it.
+    pub txid: String,
+    pub value_zat: u64,
+    pub mined_height: u32,
+    /// The block's timestamp (Unix seconds), when the wallet stored that block.
+    pub block_time: Option<u64>,
+}
+
 /// What a vault can pay right now, read from the local wallet database only.
 #[derive(Debug, Clone)]
 pub struct Spendability {
@@ -1014,6 +1026,41 @@ impl VaultWallet {
             let _ = self.reserve_inputs(*owner, &[*nf], *expiry);
         }
         Ok(())
+    }
+
+    /// Every deposit into the vault in scanned blocks, newest first.
+    pub fn received(&mut self) -> Result<Vec<Received>, String> {
+        // The extension interface returns one row, so fold the deposits into one JSON array.
+        let rows: String = self.db
+            .transactionally_with_extension(|_, ext| {
+                ext.query_row(
+                    "SELECT COALESCE(json_group_array(json_array(hex(txid), total, mined_height, time)), '[]') FROM ( \
+                       SELECT t.txid AS txid, SUM(rn.value) AS total, t.mined_height AS mined_height, b.time AS time \
+                       FROM ironwood_received_notes rn \
+                       JOIN transactions t ON t.id_tx = rn.transaction_id \
+                       LEFT JOIN blocks b ON b.height = t.mined_height \
+                       WHERE rn.is_change = 0 AND t.mined_height IS NOT NULL \
+                         AND NOT EXISTS (SELECT 1 FROM ironwood_received_note_spends s WHERE s.transaction_id = t.id_tx) \
+                       GROUP BY t.id_tx ORDER BY t.mined_height DESC)",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+            })
+            .map_err(|e: rusqlite::Error| format!("read received payments: {e}"))?;
+        let rows: Vec<(String, i64, u32, Option<i64>)> =
+            serde_json::from_str(&rows).map_err(|e| format!("read received payments: {e}"))?;
+        rows.into_iter()
+            .map(|(txid, total, mined_height, time)| {
+                let mut bytes = [0u8; 32];
+                hex::decode_to_slice(&txid, &mut bytes).map_err(|e| format!("received txid: {e}"))?;
+                Ok(Received {
+                    txid: TxId::from_bytes(bytes).to_string(),
+                    value_zat: total.max(0) as u64,
+                    mined_height,
+                    block_time: time.map(|t| t.max(0) as u64),
+                })
+            })
+            .collect()
     }
 
     /// The transaction in a scanned block that spent the vault note with this nullifier, if

@@ -353,7 +353,7 @@ fn wallet(
 ) -> Result<(VaultWallet, Lightwalletd, tokio::runtime::Runtime), String> {
     let rt = runtime()?;
     let started = std::time::Instant::now();
-    let (w, client) = rt.block_on(async {
+    let (mut w, client) = rt.block_on(async {
         tokio::select! {
             biased;
             _ = st.wait_for_stop() => Err("profile is locked".into()),
@@ -364,6 +364,11 @@ fn wallet(
         if !st.is_stopping() { native_event!(st, Event::WalletSyncFailed) }
     })?;
     eprintln!("[verbose] vault {}: lightwalletd scan done in {} ms", &vault[..8.min(vault.len())], started.elapsed().as_millis());
+    // History lists deposits from the latest scan without opening the wallet on every poll.
+    match w.received() {
+        Ok(received) => { if let Ok(mut all) = st.received.lock() { all.insert(vault.to_owned(), received); } }
+        Err(error) => eprintln!("[verbose] vault {}: {error}", &vault[..8.min(vault.len())]),
+    }
     native_event!(st, Event::WalletSynced);
     Ok((w, client, rt))
 }
@@ -3019,6 +3024,15 @@ pub(super) async fn payments(
                 "signing_expiry": p.signing_expiry, "tx_expiry": held_tx_expiry(&v, p),
                 "error": p.error, "failure_reason": p.failure_reason,
                 "created_at": created_at(&data, p),
+            }));
+        }
+        // Deposits from the latest wallet scan, shaped like the browser signer's chain history.
+        let received = st.received.lock().ok().and_then(|all| all.get(&vault).cloned()).unwrap_or_default();
+        for r in received {
+            out.push(json!({
+                "attempt": r.txid, "txid": r.txid, "direction": "received", "phase": "confirmed",
+                "recipient": "", "amount_zat": r.value_zat.to_string(), "mined_height": r.mined_height,
+                "created_at": r.block_time, "tx_verified": true,
             }));
         }
         // Newest first.
