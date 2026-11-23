@@ -247,8 +247,7 @@ function browserSigner(origin: string): SignerModule {
         const status = await call<Parameters<typeof chainPaymentSession>[0] & { chain_trust: "provider_reported" }>("payment-status", payment);
         return { ...chainPaymentSession(status), chain_trust: status.chain_trust } as T;
       }
-      // Recovery words are shown, typed and checked on the signer page; only the opaque
-      // backup ciphertext ({backup} from recovery-export) and public results come back.
+      // Recovery words and backup downloads stay in the separate signer tab.
       if (path === "recovery-setup" || path === "recovery-export" || path === "recovery-status") return call<T>(path, body);
       if (path === "restore") { const r = await call<T>(path, body); try { localStorage.setItem(SEALED, "1"); } catch {} return r; }
       if (path === "manage-custody") {

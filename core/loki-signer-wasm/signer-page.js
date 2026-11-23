@@ -15,9 +15,11 @@ const wallet = cfg.walletOrigin;
 const rpId = cfg.rpId || location.hostname;
 const custodyPath = "/manage-custody";
 const paymentPath = "/approve-payment";
+const joinPath = "/approve-roster";
+const recoveryPath = "/recovery";
 const receivePath = "/receive-address";
 const framed = window !== top;
-const embedded = framed && ![custodyPath, paymentPath, receivePath].includes(location.pathname);
+const embedded = framed && ![custodyPath, paymentPath, joinPath, recoveryPath, receivePath].includes(location.pathname);
 const $ = (id) => document.getElementById(id);
 $("self-origin").textContent = location.origin;
 $("relay").textContent = `${cfg.frostdUrl || "none configured"} · nonce witnesses: ${cfg.nonceWitnesses?.map((w) => w.endpoint).join(", ") || "none (signing is refused)"}`;
@@ -194,10 +196,14 @@ async function prfSecret(id, signal) {
 async function submitPasskey(id, signal, commit, submit) {
   const assertion = await passkeyAssertion(id, signal);
   commit();
-  const result = await submit({ prfSecret: assertion.prfSecret });
+  const result = await submit({ prfSecret: assertion.prfSecret }, assertion.id);
   // A valid WebAuthn assertion is not necessarily the passkey that opens this signer.
-  try { localStorage.setItem(CRED, assertion.id); } catch {}
+  if (embedded) rememberCredential(assertion.id);
   return result;
+}
+
+function rememberCredential(id) {
+  try { localStorage.setItem(CRED, id); } catch {}
 }
 
 // Passphrase floor for the passphrase tier: long enough that the offline Argon2id guess
@@ -278,20 +284,25 @@ async function reauthValue(field, signal) {
 }
 
 // ─── recovery: 24 words shown once, backups sealed to them ──────────────────
-// The words exist only on this page, once; the signer keeps only their public keys. Each
+// The words are shown only in the separate signer tab; custody keeps only their public keys. Each
 // vault's recovery backup is ciphertext only the words open, so it is safe to download.
 async function recoverySetup() {
   if (!current) throw new SignerError("Unlock your signer", 401);
   const status = await call({ op: "recovery-status" });
   if (status.legacy_recovery) {
-    const saved = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
-    await prompt("Confirm your saved recovery words", [
-      el("p", { textContent: "Confirm your original words before making new backups. Existing backups will not change." }),
-      el("label", { textContent: "Your 24 recovery words" }, saved),
-    ], [cancelButton, { label: "Confirm", run: () => call({ op: "recovery-migrate", words: saved.value }) }]);
-    return { recovery: true };
+    await openRecovery("recovery-migrate", null, async (words) => {
+      await call({ op: "recovery-migrate", words });
+      return true;
+    });
+  } else {
+    const words = (await call({ op: "recovery-begin" })).split(" ");
+    await openRecovery("recovery-setup", words);
+    await call({ op: "recovery-confirm" });
   }
-  const words = (await call({ op: "recovery-begin" })).split(" ");
+  return { recovery: true };
+}
+
+async function showRecoverySetup(words) {
   await prompt("Write down your 24 recovery words", [
     el("p", { textContent: "They are shown only now. With them and a vault's recovery backup file, you can restore your signer in a new browser. Anyone who has both can sign as you." }),
     el("ol", { className: "mono" }, ...words.map((w) => el("li", { textContent: w }))),
@@ -300,22 +311,25 @@ async function recoverySetup() {
   while (chosen.size < 3) chosen.add(random(1)[0] % 24);
   const picks = [...chosen].sort((a, b) => a - b);
   const fields = picks.map(() => el("input", { autocomplete: "off", spellcheck: false }));
-  await prompt("Confirm your recovery words", [
+  return prompt("Confirm your recovery words", [
     ...picks.map((i, k) => el("label", { textContent: `Word ${i + 1}` }, fields[k])),
   ], [cancelButton, { label: "Confirm", run: async () => {
     if (picks.some((i, k) => fields[k].value.trim().toLowerCase() !== words[i])) {
       throw new SignerError("Those words do not match. Check what you wrote down.", 400);
     }
-    return call({ op: "recovery-confirm" });
+    return true;
   } }]);
-  return { recovery: true };
 }
 
-// Download a vault's recovery backup on this origin. The wallet gets the same opaque bytes.
 async function recoveryExport({ vault }) {
   const blob = await call({ op: "recovery-backup", vaultHex: vault });
+  await openRecovery("recovery-export", { vault, blob });
+  return null;
+}
+
+async function showRecoveryExport({ vault, blob }) {
   const fingerprint = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", blob)));
-  await prompt("Save this vault's recovery backup", [
+  return prompt("Save this vault's recovery backup", [
     el("p", { textContent: "Keep the file anywhere you like. It opens only with your 24 recovery words." }),
     el("p", { textContent: "Write down this SHA-256 fingerprint separately to verify the file on restore:" }),
     el("code", { className: "mono", textContent: fingerprint }),
@@ -323,8 +337,8 @@ async function recoveryExport({ vault }) {
     const a = el("a", { href: URL.createObjectURL(new Blob([blob])), download: `loki-recovery-${vault}.bin` });
     a.click();
     URL.revokeObjectURL(a.href);
+    return true;
   } }]);
-  return { backup: toHex(blob) };
 }
 
 // Restore a vault member into this (fresh) browser from its words and backup file.
@@ -332,6 +346,19 @@ async function recoveryExport({ vault }) {
 // `vault`), e.g. one the member kept with the coordinator; otherwise the member picks the file.
 async function restore({ vault, name, method, backup }) {
   await persistent();
+  name = String(name || "You");
+  const result = await openRecovery("restore", { vault, name, method, backup }, async ({
+    input: { vaultHex, words, blob, fingerprint }, secret: { passphrase, prfSecret }, credentialId,
+  }) => {
+    const restored = await call({ op: "restore", method, name, vaultHex, words, blob, fingerprint, passphrase, prfSecret });
+    if (credentialId) rememberCredential(credentialId);
+    return restored;
+  });
+  current = { profile: result.profile, se: method === "passphrase" ? "software" : "passkey" };
+  return { ...result, persisted };
+}
+
+async function showRestore({ vault, name, method, backup }, _context, submit) {
   const words = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
   const file = el("input", { type: "file" });
   const fingerprint = el("input", { autocomplete: "off", spellcheck: false });
@@ -352,10 +379,7 @@ async function restore({ vault, name, method, backup }) {
     if (!f || !vaultHex) throw new SignerError("Choose the loki-recovery-<vault>.bin file you saved.", 400);
     return { vaultHex, words: typed, blob: new Uint8Array(await f.arrayBuffer()), fingerprint: expected };
   } }]);
-  name = String(name || "You");
-  const result = await newCustody(name, method, (secret) => call({ op: "restore", method, name, ...input, ...secret }));
-  current = { profile: result.profile, se: method === "passphrase" ? "software" : "passkey" };
-  return { ...result, persisted };
+  return newCustody(name, method, (secret, credentialId) => submit({ input, secret, credentialId }));
 }
 
 // Only the tab opened by this signer frame can send a removal confirmation. Its private port
@@ -527,18 +551,8 @@ async function showReceiveAddress() {
 // ─── Worker asks: on-device decisions ────────────────────────────────────────
 const zec = (zat) => `${(Number(zat) / 1e8).toFixed(8)} TAZ`;
 const asks = {
-  // The full member list, before this member tells the creator it agrees.
-  "roster-members": (d) => prompt(`Join "${d.name}"?`, [
-    el("p", { textContent: `${d.threshold} of ${d.members.length} members must approve each payment. Network: ${d.network}. You are member ${d.slot}.` }),
-    el("ul", {}, ...d.members.map((m) => el("li", { className: "mono", textContent: `#${m.id}${m.id === d.slot ? " (you)" : ""} signing ${m.signing.slice(0, 16)}… relay ${m.encryption.slice(0, 16)}…` }))),
-  ], [{ label: "Reject", ghost: true, value: false }, { label: "These are the members", value: true }]),
-
-  // The 24-digit roster code, compared out of band with every other member.
-  "roster-code": (d) => prompt("Compare this code with every other member", [
-    el("p", { className: "code", textContent: d.code }),
-    el("p", { textContent: "Every member's signer must show exactly these digits. If any differ, someone changed the vault setup." }),
-    ...(d.birth_height != null ? [facts([["Vault birth height", d.birth_height]])] : []),
-  ], [{ label: "Codes differ", ghost: true, value: false }, { label: "All codes match", value: true }]),
+  "roster-members": (d) => openTopLevelConsent(joinPath, "roster-members", d),
+  "roster-code": (d) => openTopLevelConsent(joinPath, "roster-code", d),
 
   "nonce-witnesses": (endpoints) => {
     const code = el("input", { type: "text", autocomplete: "off", spellcheck: false, maxLength: 64 });
@@ -555,22 +569,28 @@ const asks = {
     } }]);
   },
 
-  "payment-terms": (d) => openPaymentConsent("payment-terms", d),
-  "payment-sign": (d) => openPaymentConsent("payment-sign", d),
+  "payment-terms": (d) => openTopLevelConsent(paymentPath, "payment-terms", d),
+  "payment-sign": (d) => openTopLevelConsent(paymentPath, "payment-sign", d),
 };
 
-// This port belongs to one worker ask for one payment. Only the tab opened here can
-// connect; the wallet neither supplies the displayed details nor sees the answer.
-function openPaymentConsent(kind, details) {
+async function openRecovery(kind, details, submit) {
+  const value = await openTopLevelConsent(recoveryPath, kind, details, submit);
+  if (value === null) throw new SignerError("Cancelled on the signer", 400);
+  return value;
+}
+
+// One private port for the tab opened by this launcher. A recovery write, if any, is
+// supplied by the frame so the tab cannot choose an operation or open custody storage.
+function openTopLevelConsent(path, kind, details, submit) {
   const openedFor = current;
   return prompt("Continue in the Loki signer tab", [
-    el("p", { textContent: `Review the payment in a separate tab. Check its address starts with ${location.origin}${paymentPath} before approving or entering any credentials.` }),
-  ], [{ ...cancelButton, value: null }, { label: "Open signer tab", abortable: true, run: (signal) => {
-    if (!openedFor || current !== openedFor) throw new SignerError("The signer session changed. Return to the wallet and try again.", 401);
-    const tab = window.open(paymentPath, "_blank");
+    el("p", { textContent: `Open a separate tab. Before approving or entering secrets, check that its address is ${location.origin}${path}.` }),
+  ], [{ ...cancelButton, value: null }, { label: "Open signer tab", abortable: true, run: (signal, commit) => {
+    if (current !== openedFor) throw new SignerError("The signer session changed. Return to the wallet and try again.", 401);
+    const tab = window.open(path, "_blank");
     if (!tab) throw new SignerError("Allow the signer to open a new tab and try again.", 400);
     return new Promise((resolve, reject) => {
-      let port;
+      let port, committing = false;
       const finish = () => {
         removeEventListener("message", connect);
         signal.removeEventListener("abort", cancel);
@@ -581,22 +601,35 @@ function openPaymentConsent(kind, details) {
       };
       const cancel = () => { finish(); resolve(null); };
       const connect = (e) => {
-        if (e.source !== tab || e.origin !== location.origin || e.data?.cmd !== "payment-connect" || !e.ports[0]) return;
+        if (e.source !== tab || e.origin !== location.origin || e.data?.cmd !== `consent:${path}` || !e.ports[0]) return;
         removeEventListener("message", connect);
         clearTimeout(timeout);
         if (current !== openedFor || tab.closed) { cancel(); return; }
         port = e.ports[0];
-        port.onmessage = ({ data }) => {
+        port.onmessage = async ({ data }) => {
+          if (committing) return;
           if (current !== openedFor || tab.closed) { cancel(); return; }
-          finish();
-          resolve(data);
+          if (data === null) { cancel(); return; }
+          try {
+            let result = data;
+            if (submit) {
+              commit();
+              committing = true;
+              result = await submit(data);
+            }
+            finish();
+            resolve(result);
+          } catch (e) {
+            if (tab.closed || current !== openedFor) { cancel(); return; }
+            port.postMessage({ error: e.message || String(e) });
+          } finally { committing = false; }
         };
-        const passkey = openedFor.se === "passkey";
+        const passkey = path === paymentPath && openedFor?.se === "passkey";
         port.postMessage({ kind, details, passkey, credentialId: passkey ? rememberedCredential() : undefined });
       };
       addEventListener("message", connect);
       signal.addEventListener("abort", cancel, { once: true });
-      const closed = setInterval(() => { if (tab.closed || current !== openedFor) cancel(); }, 500);
+      const closed = setInterval(() => { if (!committing && (tab.closed || current !== openedFor)) cancel(); }, 500);
       const timeout = setTimeout(() => {
         finish();
         reject(new SignerError("The signer tab could not connect. Allow tabs opened by the signer and try again.", 409));
@@ -605,7 +638,35 @@ function openPaymentConsent(kind, details) {
   } }]);
 }
 
-// These prompts are only rendered by showPaymentConsent on the unframeable route.
+// These prompts are only rendered by showTopLevelConsent on their unframeable routes.
+const joinPrompts = {
+  // The full member list, before this member tells the creator it agrees.
+  "roster-members": (d) => prompt(`Join "${d.name}"?`, [
+    el("p", { textContent: `${d.threshold} of ${d.members.length} members must approve each payment. Network: ${d.network}. You are member ${d.slot}.` }),
+    el("ul", {}, ...d.members.map((m) => el("li", { className: "mono", textContent: `#${m.id}${m.id === d.slot ? " (you)" : ""} signing ${m.signing.slice(0, 16)}… relay ${m.encryption.slice(0, 16)}…` }))),
+  ], [{ label: "Reject", ghost: true, value: false }, { label: "These are the members", value: true }]),
+
+  // The 24-digit roster code, compared out of band with every other member.
+  "roster-code": (d) => prompt("Compare this code with every other member", [
+    el("p", { className: "code", textContent: d.code }),
+    el("p", { textContent: "Every member's signer must show exactly these digits. If any differ, someone changed the vault setup." }),
+    ...(d.birth_height != null ? [facts([["Vault birth height", d.birth_height]])] : []),
+  ], [{ label: "Codes differ", ghost: true, value: false }, { label: "All codes match", value: true }]),
+};
+
+const recoveryPrompts = {
+  "recovery-setup": showRecoverySetup,
+  "recovery-migrate": (_details, _context, submit) => {
+    const saved = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
+    return prompt("Confirm your saved recovery words", [
+      el("p", { textContent: "Confirm your original words before making new backups. Existing backups will not change." }),
+      el("label", { textContent: "Your 24 recovery words" }, saved),
+    ], [cancelButton, { label: "Confirm", run: () => submit(saved.value) }]);
+  },
+  "recovery-export": showRecoveryExport,
+  restore: showRestore,
+};
+
 const paymentPrompts = {
   "payment-terms": (d) => prompt("Approve this payment request?", [
     facts([["To", d.recipient, true], ["Amount", zec(d.amount_zat)], ["Fee", zec(d.fee_zat)], ["Memo", d.memo || "(none)"],
@@ -629,16 +690,27 @@ const paymentPrompts = {
   },
 };
 
-async function showPaymentConsent() {
-  const connection = await connectToSignerFrame("payment-connect");
-  if (!connection) {
-    void prompt("Payment review unavailable", [el("p", { textContent: "Return to the wallet and use the signer’s Open signer tab button to review a payment." })], []);
+async function showTopLevelConsent(prompts) {
+  const connection = await connectToSignerFrame(`consent:${location.pathname}`);
+  window.opener = null;
+  if (!connection || !Object.hasOwn(prompts, connection.context.kind)) {
+    connection?.port.close();
+    void prompt("Signer request unavailable", [el("p", { textContent: "Return to the wallet and use the signer’s Open signer tab button." })], []);
     return;
   }
   const { port, context } = connection;
-  const value = await paymentPrompts[context.kind](context.details, context);
-  port.postMessage(value);
-  port.close();
+  // For writes the frame closes this tab on success and sends errors back for retry.
+  const submit = (data) => new Promise((_, reject) => {
+    port.onmessage = ({ data: { error } }) => reject(new SignerError(error));
+    port.postMessage(data);
+  });
+  try {
+    port.postMessage(await prompts[context.kind](context.details, context, submit));
+  } catch {
+    port.postMessage(null);
+  } finally {
+    port.close();
+  }
 }
 
 async function answerAsk(d) {
@@ -767,5 +839,7 @@ if (embedded) {
   } catch { failWorker(); }
 }
 if (!framed && location.pathname === custodyPath) void showCustodyControls();
-if (!framed && location.pathname === paymentPath) void showPaymentConsent();
+if (!framed && location.pathname === paymentPath) void showTopLevelConsent(paymentPrompts);
+if (!framed && location.pathname === joinPath) void showTopLevelConsent(joinPrompts);
+if (!framed && location.pathname === recoveryPath) void showTopLevelConsent(recoveryPrompts);
 if (!framed && location.pathname === receivePath) void showReceiveAddress();

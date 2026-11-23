@@ -330,6 +330,13 @@ only to the signer frame that opened it, whose lock-owning worker verifies the c
 the shares from the wallet's actual storage partition. Use the wallet's recovery flow to restore
 from the saved words and backup.
 
+When joining a vault, use **Open signer tab** for the member list and again for the roster
+code. Check that the tab is on the signer origin at `/approve-roster` before confirming.
+For browser recovery setup, backup downloads, and restores, check the signer origin at
+`/recovery`. Enter recovery words and verify or record the backup fingerprint only in that
+tab. Downloads go directly to the browser, not to the wallet page. Keep the wallet tab open
+while using either flow.
+
 For browser payments, use **Open signer tab** and check that the separate tab's address is on
 the signer origin at `/approve-payment`. Review the request there if prompted. When the
 transaction is ready, open the signer tab to check the transaction details and verify with a passkey or

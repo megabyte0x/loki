@@ -1826,7 +1826,7 @@ function VaultOverview({
 }
 
 // Download this vault's recovery backup from the in-browser signer: ciphertext only the 24
-// words open, saved on the signer page (the wallet sees the same opaque bytes).
+// words open, saved from the separate signer tab.
 function BrowserBackupCard({ vault }: { vault: string }) {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);

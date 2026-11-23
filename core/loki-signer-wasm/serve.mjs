@@ -106,8 +106,7 @@ createServer((req, res) => {
     return;
   }
   const key = path === "/" ? "/signer.html" : path;
-  const receiveAddress = key === "/receive-address";
-  const topLevelOnly = receiveAddress || key === "/manage-custody" || key === "/approve-payment";
+  const topLevelOnly = ["/receive-address", "/manage-custody", "/approve-payment", "/approve-roster", "/recovery"].includes(key);
   const asset = topLevelOnly ? "/signer.html" : key;
   const body = bundle.get(asset);
   const type = body ? types[extname(asset)] || "application/octet-stream" : "text/plain";
@@ -117,7 +116,7 @@ createServer((req, res) => {
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     "Cross-Origin-Resource-Policy": "same-origin",
-    "Content-Security-Policy": `${csp}; worker-src ${receiveAddress ? "'none'" : "'self'"}; frame-ancestors ${topLevelOnly ? "'none'" : walletOrigin}`,
+    "Content-Security-Policy": `${csp}; worker-src ${topLevelOnly ? "'none'" : "'self'"}; frame-ancestors ${topLevelOnly ? "'none'" : walletOrigin}`,
   });
   res.end(req.method === "HEAD" ? undefined : body ?? "not found");
 }).listen(port, () => console.log(`loki signer origin on http://localhost:${port} (wallet ${walletOrigin}) build ${build.bundle}`));

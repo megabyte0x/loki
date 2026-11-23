@@ -308,15 +308,14 @@ export type RecoveryStatus = { recovery_identity: boolean; recovery_backup: bool
 export function recoveryStatus(vault: string): Promise<RecoveryStatus> { return api(`recovery-status?vault=${vault}`); }
 export function recoveryBackup(vault: string): Promise<{ vault: string; backup: string; fingerprint?: string }> { return api(`recovery-backup?vault=${vault}`); }
 
-// The in-browser signer's recovery. The words are shown, re-typed and entered only on the
-// signer page; the wallet sees public results and the opaque backup ciphertext.
+// Browser recovery words and backup downloads stay in the separate signer tab.
 function browserOnly(): void {
   if (paired()) throw new ApiError("This tab uses a native member; recover it in the member app", 400);
 }
 /** Show the 24 words once on the signer page and confirm three of them. */
 export async function setupBrowserRecovery(): Promise<{ recovery: boolean }> { browserOnly(); return signer.request("recovery-setup", {}); }
 /** Download this vault's recovery backup on the signer page (ciphertext only the words open). */
-export async function exportRecoveryBackup(vault: string): Promise<{ backup: string }> { browserOnly(); return signer.request("recovery-export", { vault }); }
+export async function exportRecoveryBackup(vault: string): Promise<void> { browserOnly(); await signer.request("recovery-export", { vault }); }
 /** Fresh browser: restore a vault member from its words (typed on the signer page) and its backup:
  *  the file the member picks there, or `backup` (hex ciphertext) + `vault` the wallet already holds. */
 export async function restoreSigner(opts: CreateSignerOpts & { vault?: string; backup?: string }): Promise<SignerSession> { browserOnly(); return signer.request("restore", opts); }
