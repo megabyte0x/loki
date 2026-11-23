@@ -355,7 +355,8 @@ fn wallet(
             _ = st.wait_for_stop() => Err("profile is locked".into()),
             result = scan_wallet(data, pass, vault, v, url(st)?) => result,
         }
-    })?;
+    }).inspect_err(|_| if !st.is_stopping() { native_event!(st, Event::WalletSyncFailed) })?;
+    native_event!(st, Event::WalletSynced);
     Ok((w, client, rt))
 }
 
@@ -791,9 +792,15 @@ fn send_control_inner(st: &AppState, v: &Vault<impl Sized>, p: &Payment, kind: &
 
 // Only roster-owned control sessions are drained. Signing sessions have ephemeral owners.
 fn sync_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault) -> Result<(), String> {
-    sync_control_inner(st, data, pass, vault, v, None).inspect_err(|_| {
-        eprintln!("vault {vault}: frostd control receive error");
-    })
+    let result = sync_control_inner(st, data, pass, vault, v, None);
+    match &result {
+        Ok(()) => native_event!(st, Event::RelayReachable),
+        Err(_) => {
+            eprintln!("vault {vault}: frostd control receive error");
+            if !st.is_stopping() { native_event!(st, Event::RelayUnavailable); }
+        }
+    }
+    result
 }
 
 fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
@@ -1166,39 +1173,56 @@ pub(super) async fn balance(State(st): State<Shared>, Json(body): Json<Value>) -
 
 pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
     with_body(st, body, |st, data, pass, body| {
-        let vault = required(&body, "vault")?;
-        let v = load_vault(&st, &data, &pass, vault)?;
-        let recipient = required(&body, "recipient")?;
-        let address = vault::orchard_receiver_from_ua(recipient, v.network.network_type())?;
-        let amount_zat: u64 = required(&body, "amount_zat")?.parse().map_err(|_| "invalid amount_zat")?;
-        if amount_zat == 0 { return Err("amount must exceed zero".into()); }
-        let amount = Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?;
-        let memo = body["memo"].as_str().unwrap_or("");
-        let memo_bytes = MemoBytes::from_bytes(memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
-        let (mut w, _, _) = wallet(&st, &data, &pass, vault, &v)?;
-        // Refresh locally authorized reservations before selecting a note.
-        let _ = sync_control(&st, &data, &pass, vault, &v);
-        reconcile(&data, &pass, vault, v.slot, &mut w)?;
-        let (anchor, expiry) = heights(&w, &v)?;
-        let funding = w.propose_with_confirmation_wait(address, Some(amount), memo_bytes.clone(), st.config.native)?;
-        let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
-        let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
-        let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
-        let note = funding.notes.iter().find(|note| note.value().inner() >= amount_zat.saturating_add(fee_zat))
-            .ok_or("payment needs one Ironwood note large enough for amount and fee")?;
-        let change_zat = note.value().inner().checked_sub(amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("note cannot cover amount and fee")?;
-        if funding.notes.len() == 1 && (funding.fee_zat != fee_zat || funding.change_zat != change_zat) { return Err("wallet funding differs from candidate fee or change".into()); }
-        let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
-        let attempt = hex::encode(random);
-        let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
-        // No signing group yet: the request is open to every member (`signing_group`).
-        let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, phase: "draft".into(), ..Default::default() };
-        check_intent(&p, &v)?;
-        let nullifier = [hex32(&p.note_selection[0])?];
-        w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
-        if let Err(e) = save_payment(&data, &pass, &p) { let _ = w.release_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier); return Err(e); }
-        Ok(json!({"attempt":attempt,"fee_zat":fee_zat.to_string(),"change_zat":change_zat.to_string()}))
+        let result = draft_locked(&st, &data, &pass, &body);
+        if let Err(error) = &result { native_event!(&st, Event::DraftRefused(draft_refusal(error))); }
+        result
     }).await
+}
+
+fn draft_refusal(error: &str) -> super::diagnostics::DraftRefusal {
+    use super::diagnostics::DraftRefusal;
+    if error.starts_with(crate::wallet_store::FUNDS_WAITING) { DraftRefusal::WaitingForConfirmations }
+    else if error == NO_SINGLE_NOTE || error == "note cannot cover amount and fee" { DraftRefusal::NoSingleNote }
+    else if error.starts_with("fund payment:") { DraftRefusal::InsufficientFunds }
+    else { DraftRefusal::Other }
+}
+
+const NO_SINGLE_NOTE: &str = "payment needs one Ironwood note large enough for amount and fee";
+
+/// Runs under `st.payment`.
+fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
+    let vault = required(body, "vault")?;
+    let v = load_vault(st, data, pass, vault)?;
+    let recipient = required(body, "recipient")?;
+    let address = vault::orchard_receiver_from_ua(recipient, v.network.network_type())?;
+    let amount_zat: u64 = required(body, "amount_zat")?.parse().map_err(|_| "invalid amount_zat")?;
+    if amount_zat == 0 { return Err("amount must exceed zero".into()); }
+    let amount = Zatoshis::from_u64(amount_zat).map_err(|e| format!("amount: {e:?}"))?;
+    let memo = body["memo"].as_str().unwrap_or("");
+    let memo_bytes = MemoBytes::from_bytes(memo.as_bytes()).map_err(|e| format!("memo: {e:?}"))?;
+    let (mut w, _, _) = wallet(st, data, pass, vault, &v)?;
+    // Refresh locally authorized reservations before selecting a note.
+    let _ = sync_control(st, data, pass, vault, &v);
+    reconcile(data, pass, vault, v.slot, &mut w)?;
+    let (anchor, expiry) = heights(&w, &v)?;
+    let funding = w.propose_with_confirmation_wait(address, Some(amount), memo_bytes.clone(), st.config.native)?;
+    let first = *funding.notes.first().ok_or("wallet proposed no Ironwood notes")?;
+    let inputs = CandidateInputs { vault_fvk: &v.fvk, notes: vec![first], recipient: address, amount, memo: memo_bytes, change: Zatoshis::ZERO, target_height: anchor, expiry_height: expiry };
+    let fee_zat: u64 = quote_fee(&v.network, &inputs)?.into();
+    let note = funding.notes.iter().find(|note| note.value().inner() >= amount_zat.saturating_add(fee_zat))
+        .ok_or(NO_SINGLE_NOTE)?;
+    let change_zat = note.value().inner().checked_sub(amount_zat).and_then(|n| n.checked_sub(fee_zat)).ok_or("note cannot cover amount and fee")?;
+    if funding.notes.len() == 1 && (funding.fee_zat != fee_zat || funding.change_zat != change_zat) { return Err("wallet funding differs from candidate fee or change".into()); }
+    let mut random = [0u8; 32]; OsRng.fill_bytes(&mut random);
+    let attempt = hex::encode(random);
+    let note_selection = vec![hex::encode(note.nullifier(&v.fvk).to_bytes())];
+    // No signing group yet: the request is open to every member (`signing_group`).
+    let p = Payment { attempt: attempt.clone(), vault: vault.to_owned(), proposer: v.slot, recipient: recipient.to_owned(), amount_zat, memo: memo.to_owned(), fee_zat, change_zat, note_selection, target_height: anchor, expiry_height: expiry, phase: "draft".into(), ..Default::default() };
+    check_intent(&p, &v)?;
+    let nullifier = [hex32(&p.note_selection[0])?];
+    w.reserve_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier, expiry)?;
+    if let Err(e) = save_payment(data, pass, &p) { let _ = w.release_inputs(zcash_client_backend::wallet::LockOwner::new(random), &nullifier); return Err(e); }
+    Ok(json!({"attempt":attempt,"fee_zat":fee_zat.to_string(),"change_zat":change_zat.to_string()}))
 }
 
 pub(super) async fn publish(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
@@ -1420,10 +1444,14 @@ fn record_failure(st: &Shared, data: &Path, pass: &str, vault: &str, attempt: &s
     reason: Option<FailureReason>,
 ) {
     let Ok(mut p) = read_payment(data, pass, vault, attempt) else { return };
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
-    if st.config.native && matches!(p.phase.as_str(), "signing" | "ready" | "signed")
+    if matches!(p.phase.as_str(), "signing" | "ready" | "signed")
         && !payment_dir(data, vault).is_ok_and(|dir| dir.exists(&refused_file(attempt))) {
-        super::native_member::emit_for(st, super::native_member::Event::PaymentFailed);
+        native_event!(st, Event::PaymentFailed(match reason {
+            Some(FailureReason::ApprovalTimeout) => PaymentFailure::ApprovalTimeout,
+            Some(FailureReason::Refused) => PaymentFailure::Refused,
+            Some(FailureReason::ShareDeadline) => PaymentFailure::ShareDeadline,
+            None => PaymentFailure::Other,
+        }));
     }
     match p.phase.as_str() {
         "signing" => {
@@ -1597,8 +1625,7 @@ fn payment_worker(
     let sign_member = || -> Result<(), RoundError> {
         if st.config.native { check_running()?; }
         sign_with_opened(st, data, pass, &p, &v, owned, &check_running, opened, approval.clone())?;
-        #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
-        if st.config.native { super::native_member::emit_for(st, super::native_member::Event::PaymentSigned); }
+        native_event!(st, Event::PaymentSigned);
         Ok(())
     };
     let report = |error: &RoundError| {
@@ -2730,6 +2757,16 @@ pub(super) async fn status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn draft_errors_map_to_fixed_log_reasons() {
+        use crate::host::diagnostics::DraftRefusal;
+        assert_eq!(draft_refusal(&format!("{} Incoming deposits need 3 confirmations before they can be spent.", crate::wallet_store::FUNDS_WAITING)),
+            DraftRefusal::WaitingForConfirmations);
+        assert_eq!(draft_refusal(NO_SINGLE_NOTE), DraftRefusal::NoSingleNote);
+        assert_eq!(draft_refusal("fund payment: insufficient balance"), DraftRefusal::InsufficientFunds);
+        assert_eq!(draft_refusal("invalid amount_zat"), DraftRefusal::Other);
+    }
+
     use super::*;
     use orchard::{
         keys::Scope,

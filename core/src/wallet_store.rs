@@ -57,6 +57,9 @@ pub use lightwalletd::Lightwalletd;
 
 type Database = WalletDb<Connection, VaultNetwork, SystemClock, UnwrapErr<SysRng>>;
 
+/// The start of the draft error for funds that are not yet confirmed deeply enough to spend.
+pub const FUNDS_WAITING: &str = "Funds for this payment are waiting for confirmations.";
+
 pub struct VaultWallet {
     db: Database,
     network: VaultNetwork,
@@ -786,7 +789,7 @@ impl VaultWallet {
                             && covers_one_note(&mut self.db, ConfirmationsPolicy::MIN)
                             && !covers_one_note(&mut self.db, confirmations)
                         {
-                            format!("Funds for this payment are waiting for confirmations. Incoming deposits need {} confirmations before they can be spent.", confirmations.untrusted())
+                            format!("{FUNDS_WAITING} Incoming deposits need {} confirmations before they can be spent.", confirmations.untrusted())
                         } else {
                             format!("fund payment: {error}")
                         }

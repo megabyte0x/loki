@@ -178,44 +178,30 @@ pub(crate) fn disconnect_wallet_tabs() {
     }
 }
 
-// The file sink accepts only these messages, never a coordinator response, request or secret.
-pub(super) enum Event {
-    Registered,
-    RegistrationFailed,
-    CoordinatorUnavailable,
-    RegistrationRefused,
-    RegistrationKeyUnavailable,
-    PaymentApproved,
-    PaymentRefused,
-    PaymentFailed,
-    PaymentSigned,
-}
+use super::diagnostics::{Event, Kind};
 
 #[derive(Default)]
 struct Diagnostics {
     sink: Option<extern "C" fn(*const std::ffi::c_char)>,
     last_error: Option<&'static str>,
+    failing: [bool; 2],
 }
 
 impl Diagnostics {
     fn record(&mut self, event: Event) {
-        let (message, error) = match event {
-            Event::Registered => ("Registered with the coordinator.", false),
-            Event::RegistrationFailed => ("LokiSigner couldn’t register with the coordinator.", true),
-            Event::CoordinatorUnavailable => ("LokiSigner couldn’t reach the coordinator. Check your connection.", true),
-            Event::RegistrationRefused => ("The coordinator refused to register this device.", true),
-            Event::RegistrationKeyUnavailable => ("LokiSigner couldn’t use its device key to register.", true),
-            Event::PaymentApproved => ("Payment approved on this Mac.", false),
-            Event::PaymentRefused => ("Payment approval was refused or not completed on this Mac.", true),
-            Event::PaymentFailed => ("LokiSigner couldn’t complete the payment. Check the wallet for details.", true),
-            Event::PaymentSigned => ("LokiSigner signed a payment.", false),
-        };
-        if error { self.last_error = Some(message); }
+        let (message, kind) = event.describe();
+        if let Some(condition) = event.condition() {
+            // Polls repeat these every few seconds: log only the change.
+            let failing = kind == Kind::Failing;
+            if self.failing[condition] == failing { return; }
+            self.failing[condition] = failing;
+        }
+        if kind == Kind::Error { self.last_error = Some(message); }
         if let Some(sink) = self.sink { sink(std::ffi::CString::new(message).unwrap().as_ptr()); }
     }
 }
 
-static DIAGNOSTICS: Mutex<Diagnostics> = Mutex::new(Diagnostics { sink: None, last_error: None });
+static DIAGNOSTICS: Mutex<Diagnostics> = Mutex::new(Diagnostics { sink: None, last_error: None, failing: [false; 2] });
 
 pub(crate) fn set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
     DIAGNOSTICS.lock().unwrap().sink = Some(sink);
@@ -460,6 +446,28 @@ impl NativeMember {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn repeating_failures_log_only_changes_and_never_set_the_last_error() {
+        static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        extern "C" fn capture(line: *const std::ffi::c_char) {
+            LINES.lock().unwrap().push(unsafe { std::ffi::CStr::from_ptr(line) }.to_str().unwrap().to_owned());
+        }
+        let mut quiet = Diagnostics::default();
+        quiet.record(Event::RelayUnavailable); // no sink: nothing to write, no panic
+        let mut diagnostics = Diagnostics { sink: Some(capture), ..Diagnostics::default() };
+        diagnostics.record(Event::RelayReachable);
+        for _ in 0..3 { diagnostics.record(Event::RelayUnavailable); }
+        diagnostics.record(Event::WalletSyncFailed);
+        diagnostics.record(Event::RelayReachable);
+        diagnostics.record(Event::RelayReachable);
+        assert_eq!(*LINES.lock().unwrap(), [
+            Event::RelayUnavailable.describe().0, Event::WalletSyncFailed.describe().0, Event::RelayReachable.describe().0,
+        ]);
+        assert_eq!(diagnostics.last_error, None);
+        diagnostics.record(Event::RegistrationRefused(super::super::diagnostics::Refusal::ExpiredChallenge));
+        assert!(diagnostics.last_error.is_some_and(|error| error.contains("pairing link expired")));
+    }
+
     use super::*;
     use crate::{
         signer::{local::encode_share, store::{FileKind, SignerStore}, Network},

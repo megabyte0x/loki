@@ -166,8 +166,27 @@ enum RegistrationFailure {
     Other(String),
     Connection(String),
     Device(DeviceKeyError),
-    Refused(String),
+    Refused(String, Refusal),
     WrongSlot,
+}
+
+/// Why the coordinator refused a registration. It is recognised only from the coordinator's exact
+/// error text, so none of that text reaches logs or the UI.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Refusal { ExpiredChallenge, GrantRequired, GrantUsed, SlotTaken, WrongSlot, Other }
+
+impl Refusal {
+    fn from_coordinator(error: Option<&str>) -> Self {
+        match error {
+            Some("unknown, expired or changed pairing challenge" | "unknown, expired or changed registration challenge"
+                | "registration generation changed; request a new challenge") => Self::ExpiredChallenge,
+            Some("a valid onboarding grant is required") => Self::GrantRequired,
+            Some("onboarding grant already used") => Self::GrantUsed,
+            Some("slot already registered or reserved") => Self::SlotTaken,
+            Some("registered identity cannot change slot" | "registered identity cannot change slot or relay key") => Self::WrongSlot,
+            _ => Self::Other,
+        }
+    }
 }
 
 impl From<String> for RegistrationFailure {
@@ -186,7 +205,7 @@ impl RegistrationFailure {
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
             Self::Device(DeviceKeyError::CoordinatorUnavailable(_)) => "coordinator-roster-unreachable",
             Self::Device(_) => "device-key",
-            Self::WrongSlot | Self::Refused(_) => "registration-refused",
+            Self::WrongSlot | Self::Refused(..) => "registration-refused",
             Self::Connection(_) => "registration-failed",
             Self::Other(_) => "native registration stopped",
         }
@@ -196,7 +215,7 @@ impl RegistrationFailure {
 impl std::fmt::Display for RegistrationFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Other(e) | Self::Connection(e) | Self::Refused(e) => f.write_str(e),
+            Self::Other(e) | Self::Connection(e) | Self::Refused(e, _) => f.write_str(e),
             Self::Device(e) => std::fmt::Display::fmt(e, f),
             Self::WrongSlot => f.write_str("registered identity cannot change slot"),
         }
@@ -211,16 +230,16 @@ async fn registration_response<T: serde::de::DeserializeOwned>(
     let status = response.status();
     if !status.is_success() {
         let error = format!("{step}: {status}");
-        if native && status == reqwest::StatusCode::BAD_REQUEST {
-            let body = read_bounded(&mut response, 1024).await.map_err(|_| RegistrationFailure::Refused(error.clone()))?;
-            if serde_json::from_slice::<serde_json::Value>(&body).ok().as_ref().is_some_and(|json|
-                matches!(json["error"].as_str(), Some("registered identity cannot change slot" | "registered identity cannot change slot or relay key"))) {
-                return Err(RegistrationFailure::WrongSlot);
-            }
-        }
         if native && status.is_client_error()
             && !matches!(status, reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) {
-            return Err(RegistrationFailure::Refused(error));
+            // The text only selects a fixed reason; it is never kept or shown.
+            let body = read_bounded(&mut response, 1024).await.ok();
+            let json = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+            let reason = Refusal::from_coordinator(json.as_ref().and_then(|json| json["error"].as_str()));
+            if status == reqwest::StatusCode::BAD_REQUEST && reason == Refusal::WrongSlot {
+                return Err(RegistrationFailure::WrongSlot);
+            }
+            return Err(RegistrationFailure::Refused(error, reason));
         }
         return Err(RegistrationFailure::Connection(error));
     }
@@ -543,17 +562,14 @@ const RESTORE_RETRY: &str = "Vault restored. LokiSigner could not reconnect to t
 /// One registration attempt; on success the public roster entry is saved and served.
 async fn register_once(st: &Shared, pass: Zeroizing<String>, pairing_claim: Option<String>, notice: Option<super::LocalNotice>) -> Result<PublicMember, RegistrationFailure> {
     let result = register_member(st, pass, pairing_claim, notice).await;
-    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
-    if st.config.native {
-        use super::native_member::{emit_for, Event};
-        emit_for(st, match &result {
-            Ok(_) => Event::Registered,
-            Err(RegistrationFailure::Connection(_)) => Event::CoordinatorUnavailable,
-            Err(RegistrationFailure::WrongSlot | RegistrationFailure::Refused(_)) => Event::RegistrationRefused,
-            Err(RegistrationFailure::Device(_)) => Event::RegistrationKeyUnavailable,
-            Err(RegistrationFailure::Other(_)) => Event::RegistrationFailed,
-        });
-    }
+    native_event!(st, match &result {
+        Ok(_) => Event::Registered,
+        Err(RegistrationFailure::Connection(_)) => Event::CoordinatorUnavailable,
+        Err(RegistrationFailure::WrongSlot) => Event::RegistrationRefused(Refusal::WrongSlot),
+        Err(RegistrationFailure::Refused(_, reason)) => Event::RegistrationRefused(*reason),
+        Err(RegistrationFailure::Device(_)) => Event::RegistrationKeyUnavailable,
+        Err(RegistrationFailure::Other(_)) => Event::RegistrationFailed,
+    });
     result
 }
 
@@ -693,6 +709,23 @@ fn write_coordinator(data: &std::path::Path, origin: &str, slot: u32) -> Result<
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn coordinator_refusals_map_only_exact_text_to_fixed_reasons() {
+        for (text, reason) in [
+            ("unknown, expired or changed pairing challenge", Refusal::ExpiredChallenge),
+            ("unknown, expired or changed registration challenge", Refusal::ExpiredChallenge),
+            ("a valid onboarding grant is required", Refusal::GrantRequired),
+            ("onboarding grant already used", Refusal::GrantUsed),
+            ("slot already registered or reserved", Refusal::SlotTaken),
+            ("registered identity cannot change slot", Refusal::WrongSlot),
+        ] {
+            assert_eq!(Refusal::from_coordinator(Some(text)), reason, "{text}");
+        }
+        for other in [None, Some(""), Some("a valid onboarding grant is required\u{202e}"), Some("A VALID ONBOARDING GRANT IS REQUIRED")] {
+            assert_eq!(Refusal::from_coordinator(other), Refusal::Other, "{other:?}");
+        }
+    }
+
     use super::*;
 
     #[test]

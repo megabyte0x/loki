@@ -24,7 +24,8 @@ enum SignerLog {
         guard line.count <= limit else { return }
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700])
-        guard let file = openLog() else { return }
+        tightenFolder()
+        guard let file = openLog() else { reportUnwritable(); return }
         defer { try? file.close() }
         guard let size = try? file.seekToEnd() else { return }
         if size + UInt64(line.count) <= UInt64(limit) {
@@ -33,6 +34,23 @@ enum SignerLog {
             defer { try? next.close() }
             try? next.write(contentsOf: line)
         }
+    }
+
+    private static var reportedUnwritable = false
+
+    /// A folder made by another tool may be group- or world-readable. Narrow it only when it is
+    /// our own real directory, never through a symbolic link.
+    private static func tightenFolder() {
+        var folder = stat()
+        guard lstat(directory.path, &folder) == 0, folder.st_mode & S_IFMT == S_IFDIR,
+              folder.st_uid == geteuid(), folder.st_mode & 0o077 != 0 else { return }
+        chmod(directory.path, 0o700)
+    }
+
+    private static func reportUnwritable() {
+        guard !reportedUnwritable else { return }
+        reportedUnwritable = true
+        FileHandle.standardError.write(Data("LokiSigner can’t write its log: ~/Library/Logs/LokiSigner must be a private folder you own.\n".utf8))
     }
 
     private static func openLog() -> FileHandle? {

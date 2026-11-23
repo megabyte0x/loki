@@ -26,6 +26,10 @@ final class WalletChannel {
         let args = Self.launchArguments(CommandLine.arguments.dropFirst())
         #endif
         validLaunch = args != nil
+        #if !LOKI_VISUAL_ONLY
+        // Connects the member's fixed diagnostic events to ~/Library/Logs/LokiSigner.
+        SignerLog.start()
+        #endif
         signer = NativeSigner(args: nativeSignerArguments(args ?? []), link: nil, walletWindow: window)
         signer.promptChanged = { [weak channel] active in
             channel?.invokeMethod("nativePromptChanged", arguments: active)
