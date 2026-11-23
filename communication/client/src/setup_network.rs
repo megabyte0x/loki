@@ -830,13 +830,23 @@ impl SetupStore {
         }
         let now = now_ms()?;
         tx.execute("DELETE FROM pending_roots WHERE expires_ms<=?1", [now])?;
+        let mut advance = true;
         for hash in pending {
-            tx.execute(
+            let inserted = tx.execute(
                 "INSERT OR IGNORE INTO pending_roots SELECT ?1,?2 WHERE (SELECT count(*) FROM pending_roots)<?3",
                 params![hash, now + PENDING_ROOT_TTL_MS, PENDING_ROOT_LIMIT],
             )?;
+            if inserted == 0 && !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending_roots WHERE hash=?1)",
+                [hash],
+                |row| row.get::<_, bool>(0),
+            )? {
+                advance = false;
+            }
         }
-        tx.execute("INSERT INTO cursors VALUES(?1,?2,?3) ON CONFLICT(pin) DO UPDATE SET sequence=excluded.sequence",params![route.pin.key.as_slice(),route.mailbox.as_slice(),next])?;
+        if advance {
+            tx.execute("INSERT INTO cursors VALUES(?1,?2,?3) ON CONFLICT(pin) DO UPDATE SET sequence=excluded.sequence",params![route.pin.key.as_slice(),route.mailbox.as_slice(),next])?;
+        }
         tx.commit()?;
         Ok(())
     }

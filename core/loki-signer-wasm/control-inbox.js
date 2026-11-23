@@ -1,6 +1,6 @@
 // Frostd's receive is destructive and offers no cursor. The worker serializes reads and
-// reduces each drain before saving. Retry a failed write before the next receive, even if
-// that receive would be empty. A worker crash before commit can still lose the drain.
+// marks each destructive drain before receiving. Retry a failed commit before the next
+// receive; after a crash the durable marker prevents use of a possibly stale start.
 export function controlInbox(store = memoryStore()) {
   let dirty;
   async function flush() {
@@ -11,16 +11,25 @@ export function controlInbox(store = memoryStore()) {
   async function read(key, drain, reduce = (old, fresh) => fresh.length ? [...old, ...fresh] : old) {
     await flush();
     const old = await store.get(key);
-    const next = await reduce(old, await drain(old));
-    if (next !== old) {
+    let marked = false;
+    const fresh = await drain(old, async () => {
+      await store.put(key, { ...old, draining: true });
+      marked = true;
+    });
+    const next = await reduce(old, fresh);
+    if (next !== old || marked && !old.draining) {
       dirty = [key, next];
       await flush();
     }
     return next;
   }
   read.prune = async (scope, live) => {
-    await store.prune(scope, live);
     await flush();
+    await store.prune(scope, live);
+  };
+  read.clear = async () => {
+    await store.clear();
+    dirty = undefined;
   };
   return read;
 }
@@ -86,9 +95,13 @@ export function idbStore(name = "loki_control") {
       const keys = notices.getAllKeys();
       keys.onsuccess = () => {
         for (const key of keys.result) {
-          if (key[0] === scope && !live.has(key[1])) notices.delete(key);
+          if (key[0] !== scope || !live.has(key[1])) notices.delete(key);
         }
       };
+    }),
+    clear: () => run("readwrite", (notices, legacy) => {
+      notices.clear();
+      legacy.clear();
     }),
   };
 }

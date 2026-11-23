@@ -513,9 +513,10 @@ function controlOwner(vault, info) {
 // vault before discarding its one-shot notice; the sealed envelope binds the actual vault.
 async function readControl(signer, control, vault, sessionId, owner, scope, info) {
   let reduced = null;
-  await controlHistory([scope, sessionId], async (saved) => {
+  await controlHistory([scope, sessionId], async (saved, markDraining) => {
     if (saved.blocked || saved.vault && saved.vault !== vault.vault_id || saved.wires.length > MAX_CONTROL_BATCH) return [];
     control.useSession(sessionId);
+    await markDraining();
     return JSON.parse(await control.recv());
   }, async (saved, fresh) => {
     if (saved.vault && saved.vault !== vault.vault_id) return saved;
@@ -534,8 +535,17 @@ async function readControl(signer, control, vault, sessionId, owner, scope, info
       }
     }
     const wires = [...unique.values()];
-    const record = (name, state) => ({
-      vault: name, wires: state.wires, blocked,
+    // Only a fresh copy of the selected notice can clear an interrupted drain. In
+    // particular, receiving an old intent must not make a cached start signable again.
+    const reannounced = ({ notice }, target, proposer) => fresh.slice(0, MAX_CONTROL_BATCH).some((wire) => {
+      if (wire?.from !== proposer.encryption || !unique.has(wire.message)) return false;
+      const event = openNotice(signer, target, sessionId, proposer, wire);
+      return event?.kind === notice.kind && event.hash === notice.hash && event.termsKey === notice.termsKey
+        && event.intent.signing_expiry === notice.intent.signing_expiry
+        && String(event.intent.signers) === String(notice.intent.signers);
+    });
+    const record = (name, state, draining) => ({
+      vault: name, wires: state.wires, blocked, draining,
       // Don't discard legacy data if only a prefix could be checked.
       migrated: !blocked && !saved.vault && saved.wires.some((w) => state.wires.some((m) => m.message === w?.message)),
     });
@@ -550,17 +560,18 @@ async function readControl(signer, control, vault, sessionId, owner, scope, info
           const proposer = controlOwner(other, info);
           if (!proposer) continue;
           const match = selectNotices(signer, other, sessionId, proposer, wires);
-          if (match) return record(name, match);
+          if (match) return record(name, match, !!saved.draining && !reannounced(match, other, proposer));
         }
       } finally { await openVault(signer, vault.vault_id); }
     }
-    if (!reduced) return saved;
-    // A destructive read went over budget. A dropped terminal event could make the
-    // retained start stale, so never authorize signing from this partial record.
-    reduced.blocked = blocked;
-    if (saved.vault && blocked === saved.blocked && reduced.wires.length === saved.wires.length
+    if (!reduced) return blocked && !saved.blocked ? { ...saved, blocked } : saved;
+    const draining = !!saved.draining && !reannounced(reduced, vault, owner);
+    // Keep newly authenticated wires even while signing is blocked. An interrupted drain
+    // must still accept later notices, unlike a session that exceeded the wire budget.
+    reduced.blocked = blocked || draining;
+    if (!saved.draining && saved.vault && blocked === saved.blocked && reduced.wires.length === saved.wires.length
       && reduced.wires.every((wire, i) => wire.message === saved.wires[i].message)) return saved;
-    return record(vault.vault_id, reduced);
+    return record(vault.vault_id, reduced, draining);
   });
   return reduced;
 }
@@ -939,8 +950,13 @@ self.onmessage = async (e) => {
       }
       case "restore": {
         const pathId = await vaultPathId(vaultHex);
-        await preopenCreate(P, method);
-        await opfsPreopenWrite(P.recovery);
+        await opfsPreopenRead(P.identity);
+        if (signer.hasSigner()) {
+          await opfsPreopenRead(P.profile);
+        } else {
+          await preopenCreate(P, method);
+          await opfsPreopenWrite(P.recovery);
+        }
         for (const path of JSON.parse(vaultPaths(pathId))) await opfsPreopenWrite(path);
         result = JSON.parse(signer.restoreSigner(method, name ?? "", passphrase, prfSecret, pathId, words, blob, fingerprint));
         break;
@@ -950,6 +966,7 @@ self.onmessage = async (e) => {
         // KEK in the same worker that holds this partition's custody and sync handles.
         signer.reauth(method, passphrase, prfSecret);
         const root = await navigator.storage.getDirectory();
+        await controlHistory.clear();
         opfsCloseAll();
         await root.removeEntry("loki", { recursive: true }).catch((e) => { if (e.name !== "NotFoundError") throw e; });
         signer.lock();

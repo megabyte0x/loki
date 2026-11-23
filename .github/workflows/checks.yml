@@ -23,7 +23,7 @@ jobs:
         run: |
           git ls-files -z | while IFS= read -r -d '' path; do
             case "${path##*/}" in
-              passphrase|*.passphrase|*.pass|profile.sealed|identity.sealed|share.sealed|vault.card|wallet.sqlite|wallet.sqlite-wal|wallet.sqlite-shm|wallet.sqlite-journal|.unlock-*)
+              passphrase|*.passphrase|*.pass|profile.sealed|identity.sealed|share.sealed|vault.sealed|vault.card|wallet.sqlite|wallet.sqlite-wal|wallet.sqlite-shm|wallet.sqlite-journal|.unlock-*)
                 printf 'Member secrets must not be committed: %q\n' "$path" >&2
                 exit 1
                 ;;
@@ -31,7 +31,7 @@ jobs:
           done
       - name: Check secret ignore patterns
         run: |
-          for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test loki-state/member-1/pids loki-member-1/member.log custom/local.pass custom/member-1.pass custom/identity.sealed custom/share.sealed; do
+          for candidate in member/passphrase member/operator.passphrase member/profile/profile.sealed member/card/vault.card member/wallet.sqlite member/wallet.sqlite-wal member/wallet.sqlite-shm member/wallet.sqlite-journal member/.unlock-test loki-state/member-1/pids loki-member-1/member.log custom/local.pass custom/member-1.pass custom/identity.sealed custom/share.sealed custom/vault.sealed; do
             if ! git check-ignore -q --no-index "$candidate"; then
               printf 'Expected Git to ignore %s\n' "$candidate" >&2
               exit 1

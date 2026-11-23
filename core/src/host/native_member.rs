@@ -284,7 +284,8 @@ fn request_route(path: &str, write: bool, export: bool) -> Result<&str, RequestE
     let (route, query) = path.split_once('?').map_or((path, None), |(route, query)| (route, Some(query)));
     let allowed = if export { !write && route == "recovery-backup" } else if write {
         matches!(route, "create" | "join" | "agree" | "balance" | "payment-draft" | "payment-publish"
-            | "payment-review" | "payment-approve" | "payment-discard" | "payment-send" | "payment-replace" | "payment-verify")
+            | "payment-review" | "payment-approve" | "payment-discard" | "payment-send" | "payment-replace" | "payment-verify"
+            | "device-revoke")
     } else {
         matches!(route, "status" | "registration" | "payments" | "pending" | "payment-status" | "recovery-status")
     };
@@ -376,14 +377,16 @@ pub(crate) fn vault_addresses() -> Result<Vec<Value>, &'static str> {
 
 fn vault_addresses_with(after_list: impl FnOnce()) -> Result<Vec<Value>, &'static str> {
     with_running_member(|member| {
-        let rows = {
+        let (data, passphrase, generation) = {
             let session = member.state.session.blocking_read();
             let session = session.as_ref().ok_or(LOCKED)?;
             if member.state.is_stopping() { return Err(LOCKED); }
-            member.list(&session.data, &session.passphrase)
+            (session.data.clone(), session.passphrase.clone(), member.state.session_generation())
         };
+        let rows = member.list(&data, &passphrase, generation);
         after_list();
-        if member.state.is_stopping() || member.state.session.blocking_read().is_none() {
+        let session = member.state.session.blocking_read();
+        if member.state.is_stopping() || session.is_none() || member.state.session_generation() != generation {
             return Err(LOCKED);
         }
         rows
@@ -391,7 +394,7 @@ fn vault_addresses_with(after_list: impl FnOnce()) -> Result<Vec<Value>, &'stati
 }
 
 impl NativeMember {
-    fn list(&self, data: &Path, pass: &str) -> Result<Vec<Value>, &'static str> {
+    fn list(&self, data: &Path, pass: &str, generation: u64) -> Result<Vec<Value>, &'static str> {
         let entries = match std::fs::read_dir(data.join("vaults")) {
             Ok(entries) => entries,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
@@ -401,6 +404,7 @@ impl NativeMember {
         entries.sort_by_key(|entry| entry.file_name());
         let mut rows = Vec::new();
         for entry in entries {
+            if self.state.session_generation() != generation || self.state.is_stopping() { return Err(LOCKED); }
             let name = entry.file_name();
             let Some(vault) = name.to_str() else { continue };
             let Ok(dir) = ceremony::dir(data, vault) else { continue };
@@ -413,7 +417,7 @@ impl NativeMember {
             };
             let slot = c.my_slot;
             let label = vault_label(&c.name);
-            let row = match self.address(data, pass, vault, slot, &c.name) {
+            let row = match self.address(data, pass, vault, slot, &c.name, generation) {
                 Ok((network, address)) => json!({ "vault": vault, "name": label, "slot": slot, "network": network, "address": address }),
                 Err(error) => json!({ "vault": vault, "name": label, "slot": slot, "error": error }),
             };
@@ -422,7 +426,7 @@ impl NativeMember {
         Ok(rows)
     }
 
-    fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16, name: &str) -> Result<(&'static str, String), &'static str> {
+    fn address(&self, data: &Path, pass: &str, vault: &str, slot: u16, name: &str, generation: u64) -> Result<(&'static str, String), &'static str> {
         // Don't migrate from vault.sealed or hold any host/cache lock over the Enclave prompt.
         let id = (vault.to_owned(), slot);
         let cached = self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.get(&id).cloned();
@@ -444,6 +448,11 @@ impl NativeMember {
             return Err(VAULT_ERROR);
         }
         let address = key.checked_address(&sealed, network).map_err(|_| VAULT_ERROR)?;
+        // Lock may have completed while Touch ID was open. Do not repopulate its cleared cache.
+        let session = self.state.session.blocking_read();
+        if session.is_none() || self.state.session_generation() != generation || self.state.is_stopping() {
+            return Err(LOCKED);
+        }
         self.viewing_keys.lock().map_err(|_| VAULT_ERROR)?.entry(id).or_insert((key, network));
         Ok((network.label(), address))
     }

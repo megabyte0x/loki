@@ -28,6 +28,7 @@ passphrase
 profile.sealed
 identity.sealed
 share.sealed
+vault.sealed
 vault.card
 wallet.sqlite
 wallet.sqlite-wal

@@ -1,5 +1,6 @@
 import { createServer } from "node:http";
 import { connect } from "node:http2";
+import { isIP } from "node:net";
 
 const origin = process.env.ORIGIN;
 if (!origin || new URL(origin).origin !== origin || !/^https?:\/\//.test(origin)) {
@@ -17,6 +18,7 @@ const mime = "application/grpc-web+proto";
 const deadlineMs = 25_000;
 const maxRequest = 23; // envelope + two height-only BlockIDs (uint32 height varints)
 const maxResponse = 32 * 1024 * 1024;
+const trustForwarded = process.env.TRUST_FORWARDED === "1";
 const active = new Map();
 let total = 0;
 
@@ -64,22 +66,11 @@ const server = createServer({ headersTimeout: 5_000, requestTimeout: 30_000, con
   if (req.headers["content-type"] !== mime) return reply(415);
   if (Number(req.headers["content-length"]) > maxRequest) return reply(413);
 
-  // Key on the actual peer, never a client-supplied forwarding header. A TLS terminator
-  // shares this budget across its downstream clients unless it applies its own fair limits.
-  const peer = req.socket.remoteAddress;
-  const inFlight = active.get(peer) ?? 0;
-  if (inFlight >= 4 || total >= 32) return reply(429);
-  active.set(peer, inFlight + 1);
-  total++;
   let session;
   const timer = setTimeout(() => fail(504), deadlineMs);
   res.once("close", () => {
     clearTimeout(timer);
     session?.destroy();
-    const left = active.get(peer) - 1;
-    if (left) active.set(peer, left);
-    else active.delete(peer);
-    total--;
   });
 
   try {
@@ -93,6 +84,24 @@ const server = createServer({ headersTimeout: 5_000, requestTimeout: 30_000, con
     if (res.destroyed || res.writableEnded) return;
     const bytes = Buffer.concat(chunks, length);
     if (!validRequest(req.url, bytes)) return fail(400);
+
+    // An opted-in loopback proxy must set or append the IP it actually accepted.
+    const socketPeer = req.socket.remoteAddress;
+    const forwarded = trustForwarded && ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(socketPeer)
+      ? req.headers["x-forwarded-for"]?.split(",").at(-1)?.trim()
+      : undefined;
+    const family = forwarded && !forwarded.includes("%") ? isIP(forwarded) : 0;
+    const peer = family === 6 ? new URL(`http://[${forwarded}]`).hostname : family === 4 ? forwarded : socketPeer;
+    const inFlight = active.get(peer) ?? 0;
+    if (inFlight >= 4 || total >= 32) return reply(429);
+    active.set(peer, inFlight + 1);
+    total++;
+    res.once("close", () => {
+      const left = active.get(peer) - 1;
+      if (left) active.set(peer, left);
+      else active.delete(peer);
+      total--;
+    });
     session = connect(upstream, { rejectUnauthorized: true, maxHeaderListPairs: 32 });
     session.on("error", () => fail(502));
     const stream = session.request({

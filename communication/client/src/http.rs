@@ -105,7 +105,7 @@ impl RelayHttp {
         if status != 200 && status != 201 {
             return Err(ClientError::Transport);
         }
-        verify_nonce_claim(route, cid, wire, challenge, status, &raw)
+        verify_nonce_claim(route, proof.claimant, cid, wire, challenge, status, &raw)
     }
     /// Existing local tooling explicitly permits literal loopback HTTP.
     pub fn new() -> ClientResult<Self> {
@@ -982,6 +982,7 @@ async fn finish(
 
 fn verify_nonce_claim(
     route: &RelayRoute,
+    claimant: nonce::Claimant,
     cid: Id32,
     wire: &[u8],
     challenge: Id32,
@@ -1000,6 +1001,8 @@ fn verify_nonce_claim(
     if nonce::encode_body(&receipt).map_err(|_| ClientError::Receipt)? != *body
         || receipt.pin != route.pin
         || receipt.mailbox != route.mailbox
+        || receipt.vault != claimant.vault
+        || receipt.slot != claimant.slot
         || receipt.cid != cid
         || receipt.challenge != challenge
         || receipt.record_hash != <Id32>::from(Sha256::digest(wire))
@@ -1355,9 +1358,12 @@ mod nonce_tests {
             append_revision: 1,
         };
         let wire = b"encrypted claim";
+        let claimant = nonce::Claimant { vault: [14; 32], slot: 2, key: [15; 32] };
         let receipt = NonceReceipt {
             pin: route.pin.clone(),
             mailbox: route.mailbox,
+            vault: claimant.vault,
+            slot: claimant.slot,
             cid: [10; 32],
             record_hash: Sha256::digest(wire).into(),
             challenge: [11; 32],
@@ -1374,12 +1380,13 @@ mod nonce_tests {
         };
         let raw = pack(&receipt);
         assert_eq!(
-            verify_nonce_claim(&route, receipt.cid, wire, receipt.challenge, 201, &raw),
+            verify_nonce_claim(&route, claimant, receipt.cid, wire, receipt.challenge, 201, &raw),
             Ok(true)
         );
-        assert!(verify_nonce_claim(&route, receipt.cid, wire, [12; 32], 201, &raw).is_err());
+        assert!(verify_nonce_claim(&route, claimant, receipt.cid, wire, [12; 32], 201, &raw).is_err());
         assert!(verify_nonce_claim(
             &route,
+            claimant,
             receipt.cid,
             b"different",
             receipt.challenge,
@@ -1388,18 +1395,18 @@ mod nonce_tests {
         )
         .is_err());
         assert!(
-            verify_nonce_claim(&route, receipt.cid, wire, receipt.challenge, 200, &raw).is_err()
+            verify_nonce_claim(&route, claimant, receipt.cid, wire, receipt.challenge, 200, &raw).is_err()
         );
         let mut wrong_pin = route.clone();
         wrong_pin.pin.run = [13; 32];
         assert!(
-            verify_nonce_claim(&wrong_pin, receipt.cid, wire, receipt.challenge, 201, &raw)
+            verify_nonce_claim(&wrong_pin, claimant, receipt.cid, wire, receipt.challenge, 201, &raw)
                 .is_err()
         );
         let mut corrupt = raw.clone();
         *corrupt.last_mut().unwrap() ^= 1;
         assert!(
-            verify_nonce_claim(&route, receipt.cid, wire, receipt.challenge, 201, &corrupt)
+            verify_nonce_claim(&route, claimant, receipt.cid, wire, receipt.challenge, 201, &corrupt)
                 .is_err()
         );
         let duplicate = NonceReceipt {
@@ -1409,6 +1416,7 @@ mod nonce_tests {
         assert_eq!(
             verify_nonce_claim(
                 &route,
+                claimant,
                 duplicate.cid,
                 wire,
                 duplicate.challenge,

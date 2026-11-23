@@ -3,10 +3,10 @@
 //!
 //! Two round-two formats exist:
 //! - v1 (`LOKIDKG1`, [`Identity::seal_round2`]) encrypts to the recipient's long-lived
-//!   encryption key. Only the local transport (`loki_setup_member run`) still uses it.
+//!   encryption key. It is retained for legacy compatibility, not used in new setups.
 //! - v2 (`LOKIDKG2`, [`Identity::seal_round2_v2`]) encrypts between two one-setup
 //!   [`FreshKey`]s announced in the signed round-one bodies and binds the round-one
-//!   transcript. The hosted engine and the new signer use only v2 (`crate::dkg_core`).
+//!   transcript. Both the local courier and the hosted engine use v2.
 
 use crate::signing_session::{MessageKind, OpenedMessage, SessionContext};
 use blake2b_simd::Params;
@@ -34,7 +34,7 @@ const PUBLIC_HEADER: usize = 8 + 32 + 2 + 4;
 const SIGNATURE: usize = 64;
 const COURIER_PAYLOAD_LIMIT: usize = 64 * 1024;
 /// Largest local courier envelope (encrypted round two, including its AEAD tag).
-pub const MAX_COURIER_ENVELOPE: usize = HEADER + COURIER_PAYLOAD_LIMIT + 16 + SIGNATURE;
+pub const MAX_COURIER_ENVELOPE: usize = HEADER_V2 + COURIER_PAYLOAD_LIMIT + 16 + SIGNATURE;
 const SESSION_MAGIC: &[u8; 8] = b"LOKISGN1";
 const SESSION_INNER: &[u8; 8] = b"LOKISGIP";
 const SESSION_HEADER: usize = 8 + 1 + 24 + 4;

@@ -434,11 +434,9 @@ impl Signer {
             .ok_or_else(|| JsError::new("this browser holds no recovery backup for that vault"))
     }
 
-    /// Restore a vault member into a FRESH browser from its 24 words and exported recovery
-    /// backup: the backup's member identity becomes this browser's signer, sealed under the
-    /// chosen custody (as `createSigner`), and the vault reopens ready to sign. Returns
-    /// `{profile, vault}`: the profile and the `vaultOpen` JSON. Pre-open the device paths
-    /// and `vaultPaths(vaultHex)` for write.
+    /// Restore a vault from its 24 words and exported recovery backup. A fresh browser
+    /// adopts the backed-up identity under the chosen custody; an existing signer must
+    /// be unlocked and match the identity. Returns `{profile, vault}`.
     #[wasm_bindgen(js_name = restoreSigner)]
     #[allow(clippy::too_many_arguments)]
     pub fn restore_signer(
@@ -1740,35 +1738,52 @@ impl Signer {
         blob: &[u8],
         fingerprint: &str,
     ) -> Result<String, String> {
-        if opfs_exists(IDENTITY_PATH) {
-            return Err("restore into a fresh browser: this one already holds a signer".into());
-        }
+        let has_identity = opfs_exists(IDENTITY_PATH);
         let vault_id = hex32(vault_hex)?;
         let key = RecoveryKey::from_words(words)?;
         BackupArtifact(blob.to_vec()).check_fingerprint(fingerprint)?;
         let material = restored_material(&key, blob, &vault_id)?;
         let identity = Identity::from_secret_bytes(&material.identity)?;
         let dir = vault_dir(vault_hex);
+        if matches!(stored_vault(&dir)?, StoredVault::Confirmed | StoredVault::Pending) {
+            return Err("this browser already holds signer data for that vault".into());
+        }
         let recovery_path = format!("{dir}/recovery.backup");
         let existing = opfs_get(&recovery_path)?;
         if existing.as_deref().is_some_and(|bytes| bytes != blob) {
             return Err("a different recovery file already exists for this vault; preserve it before restoring another copy".into());
         }
-        let kek = custody_kek(method, passphrase, prf_secret, true)?;
-        let se = SoftwareSecureElement::from_kek(*kek);
-        // The backup re-sealed under this browser's KEK is what `vaultOpen` rebuilds from; the
-        // words stay this signer's recovery identity, so later backups seal to the same words.
+        let (kek, existing_profile) = if has_identity {
+            let active = self.identity.as_ref().ok_or("unlock your signer before restoring another vault")?;
+            // The same browser identity is re-stamped to each vault's own slot during DKG.
+            let (active, backed_up) = (active.public(), identity.public());
+            if active.signing != backed_up.signing || active.encryption != backed_up.encryption {
+                return Err("the recovery backup belongs to a different signer".into());
+            }
+            let profile = opfs_get(PROFILE_PATH)?.ok_or("signer profile is missing")?;
+            let profile = String::from_utf8(profile).map_err(|_| "signer profile is invalid")?;
+            (self.kek.as_ref().ok_or("signer is locked")?.clone(), Some(profile))
+        } else {
+            (custody_kek(method, passphrase, prf_secret, true)?, None)
+        };
+        // The backup re-sealed under this browser's KEK is what `vaultOpen` rebuilds from.
         let local = backup::create(&material, &hex::encode(*kek))?;
         opfs_put(&format!("{dir}/backup.sealed"), &local.0, false)?;
         if existing.is_none() { opfs_put(&recovery_path, blob, true)?; }
-        opfs_put(RECOVERY_PATH, &seal_recovery_record(&identity, &kek, &recovery_public_keys(&key))?, false)?;
-        opfs_put(PROFILE_PATH, profile_json(&identity, name).as_bytes(), false)?;
-        // The identity last: until it exists this browser still counts as fresh.
-        let secret = Zeroizing::new(identity.to_secret_bytes());
-        opfs_put(IDENTITY_PATH, &SealedShare::seal(&se, 0, &secret[..])?.to_bytes(), true)?;
-        let profile = profile_json(&identity, name);
-        self.kek = Some(kek);
-        self.identity = Some(identity);
+        let profile = if let Some(profile) = existing_profile {
+            profile
+        } else {
+            let profile = profile_json(&identity, name);
+            let se = SoftwareSecureElement::from_kek(*kek);
+            opfs_put(RECOVERY_PATH, &seal_recovery_record(&identity, &kek, &recovery_public_keys(&key))?, false)?;
+            opfs_put(PROFILE_PATH, profile.as_bytes(), false)?;
+            // The identity last: until it exists this browser still counts as fresh.
+            let secret = Zeroizing::new(identity.to_secret_bytes());
+            opfs_put(IDENTITY_PATH, &SealedShare::seal(&se, 0, &secret[..])?.to_bytes(), true)?;
+            self.kek = Some(kek);
+            self.identity = Some(identity);
+            profile
+        };
         let vault = self.vault_open_impl(vault_hex)?;
         Ok(format!(r#"{{"profile":{profile},"vault":{vault}}}"#))
     }

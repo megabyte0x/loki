@@ -386,7 +386,7 @@ const RECEIPT_CAP: usize = 4096;
 /// Claim `cid` once at one witness, the same request and receipt check as the native relay
 /// client (`loki_relay_client::RelayHttp::claim_nonce`): PUT the record under a fresh
 /// challenge, then accept only a canonical receipt signed by the PINNED relay key that binds
-/// this mailbox, CID, record hash and challenge. `Ok(true)` is a fresh claim; `Ok(false)` an
+/// this mailbox, claimant, CID, record hash and challenge. `Ok(true)` is a fresh claim; `Ok(false)` an
 /// existing one (a duplicate, which a signer must treat as a refusal).
 pub async fn claim_nonce(
     route: &NonceWitnessRoute,
@@ -401,6 +401,7 @@ pub async fn claim_nonce(
     if record.is_empty() || record.len() > nonce::MAX_RECORD {
         return Err("nonce witness record size".into());
     }
+    let claimant = nonce::ClaimProof::from_bytes(proof).claimant;
     let token = format!("{}{}", nonce::CLAIM_SCHEME, hex::encode(proof));
     let url = format!(
         "{endpoint}/v1/mailboxes/{}/nonces/{}",
@@ -430,6 +431,8 @@ pub async fn claim_nonce(
         || receipt.pin.key != route.key
         || receipt.pin.run != route.run
         || receipt.mailbox != route.mailbox
+        || receipt.vault != claimant.vault
+        || receipt.slot != claimant.slot
         || receipt.cid != cid
         || receipt.challenge != challenge
         || receipt.record_hash != <[u8; 32]>::from(sha2::Sha256::digest(record))

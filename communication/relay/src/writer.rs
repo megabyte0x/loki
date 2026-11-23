@@ -27,6 +27,7 @@ pub struct DbHandle {
     stopping: Arc<AtomicBool>,
     root: Arc<PathBuf>,
     classify: std_mpsc::SyncSender<ClassifyJob>,
+    classify_hash: std_mpsc::SyncSender<ClassifyJob>,
     fresh: Arc<AtomicUsize>,
 }
 
@@ -186,18 +187,25 @@ impl DbHandle {
     pub async fn open(root: PathBuf, limits: Limits) -> RelayResult<(Self, DbWriter)> {
         let root = Arc::new(root);
         let (classify_tx, classify_rx) = std_mpsc::sync_channel(CLASSIFY_QUEUE_CAPACITY);
+        let (hash_tx, hash_rx) = std_mpsc::sync_channel(CLASSIFY_QUEUE_CAPACITY);
         let (sender, mut receiver) = mpsc::channel(WRITER_QUEUE_CAPACITY);
         let handle = Self {
             sender,
             stopping: Arc::new(AtomicBool::new(false)),
             root: Arc::clone(&root),
             classify: classify_tx,
+            classify_hash: hash_tx,
             fresh: Arc::new(AtomicUsize::new(0)),
         };
         let classify_root = Arc::clone(&handle.root);
         std::thread::Builder::new()
             .name("relay-db-classify".into())
             .spawn(move || classify_loop(classify_root, classify_rx))
+            .map_err(|_| RelayError::StorageUnavailable)?;
+        let hash_root = Arc::clone(&root);
+        std::thread::Builder::new()
+            .name("relay-db-screen-hash".into())
+            .spawn(move || classify_loop(hash_root, hash_rx))
             .map_err(|_| RelayError::StorageUnavailable)?;
         let stopping = Arc::clone(&handle.stopping);
         let (ready_tx, ready_rx) = oneshot::channel();
@@ -364,7 +372,7 @@ impl DbHandle {
             return Err(RelayError::StorageUnavailable);
         }
         let (reply_tx, reply_rx) = std_mpsc::channel();
-        self.classify
+        self.classify_hash
             .try_send(ClassifyJob::Hash {
                 mailbox,
                 hash,
