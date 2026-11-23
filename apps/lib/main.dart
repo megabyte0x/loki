@@ -12,6 +12,11 @@ import 'wallet_api.dart';
 
 void main() => runApp(const LokiApp(api: MacWalletApi()));
 
+/// TEMPORARY verbose diagnostics: stdout goes to the profile's verbose log (VerboseLog.swift
+/// part of WalletChannel.swift). Remove before release.
+// ignore: avoid_print
+void verbose(String message) => print('[verbose] dart $message');
+
 class LokiApp extends StatefulWidget {
   const LokiApp({
     super.key,
@@ -73,8 +78,13 @@ class _Wallet extends StatefulWidget {
   State<_Wallet> createState() => _WalletState();
 }
 
-class _WalletState extends State<_Wallet> {
+class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
   WalletApi get api => widget.api;
+  // A cancelled Touch ID prompt leaves the vault's key closed for this session. Ask again by
+  // itself, but only while the window is in front: at most once a minute, and right away when
+  // the member comes back to the window.
+  DateTime touchIdAgainAfter = DateTime.fromMillisecondsSinceEpoch(0);
+  bool appActive = true;
   MacWalletApi? get macApi => api is MacWalletApi ? api as MacWalletApi : null;
   Timer? timer;
   bool polling = false,
@@ -136,6 +146,7 @@ class _WalletState extends State<_Wallet> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     if (macApi case final mac?) unawaited(watchNativePrompt(mac));
     unawaited(poll());
   }
@@ -165,9 +176,20 @@ class _WalletState extends State<_Wallet> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     timer?.cancel();
     macApi?.onNativePromptChanged(null);
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    appActive = state == AppLifecycleState.resumed;
+    verbose('app lifecycle: ${state.name}');
+    if (appActive) {
+      touchIdAgainAfter = DateTime.fromMillisecondsSinceEpoch(0);
+      nextScan = DateTime.fromMillisecondsSinceEpoch(0);
+    }
   }
 
   void resetSession() {
@@ -345,24 +367,47 @@ class _WalletState extends State<_Wallet> {
     }
   }
 
-  Future<void> scan(String id, int epoch) async {
+  Future<void> scan(String id, int epoch, {bool retryTouchId = false}) async {
     if (scanning) return;
     scanning = true;
     nextScan = DateTime.now().add(const Duration(seconds: 10));
+    var askAgain = false;
     try {
-      final result = await api.request('balance', {'vault': id});
+      final result = await api.request('balance', {
+        'vault': id,
+        if (retryTouchId) 'retry_touch_id': true,
+      });
       if (mounted && epoch == generation) {
         setState(() {
           balance = result['balance_zat'];
           scanError = null;
+          dataError = null;
         });
       }
-    } catch (_) {
-      if (mounted && epoch == generation) {
-        setState(() => scanError = 'Balance could not sync. Retrying…');
+    } catch (e) {
+      final touchId = walletErrorCode(e) == 'touch_id_required';
+      // TEMPORARY verbose diagnostics (stdout goes to the profile's verbose log).
+      verbose('balance scan failed (retry=$retryTouchId, active=$appActive): ${walletError(e)}');
+      askAgain = touchId &&
+          !retryTouchId &&
+          appActive &&
+          DateTime.now().isAfter(touchIdAgainAfter);
+      if (askAgain) {
+        verbose('asking for Touch ID again to open the vault');
+        touchIdAgainAfter = DateTime.now().add(const Duration(minutes: 1));
+      } else if (mounted && epoch == generation) {
+        setState(
+          () => scanError = touchId
+              ? 'Touch ID is needed to open this vault. LokiSigner will ask again.'
+              : 'Balance could not sync. Retrying…',
+        );
       }
     } finally {
       scanning = false;
+    }
+    // The vault is closed only because a Touch ID prompt was cancelled: prompt again now.
+    if (askAgain && mounted && epoch == generation) {
+      await scan(id, epoch, retryTouchId: true);
     }
   }
 

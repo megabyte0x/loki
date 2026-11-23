@@ -39,6 +39,7 @@ pub(super) fn error_code(error: &str) -> Option<&'static str> {
             || e == "the Orchard receiver is not a valid address" => "invalid_address",
         "amount must exceed zero" | "invalid amount_zat" => "invalid_amount",
         "profile is locked" => "profile_locked",
+        "Touch ID is required to open this vault." => "touch_id_required",
         e if e == ENOUGH_APPROVED => "enough_approved",
         e if e == REPEATED_APPROVAL => "approval_repeated",
         _ => return None,

@@ -42,6 +42,10 @@ final class WalletChannel {
         validLaunch = launchProblem == nil
         self.window = window
         #if !LOKI_VISUAL_ONLY
+        // TEMPORARY: capture the member's verbose stderr per profile (see VerboseLog).
+        if let index = signerArgs.firstIndex(of: "--data"), index + 1 < signerArgs.count {
+            VerboseLog.start(dataFolder: signerArgs[index + 1])
+        }
         // Connects the member's fixed diagnostic events to ~/Library/Logs/LokiSigner.
         SignerLog.start()
         #endif
@@ -288,5 +292,63 @@ final class WalletChannel {
 
     private func isHexID(_ value: String) -> Bool {
         value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }
+    }
+}
+
+
+/// TEMPORARY verbose diagnostics. Everything this process writes to stdout and stderr (the
+/// member's own `eprintln!` lines, Swift and Flutter prints) goes to
+/// ~/Library/Logs/LokiSigner/<profile folder>.verbose.log, one timestamped line at a time.
+/// Unlike LokiSigner.log it can contain coordinator and relay error text and payment ids, so it
+/// stays private (0600 in a 0700 folder) and must be removed before release.
+enum VerboseLog {
+    private final class Lines: @unchecked Sendable {
+        var pending = Data()
+        let formatter: ISO8601DateFormatter = {
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions.insert(.withFractionalSeconds)
+            return formatter
+        }()
+    }
+
+    private static var pipe: Pipe?
+    private static let limit: UInt64 = 50 * 1024 * 1024
+
+    static func start(dataFolder: String) {
+        guard pipe == nil else { return }
+        let profile = URL(fileURLWithPath: dataFolder).lastPathComponent
+        let directory = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/LokiSigner", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        let url = directory.appendingPathComponent("\(profile).verbose.log")
+        if let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? UInt64, size > limit {
+            let older = directory.appendingPathComponent("\(profile).verbose.previous.log")
+            try? FileManager.default.removeItem(at: older)
+            try? FileManager.default.moveItem(at: url, to: older)
+        }
+        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return }
+        let file = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
+        let pipe = Pipe()
+        setvbuf(stdout, nil, _IOLBF, 0)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, STDOUT_FILENO)
+        dup2(pipe.fileHandleForWriting.fileDescriptor, STDERR_FILENO)
+        self.pipe = pipe
+        let lines = Lines()
+        pipe.fileHandleForReading.readabilityHandler = { handle in
+            let chunk = handle.availableData
+            guard !chunk.isEmpty else { return }
+            lines.pending.append(chunk)
+            while let newline = lines.pending.firstIndex(of: 0x0A) {
+                let line = lines.pending[lines.pending.startIndex..<newline]
+                lines.pending.removeSubrange(lines.pending.startIndex...newline)
+                var stamped = Data("\(lines.formatter.string(from: Date())) ".utf8)
+                stamped.append(line)
+                stamped.append(0x0A)
+                try? file.write(contentsOf: stamped)
+            }
+        }
+        FileHandle.standardError.write(Data("[verbose] LokiSigner \(ProcessInfo.processInfo.processIdentifier) started for profile \(profile)\n".utf8))
     }
 }

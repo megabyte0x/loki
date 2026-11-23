@@ -349,13 +349,18 @@ fn wallet(
     v: &Vault,
 ) -> Result<(VaultWallet, Lightwalletd, tokio::runtime::Runtime), String> {
     let rt = runtime()?;
+    let started = std::time::Instant::now();
     let (w, client) = rt.block_on(async {
         tokio::select! {
             biased;
             _ = st.wait_for_stop() => Err("profile is locked".into()),
             result = scan_wallet(data, pass, vault, v, url(st)?) => result,
         }
-    }).inspect_err(|_| if !st.is_stopping() { native_event!(st, Event::WalletSyncFailed) })?;
+    }).inspect_err(|error| {
+        eprintln!("[verbose] vault {}: lightwalletd scan failed after {} ms: {error}", &vault[..8.min(vault.len())], started.elapsed().as_millis());
+        if !st.is_stopping() { native_event!(st, Event::WalletSyncFailed) }
+    })?;
+    eprintln!("[verbose] vault {}: lightwalletd scan done in {} ms", &vault[..8.min(vault.len())], started.elapsed().as_millis());
     native_event!(st, Event::WalletSynced);
     Ok((w, client, rt))
 }
@@ -2744,6 +2749,7 @@ fn watch_control(st: &Shared, data: &Path, pass: &str, vault: &str) -> Result<()
 /// sure every local payment has its worker.
 fn control_round(st: &Shared, data: &Path, pass: &str, vault: &str) {
     set_control_status(st, vault, |s| s.in_progress = true);
+    let started = std::time::Instant::now();
     let result = (|| {
         let v = load_vault(st, data, pass, vault)?;
         let fetch_error = {
@@ -2763,10 +2769,14 @@ fn control_round(st: &Shared, data: &Path, pass: &str, vault: &str) {
     })();
     let stopping = st.is_stopping();
     match &result {
-        Ok(()) => native_event!(st, Event::RelayReachable),
+        Ok(()) => {
+            eprintln!("[verbose] vault {}: control sync ok in {} ms", &vault[..8.min(vault.len())], started.elapsed().as_millis());
+            native_event!(st, Event::RelayReachable)
+        }
         Err(_) if stopping => {}
-        Err(_) => {
+        Err(error) => {
             eprintln!("vault {vault}: frostd control receive error");
+            eprintln!("[verbose] vault {}: control sync failed after {} ms: {error}", &vault[..8.min(vault.len())], started.elapsed().as_millis());
             native_event!(st, Event::RelayUnavailable);
         }
     }

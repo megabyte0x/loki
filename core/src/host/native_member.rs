@@ -339,7 +339,16 @@ pub(crate) fn wallet_request(path: &str, body: Option<Value>, export: bool) -> V
         }
         result
     }
+    // TEMPORARY verbose diagnostics: route (without query), status, time and the error text.
+    let started = std::time::Instant::now();
+    let route = path.split('?').next().unwrap_or(path).to_owned();
     let (status, data) = dispatch(path, body, export).unwrap_or_else(|(status, message)| (status, json!({ "error": message })));
+    if status.is_success() {
+        eprintln!("[verbose] wallet {route} -> {} in {} ms", status.as_u16(), started.elapsed().as_millis());
+    } else {
+        eprintln!("[verbose] wallet {route} -> {} in {} ms: {} (code {})", status.as_u16(), started.elapsed().as_millis(),
+            data["error"].as_str().unwrap_or("?"), data["code"].as_str().unwrap_or("-"));
+    }
     json!({ "status": status.as_u16(), "data": data })
 }
 
