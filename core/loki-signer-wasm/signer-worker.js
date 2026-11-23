@@ -199,7 +199,7 @@ async function joinCeremony(signer, p) {
   if (!Number.isSafeInteger(threshold) || threshold < 1 || threshold > members.length) {
     throw new Error("the invite's threshold does not fit the roster");
   }
-  if (!await ask("roster-members", { name, vault, threshold, network, slot, members })) {
+  if (await ask("roster-members", { name, vault, threshold, network, slot, members }) !== true) {
     throw new Error("You rejected this vault's members");
   }
 
@@ -260,7 +260,7 @@ async function driveDkg(signer, p) {
   // roster prompt answers Match only for the code the member confirmed here.
   const roster = Uint8Array.from(rosterHex.match(/../g).map((b) => parseInt(b, 16)));
   const code = signer.rosterCode(roster);
-  if (!await ask("roster-code", { code, birth_height: p.birthHeight ?? null })) {
+  if (await ask("roster-code", { code, birth_height: p.birthHeight ?? null }) !== true) {
     throw new Error("You reported that the roster codes differ; this vault setup is stopped");
   }
   const vref = JSON.parse(signer.vaultJoin(vaultHex, slot, label ?? "vault", network, roster, code));
