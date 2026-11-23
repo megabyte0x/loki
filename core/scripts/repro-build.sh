@@ -3,7 +3,9 @@
 # every artifact on stdout (build logs go to stderr):
 #   - native: loki_member_app (relay-communication), the packaged member binary
 #     (communication/deploy/run-member.sh MEMBER_BIN)
-#   - browser: the signer origin's build-hash.json manifest (static files and both wasm packages)
+#   - browser: raw rustc wasm hashes, then the signer origin's build-hash.json manifest
+#     (static files and both wasm-pack packages). The raw hashes identify which stage first
+#     diverged if a published wasm hash differs.
 #
 #   core/scripts/repro-build.sh > signer.manifest
 #
@@ -34,8 +36,31 @@ RUSTFLAGS="$flags" cargo build --release --locked --features relay-communication
 for crate in loki-signer-wasm wasm-transport; do
   RUSTFLAGS="$flags --cfg getrandom_backend=\"wasm_js\"" \
     wasm-pack build "$crate" --release --no-opt --target web -- --locked
+  pkg="$build/src/core/$crate/pkg"
+  # wasm-transport's package is named loki-wasm-transport, unlike its directory.
+  module=${crate//-/_}
+  if [[ $crate == wasm-transport ]]; then module=loki_wasm_transport; fi
+  raw="$CARGO_TARGET_DIR/wasm32-unknown-unknown/release/$module.wasm"
+  first_raw=$(shasum -a 256 "$raw")
+  printf '%s\n' "$first_raw" >> "$build/raw.manifest"
+  find "$pkg" -type f ! -name .gitignore -print0 | sort -z | xargs -0 shasum -a 256 > "$build/$crate.first"
+
+  # Reprocess the same rustc output once more. A mismatch here is post-rustc; otherwise
+  # the two checkout manifests below distinguish raw compiler output from packaging.
+  RUSTFLAGS="$flags --cfg getrandom_backend=\"wasm_js\"" \
+    wasm-pack build "$crate" --release --no-opt --target web -- --locked
+  if [[ $(shasum -a 256 "$raw") != "$first_raw" ]]; then
+    echo "$crate: raw rustc wasm changed during the repeated wasm-pack invocation" >&2
+    exit 1
+  fi
+  find "$pkg" -type f ! -name .gitignore -print0 | sort -z | xargs -0 shasum -a 256 > "$build/$crate.second"
+  if ! diff -u "$build/$crate.first" "$build/$crate.second"; then
+    echo "$crate: identical raw rustc wasm produced different wasm-pack output" >&2
+    exit 1
+  fi
 done
 
 cd "$build"
 shasum -a 256 target/release/loki_member_app >&3
+cat raw.manifest >&3
 node src/core/loki-signer-wasm/serve.mjs --hash >&3

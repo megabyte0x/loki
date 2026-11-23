@@ -1073,10 +1073,6 @@ const PHASE_LABEL: Record<CeremonyStatus["phase"], string> = {
   waiting_for_members: "Waiting for members",
   compare_roster: "Verify members",
   creating_keys: "Creating keys",
-  back_up: "Back up",
-  waiting_for_backups: "Waiting for backups",
-  final_backup: "Final backup",
-  connecting_relays: "Connecting relays",
   setup_interrupted: "Setup interrupted",
   active: "Active",
 };
@@ -1158,18 +1154,12 @@ function CeremonyView({
             members={cs.members}
           />
         )}
-        {(cs.phase === "creating_keys" || cs.phase === "waiting_for_backups" || cs.phase === "connecting_relays") && (
+        {cs.phase === "creating_keys" && (
           <GlassCard>
             <p role="status" className="py-5 text-center text-sm text-muted">
               {PHASE_LABEL[cs.phase]}… please wait.
             </p>
           </GlassCard>
-        )}
-        {cs.phase === "back_up" && (
-          <BackupPhase vault={vault} finalStep={false} />
-        )}
-        {cs.phase === "final_backup" && (
-          <BackupPhase vault={vault} finalStep={true} />
         )}
         {cs.phase === "setup_interrupted" && (
           <GlassCard className="text-center">
@@ -1441,130 +1431,6 @@ function NativeCompareRoster({
         <p role="status" className="glass rounded-2xl p-4 text-center text-sm text-mint">{allConfirmed ? "All members confirmed — advancing…" : "You confirmed in LokiSigner — waiting for others."}</p>
       )}
       {!done && <ErrMsg msg={refusal} />}
-    </div>
-  );
-}
-
-function BackupPhase({
-  vault,
-  finalStep,
-}: {
-  vault: string;
-  finalStep: boolean;
-}) {
-  const [words, setWords] = useState<string[] | null>(null);
-  const [entry, setEntry] = useState("");
-  const [card, setCard] = useState<string | null>(null);
-  const [cardEntry, setCardEntry] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-  const [done, setDone] = useState(false);
-
-  const fetchWords = async () => {
-    setBusy(true); setErr(null);
-    try {
-      const res = await api<{ words: string[] }>("backup", { vault });
-      setWords(res.words);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  const fetchFinalCard = async () => {
-    setBusy(true); setErr(null);
-    try {
-      const res = await api<{ card: string }>(`final-card?vault=${encodeURIComponent(vault)}`);
-      setCard(res.card);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  const verifyWords = async () => {
-    setBusy(true); setErr(null);
-    try {
-      const enteredWords = entry.trim().split(/\s+/);
-      if (finalStep) {
-        await api("verify-final-backup", { vault, words: enteredWords, card: cardEntry.trim() });
-      } else {
-        await api("verify", { vault, words: enteredWords });
-        // then finalize-backup
-        await api("finalize-backup", { vault, words: enteredWords });
-      }
-      setDone(true);
-    } catch (e) { setErr((e as Error).message); }
-    finally { setBusy(false); }
-  };
-
-  if (done) {
-    return <p role="status" className="glass rounded-2xl p-5 text-center text-sm text-mint">Backup complete — waiting for others…</p>;
-  }
-
-  if (!words) {
-    return (
-      <GlassCard className="text-center">
-        <p className="text-sm text-muted mb-4">
-          {finalStep
-            ? "Final check — confirm your backup is safe, then the vault goes live."
-            : "Save the 24 words privately. Restoring a share here also requires signing in and a stored vault backup. Never share these words, including with other members."}
-        </p>
-        <Btn variant="amber" onClick={finalStep ? fetchFinalCard : fetchWords} disabled={busy}>
-          {busy ? "Loading…" : finalStep ? "Show final backup" : "Show my recovery phrase"}
-        </Btn>
-        <ErrMsg msg={err} />
-      </GlassCard>
-    );
-  }
-
-  return (
-    <div>
-      <h3 data-screen-heading className="eyebrow mb-3">
-        {finalStep ? "Final backup words" : "Recovery phrase — write these down"}
-      </h3>
-      <GlassCard className="mb-4">
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-          {words.map((w, i) => (
-            <div key={i} className="flex gap-1.5 items-baseline">
-              <span className="text-[10px] text-muted w-5 text-right">{i + 1}.</span>
-              <span className="font-mono text-sm">{w}</span>
-            </div>
-          ))}
-        </div>
-      </GlassCard>
-
-      {finalStep && card && (
-        <div className="mb-3">
-          <p className="text-xs text-muted mb-1">Recovery card code</p>
-          <GlassCard>
-            <p className="font-mono text-sm break-all text-amber">{card}</p>
-          </GlassCard>
-          <label className="mt-3 block text-xs text-muted">
-            Re-enter card code
-            <input
-              placeholder="Re-enter card code"
-              value={cardEntry}
-              onChange={(e) => setCardEntry(e.target.value)}
-              className="glass mt-2 w-full rounded-full px-6 py-3 font-mono text-sm outline-none placeholder:text-muted"
-            />
-          </label>
-        </div>
-      )}
-
-      <label htmlFor="backup-words" className="mb-2 block text-xs text-muted">Re-enter all 24 words to confirm</label>
-      <textarea
-        id="backup-words"
-        rows={3}
-        placeholder="word1 word2 word3 …"
-        value={entry}
-        onChange={(e) => setEntry(e.target.value)}
-        className="glass w-full rounded-2xl px-4 py-3 font-mono text-sm outline-none placeholder:text-muted resize-none mb-3"
-      />
-      <Btn
-        variant="amber"
-        onClick={verifyWords}
-        disabled={busy || !entry.trim() || (finalStep && !cardEntry.trim())}
-      >
-        {busy ? "Verifying…" : "Verify & continue"}
-      </Btn>
-      <ErrMsg msg={err} />
     </div>
   );
 }

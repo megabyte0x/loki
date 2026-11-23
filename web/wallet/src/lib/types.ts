@@ -30,10 +30,6 @@ export type CeremonyStatus = {
     | "waiting_for_members"
     | "compare_roster"
     | "creating_keys"
-    | "back_up"
-    | "waiting_for_backups"
-    | "final_backup"
-    | "connecting_relays"
     | "setup_interrupted"
     | "active";
   fingerprint?: string;
