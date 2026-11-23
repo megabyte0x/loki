@@ -581,7 +581,8 @@ class VaultSetup extends StatelessWidget {
           )
         else if (phase == 'setup_interrupted') ...[
           Notice(
-            status['error'] as String? ?? 'Key generation was interrupted. Use a new vault and new invitations.',
+            describeError(null, status['error'] as String?) ??
+                'Key generation was interrupted. Use a new vault and new invitations.',
           ),
           const SizedBox(height: 10),
           Align(

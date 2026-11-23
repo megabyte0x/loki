@@ -412,10 +412,10 @@ class _SendPageState extends State<SendPage> {
         _draft = draft;
         if (!_hasQuote(draft)) _error = 'The signer did not return a complete quote. Discard the draft and prepare it again.';
       });
-    } catch (_) {
+    } catch (e) {
       if (_current(vault)) {
         setState(
-          () => _error = 'Could not prepare the payment. Check the address, available funds, and History before trying again.',
+          () => _error = walletErrorWith('Could not prepare the payment.', e),
         );
       }
     } finally {
@@ -442,11 +442,14 @@ class _SendPageState extends State<SendPage> {
         'attempt': attempt,
       });
       if (_current(vault)) widget.published(attempt);
-    } catch (_) {
+    } catch (e) {
       if (_current(vault)) {
         setState(() {
           _publishUncertain = true;
-          _error = 'Could not confirm publication. Go back and check this payment in History before acting on it again.';
+          _error = walletErrorWith(
+            'Could not confirm publication. Go back and check this payment in History before acting on it again.',
+            e,
+          );
         });
       }
     } finally {
@@ -485,11 +488,13 @@ class _SendPageState extends State<SendPage> {
         _error = null;
       });
       if (!edit) widget.back();
-    } catch (_) {
+    } catch (e) {
       if (_current(vault)) {
         setState(
-          () => _error =
-              'Could not confirm that the draft was discarded. Check History.',
+          () => _error = walletErrorWith(
+            'Could not confirm that the draft was discarded. Check History.',
+            e,
+          ),
         );
       }
     } finally {
@@ -1056,6 +1061,7 @@ class _HistoryPageState extends State<HistoryPage> {
     final replaces = _object(payment['replaces']),
         replacedBy = _id(payment['replaced_by']);
     final hasError = _text(payment['error']) != null;
+    final failure = hasError ? paymentFailure(payment) : null;
     final signers = payment['signers'], slot = vault['my_slot'];
     final canReview =
         phase == 'signing' &&
@@ -1124,11 +1130,8 @@ class _HistoryPageState extends State<HistoryPage> {
             ),
           if (!settled && payment['approvals'] is List)
             _ApprovalStatus(vault, payment),
-          if (!settled && hasError)
-            const _PaymentNote(
-              'The signer reported a problem with this payment.',
-              error: true,
-            ),
+          if (!settled && failure != null)
+            _PaymentNote(failure, error: true),
           if (recipient != null) ...[
             const Divider(height: 1),
             _identifier(attempt, 'Recipient', recipient),
@@ -1677,8 +1680,8 @@ class _PaymentReviewState extends State<PaymentReview> {
             error: true,
           ),
         if (status?['error'] != null)
-          const _PaymentNote(
-            'The signer reported a problem. Check History for available actions.',
+          _PaymentNote(
+            '${paymentFailure(status) ?? 'The signer reported a problem.'} Check History for available actions.',
             error: true,
           ),
         if (_approvalUnknown && !_alreadyRequested && !noLongerOpen)

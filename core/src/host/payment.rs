@@ -629,7 +629,8 @@ fn public_intent(p: &Payment) -> Value {
     intent
 }
 const UNAVAILABLE: &str = "payment session unavailable";
-const ENOUGH_APPROVED: &str = "enough members already approved this payment";
+pub(super) const ENOUGH_APPROVED: &str = "enough members already approved this payment";
+pub(super) const REPEATED_APPROVAL: &str = "invalid or repeated payment approval; replace a failed attempt instead";
 const APPROVAL_TIMED_OUT: &str = "Payment approval timed out: the member did not answer in time.";
 
 /// The transaction's expiry height: the one fixed when signing started, else the approved bound.
@@ -1181,13 +1182,15 @@ pub(super) async fn draft(State(st): State<Shared>, Json(body): Json<Value>) -> 
 
 fn draft_refusal(error: &str) -> super::diagnostics::DraftRefusal {
     use super::diagnostics::DraftRefusal;
-    if error.starts_with(crate::wallet_store::FUNDS_WAITING) { DraftRefusal::WaitingForConfirmations }
-    else if error == NO_SINGLE_NOTE || error == "note cannot cover amount and fee" { DraftRefusal::NoSingleNote }
-    else if error.starts_with("fund payment:") { DraftRefusal::InsufficientFunds }
-    else { DraftRefusal::Other }
+    match super::routes::error_code(error) {
+        Some("funds_pending_confirmation") => DraftRefusal::WaitingForConfirmations,
+        Some("no_single_note") => DraftRefusal::NoSingleNote,
+        Some("insufficient_funds") => DraftRefusal::InsufficientFunds,
+        _ => DraftRefusal::Other,
+    }
 }
 
-const NO_SINGLE_NOTE: &str = "payment needs one Ironwood note large enough for amount and fee";
+pub(super) const NO_SINGLE_NOTE: &str = "payment needs one Ironwood note large enough for amount and fee";
 
 /// Runs under `st.payment`.
 fn draft_locked(st: &Shared, data: &Path, pass: &str, body: &Value) -> Result<Value, String> {
@@ -1313,9 +1316,7 @@ pub(super) async fn approve(State(st): State<Shared>, Json(body): Json<Value>) -
             || p.review_token.as_deref() != body["review_token"].as_str()
             || body["intent_hash"].as_str() != Some(intent_hash(&p).as_str())
         {
-            return Err(
-                "invalid or repeated payment approval; replace a failed attempt instead".into(),
-            );
+            return Err(REPEATED_APPROVAL.into());
         }
         let (v, opened) = load_vault_for_approval(&st, &data, &pass, &p)?;
         check_intent(&p, &v)?;
@@ -2644,7 +2645,7 @@ pub(super) async fn payments(
                 "mined_height": p.mined_height,
                 "target_height": p.target_height, "expiry_height": p.expiry_height,
                 "signing_expiry": p.signing_expiry, "tx_expiry": held_tx_expiry(&v, p),
-                "error": p.error,
+                "error": p.error, "failure_reason": p.failure_reason,
             }));
         }
         Ok(json!({"payments":out, "chain_trust": PROVIDER_REPORTED}))
@@ -2738,7 +2739,7 @@ pub(super) async fn status(
         Ok(json!({
             "phase": reported_phase(&p),
             "chain_trust": PROVIDER_REPORTED,
-            "approvals":p.approvals,"error":p.error,"approval_requested":p.approval_requested,
+            "approvals":p.approvals,"error":p.error,"failure_reason":p.failure_reason,"approval_requested":p.approval_requested,
             "signatures_received": p.signed_pczt.is_some() || p.tx_verified,
             "txid": p.txid.filter(|_| p.tx_verified), "replaces": p.replaces, "spent_by": p.replaced_by,
             "replaced_by": if p.phase == "replaced" && p.tx_verified { p.replaced_by.as_deref() } else { None },

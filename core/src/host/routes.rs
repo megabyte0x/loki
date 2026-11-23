@@ -21,7 +21,28 @@ pub(super) fn ok(v: Value) -> Reply {
 }
 
 pub(super) fn err(code: StatusCode, message: impl Into<String>) -> Reply {
-    (code, Json(json!({ "error": message.into() })))
+    let message = message.into();
+    let mut body = json!({ "error": message });
+    if let Some(code) = error_code(&message) { body["code"] = json!(code); }
+    (code, Json(body))
+}
+
+/// A stable code for the host's own error sentences, so the wallet can show its own wording
+/// instead of the text. Errors without a code are shown only after sanitizing.
+pub(super) fn error_code(error: &str) -> Option<&'static str> {
+    use payment::{ENOUGH_APPROVED, NO_SINGLE_NOTE, REPEATED_APPROVAL};
+    Some(match error {
+        e if e.starts_with(crate::wallet_store::FUNDS_WAITING) => "funds_pending_confirmation",
+        e if e == NO_SINGLE_NOTE || e == "note cannot cover amount and fee" => "no_single_note",
+        e if e.starts_with("fund payment:") => "insufficient_funds",
+        e if e.starts_with("not a unified address") || e.starts_with("that address ")
+            || e == "the Orchard receiver is not a valid address" => "invalid_address",
+        "amount must exceed zero" | "invalid amount_zat" => "invalid_amount",
+        "profile is locked" => "profile_locked",
+        e if e == ENOUGH_APPROVED => "enough_approved",
+        e if e == REPEATED_APPROVAL => "approval_repeated",
+        _ => return None,
+    })
 }
 
 /// Run a blocking library call (which drives the relay runtime via `block_on`) off the

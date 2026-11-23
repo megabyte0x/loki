@@ -1506,7 +1506,7 @@ class _WalletState extends State<_Wallet> {
                 CopyButton('Copy address', address, 'Address copied'),
               ] else
                 Text(
-                  row['error'] as String? ??
+                  describeError(null, row['error'] as String?) ??
                       'LokiSigner could not verify the receive address.',
                 ),
             ],

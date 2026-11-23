@@ -235,7 +235,9 @@ final class WalletChannel {
             let status = reply["status"] as? Int ?? 500
             let data = reply["data"] as? [String: Any] ?? [:]
             if (200..<300).contains(status) { complete(data) }
-            else { result(self.failure(status, data["error"] as? String ?? "LokiSigner request failed.")) }
+            // Backend text can quote a relay or lightwalletd; neutralise it before Flutter shows it.
+            else { result(self.failure(status, untrustedText(data["error"] as? String ?? "LokiSigner request failed."),
+                                       code: data["code"] as? String)) }
         }
     }
 
@@ -247,8 +249,9 @@ final class WalletChannel {
         }) { result(failure(401, "LokiSigner is locked.")) }
     }
 
-    private func failure(_ status: Int, _ message: String) -> FlutterError {
-        FlutterError(code: String(status), message: message, details: nil)
+    /// `code` is the host's stable error code; the wallet maps it to its own wording.
+    private func failure(_ status: Int, _ message: String, code: String? = nil) -> FlutterError {
+        FlutterError(code: String(status), message: message, details: code)
     }
 
     private func isHexID(_ value: String) -> Bool {
