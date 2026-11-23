@@ -387,8 +387,11 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     } catch (e) {
       final touchId = walletErrorCode(e) == 'touch_id_required';
       // TEMPORARY verbose diagnostics (stdout goes to the profile's verbose log).
-      verbose('balance scan failed (retry=$retryTouchId, active=$appActive): ${walletError(e)}');
-      askAgain = touchId &&
+      verbose(
+        'balance scan failed (retry=$retryTouchId, active=$appActive): ${walletError(e)}',
+      );
+      askAgain =
+          touchId &&
           !retryTouchId &&
           appActive &&
           DateTime.now().isAfter(touchIdAgainAfter);
@@ -720,7 +723,9 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
       text = 'Syncing with the relay…';
     } else if (last is int) {
       final age = DateTime.now().millisecondsSinceEpoch ~/ 1000 - last;
-      text = age < 5 ? 'Up to date' : 'Updated ${age < 60 ? '${age}s' : '${age ~/ 60} min'} ago';
+      text = age < 5
+          ? 'Up to date'
+          : 'Updated ${age < 60 ? '${age}s' : '${age ~/ 60} min'} ago';
     } else {
       text = 'Syncing with the relay…';
     }
@@ -1535,7 +1540,9 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                             radius: 15,
                             backgroundColor: c.secondary,
                             child: Icon(
-                              Icons.north_east,
+                              p['direction'] == 'received'
+                                  ? Icons.south_west
+                                  : Icons.north_east,
                               size: 14,
                               color: c.muted,
                             ),
@@ -1553,7 +1560,8 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                                 ),
                                 Text(
                                   shortId(
-                                    (p['recipient'] as String?)?.isNotEmpty == true
+                                    (p['recipient'] as String?)?.isNotEmpty ==
+                                            true
                                         ? p['recipient'] as String
                                         : p['txid'] as String? ?? '',
                                   ),

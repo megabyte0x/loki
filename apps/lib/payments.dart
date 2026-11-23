@@ -665,7 +665,11 @@ class _SendPageState extends State<SendPage> {
             '${_withUnit(reserved.toString())} held by an open payment.',
           ),
         if (max != null && spendable != null && max < spendable)
-          ValueRow('Largest payment now', _withUnit(max.toString()), mono: true),
+          ValueRow(
+            'Largest payment now',
+            _withUnit(max.toString()),
+            mono: true,
+          ),
         _PaymentNote(
           'As of block ${funds['scanned_height'] ?? '—'}, as reported by the chain provider.',
         ),
@@ -987,8 +991,7 @@ class _HistoryPageState extends State<HistoryPage> {
         latest != null &&
         switch (action) {
           // The draft remains actionable if the original merely expires.
-          'retry' ||
-          'cancel' => !{
+          'retry' || 'cancel' => !{
             'confirmed',
             'replaced',
             'spent_unverified',
@@ -1255,8 +1258,7 @@ class _HistoryPageState extends State<HistoryPage> {
             ),
           if (!settled && payment['approvals'] is List)
             _ApprovalStatus(vault, payment),
-          if (!settled && failure != null)
-            _PaymentNote(failure, error: true),
+          if (!settled && failure != null) _PaymentNote(failure, error: true),
           if (recipient != null) ...[
             const Divider(height: 1),
             _identifier(attempt, 'Recipient', recipient),
@@ -1364,7 +1366,11 @@ class _HistoryPageState extends State<HistoryPage> {
                       ? colors.mint.withValues(alpha: .09)
                       : colors.secondary,
                   child: Icon(
-                    confirmed ? Icons.north_east : Icons.draw_outlined,
+                    payment['direction'] == 'received'
+                        ? Icons.south_west
+                        : confirmed
+                        ? Icons.north_east
+                        : Icons.draw_outlined,
                     size: 15,
                     color: selected
                         ? colors.mint
