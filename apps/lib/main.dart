@@ -97,6 +97,8 @@ class _WalletState extends State<_Wallet> {
   int? previewRequestGeneration;
   Json profile = {};
   List<Json> vaults = [], payments = [], addresses = [];
+  // Per vault: the signer's background relay sync (`sync` on payments/pending).
+  Map<String, Json> relaySync = {};
   List<({Json vault, Json payment})> approvals = [];
   Json ceremony = {}, recovery = {};
   Object? balance;
@@ -285,12 +287,12 @@ class _WalletState extends State<_Wallet> {
       } else if (id != null &&
           active &&
           (view == _Page.history || view == _Page.overview)) {
-        final result = jsonRows(
-          (await api.request('payments?vault=$id'))['payments'],
-        );
+        final reply = await api.request('payments?vault=$id');
+        final result = jsonRows(reply['payments']);
         if (!mounted || epoch != generation) return;
         setState(() {
           payments = result;
+          if (reply['sync'] case final Json sync) relaySync[id] = sync;
           dataError = null;
         });
         if (!scanning) unawaited(verifyBroadcast(id, result));
@@ -310,6 +312,9 @@ class _WalletState extends State<_Wallet> {
         final inbox = await Future.wait(
           list.where((v) => v['active'] == true).map((v) async {
             final rows = await api.request('pending?vault=${v['vault']}');
+            if (rows['sync'] case final Json sync) {
+              relaySync[v['vault'] as String] = sync;
+            }
             return jsonRows(rows['pending']).map((p) => (vault: v, payment: p));
           }),
         );
@@ -582,6 +587,11 @@ class _WalletState extends State<_Wallet> {
                             ),
                           ),
                         ),
+                        if (syncLine() case final line?)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 12),
+                            child: line,
+                          ),
                         if (coordinator case final origin?)
                           Padding(
                             padding: const EdgeInsets.symmetric(vertical: 12),
@@ -649,6 +659,38 @@ class _WalletState extends State<_Wallet> {
   Widget walletBody({required Widget child}) => Expanded(
     child: Visibility(visible: !hideContent, maintainState: true, child: child),
   );
+
+  /// The current vault's relay sync, so a slow relay reads as "syncing", not a frozen app.
+  Widget? syncLine() {
+    final id = vaultId;
+    final sync = id == null ? null : relaySync[id];
+    if (sync == null) return null;
+    final c = context.colors;
+    final failing = sync['last_error'] != null;
+    final last = sync['last_ok_at'];
+    final String text;
+    if (failing) {
+      text = 'Relay unreachable. Retrying…';
+    } else if (sync['in_progress'] == true && last == null) {
+      text = 'Syncing with the relay…';
+    } else if (last is int) {
+      final age = DateTime.now().millisecondsSinceEpoch ~/ 1000 - last;
+      text = age < 5 ? 'Up to date' : 'Updated ${age < 60 ? '${age}s' : '${age ~/ 60} min'} ago';
+    } else {
+      text = 'Syncing with the relay…';
+    }
+    return Row(
+      spacing: 6,
+      children: [
+        Icon(
+          failing ? Icons.cloud_off_outlined : Icons.sync,
+          size: 12,
+          color: failing ? c.gold : c.muted,
+        ),
+        Text(text, style: lokiSans(10, color: failing ? c.gold : c.muted)),
+      ],
+    );
+  }
 
   Widget nativeFeedback() => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
