@@ -45,6 +45,7 @@ struct Gate {
     inner: Arc<Mutex<GateCounts>>,
     screening: PeerGate,
     rejected_body: PeerGate,
+    duplicate_body: PeerGate,
     witness_body: PeerGate,
     identity: PeerGate,
     db: DbHandle,
@@ -76,6 +77,7 @@ impl Gate {
             inner: Arc::new(Mutex::new(GateCounts { total: 0, fresh: 0 })),
             screening: PeerGate::new(64, REQUEST_CONCURRENCY),
             rejected_body: PeerGate::new(16, 4),
+            duplicate_body: PeerGate::new(8, 2),
             witness_body: PeerGate::new(16, 4),
             identity: PeerGate::new(16, 8),
             db,
@@ -100,7 +102,7 @@ impl Gate {
         })
     }
 
-    /// A read, or a PUT whose committed hash is already present. Not a fresh body.
+    /// A read, not a request that still needs to upload a body.
     fn try_acquire_progress(&self) -> Option<RequestPermit> {
         let mut counts = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if counts.total >= REQUEST_CONCURRENCY {
@@ -200,15 +202,19 @@ async fn admit_checked(gate: Gate, mut request: Request, next: Next) -> RelayRes
         }
         Err(error) => return Err(error),
     };
+    let fresh = write.then(|| gate.try_acquire_fresh()).flatten();
+    if write && fresh.is_none() && matches!(presence, Some(HashPresence::Committed)) {
+        let _permit = gate
+            .duplicate_body
+            .try_acquire(request.extensions())
+            .ok_or(RelayError::RateLimit)?;
+        request.extensions_mut().insert(AdmissionMark::Reserved);
+        return Ok(next.run(request).await);
+    }
     let _permit = if !write {
         gate.try_acquire_progress()
-    } else if let Some(fresh) = gate.try_acquire_fresh() {
-        Some(fresh)
-    } else if matches!(presence, Some(HashPresence::Committed)) {
-        request.extensions_mut().insert(AdmissionMark::Reserved);
-        gate.try_acquire_progress()
     } else {
-        None
+        fresh
     }
     .ok_or(RelayError::RateLimit)?;
     Ok(next.run(request).await)

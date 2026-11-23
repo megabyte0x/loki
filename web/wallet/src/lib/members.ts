@@ -2,7 +2,7 @@ import { createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } fro
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
-import { freeSlot, grantDigest, grantedSlot, MAX_SLOT, registrationSlot } from "./member-admission.ts";
+import { freeSlot, grantDigest, grantedSlot, MAX_SLOT, otherPinnedSlots, registrationSlot } from "./member-admission.ts";
 import { registrationLock } from "./registration-lock.ts";
 import { newRelayChallenge, verifyRelayProof } from "./relay-registration.ts";
 
@@ -177,11 +177,12 @@ function checkDevice(e: Enrollment, bindings: Device[]): Device | undefined {
   return bindings.find((d) => d.signing_pubkey === e.signing_pubkey);
 }
 
-function occupied(state: Registry, signing?: string): Set<number> {
+function occupied(state: Registry, signing?: string, automaticGrant?: string): Set<number> {
   return new Set([
     ...state.access.map((m) => m.slot),
     ...state.devices.filter((d) => d.signing_pubkey !== signing && !state.retired.includes(d.signing_pubkey)).map((d) => d.slot),
     ...state.challenges.flatMap((c) => c.pairing_slot === undefined ? [] : [c.pairing_slot]),
+    ...(automaticGrant === undefined ? [] : otherPinnedSlots(automaticGrant)),
   ]);
 }
 
@@ -258,7 +259,7 @@ export async function issuePairingChallenge(raw: unknown, origin: string) {
       if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
       // Pairing alone cannot reserve the entire supported slot range.
       if (state.challenges.filter((c) => !c.enrollment).length >= MAX_SLOT / 2) throw new Error("too many pending registrations");
-      const id = freeSlot(occupied(state), pinned ?? requested);
+      const id = freeSlot(occupied(state, undefined, pinned === undefined ? grant : undefined), pinned ?? requested);
       const expires = now + CHALLENGE_TTL;
       reservation = { challenge: randomBytes(32).toString("hex"), origin, pairing_slot: id, grant, expires };
       state.challenges.push(reservation);
@@ -337,7 +338,8 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string) {
         const permitted = pinned ?? claimed?.pairing_slot ?? prior?.slot;
         const desired = e.slot;
         if (desired !== undefined && desired !== permitted) throw new Error("slot not authorized by onboarding grant");
-        reserved = freeSlot(occupied(state, e.signing_pubkey), pinned ?? claimed?.pairing_slot ?? desired);
+        // A still-live pairing link already holds its slot, even if operator pins changed.
+        reserved = freeSlot(occupied(state, e.signing_pubkey, pinned === undefined && !claimed ? grant : undefined), pinned ?? claimed?.pairing_slot ?? desired);
         state.grants[grant] = { slot: reserved, retry_after: expires, used: false };
       }
       const challenge = randomBytes(32).toString("hex");

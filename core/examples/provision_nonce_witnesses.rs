@@ -158,6 +158,10 @@ async fn main() -> Result<()> {
     }
     let http = if development { RelayHttp::new()? } else { RelayHttp::hosted()? };
     for route in &routes { http.authenticate_endpoint(&route.pin, &route.endpoint).await?; }
+    let mut lock_name = output.as_os_str().to_owned();
+    lock_name.push(".lock");
+    let _lock = OpenOptions::new().write(true).create(true).truncate(false).open(lock_name)?;
+    _lock.try_lock().map_err(|e| format!("lock witness output: {e}"))?;
     if output.try_exists()? {
         let witnesses: [ProvisionedWitness; 2] = serde_json::from_slice(&read_private(&output)?)?;
         bind(&mut routes, &witnesses)?;

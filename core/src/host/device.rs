@@ -5,7 +5,7 @@
 //! device signs it, `POST /api/device-login` verifies the signature against the device's
 //! enrolled public key — Loki never sees a private key. A device is enrolled only once the
 //! recovery identity (the 24 words) has authorized it (`POST /api/device-enroll`), which is how
-//! a new phone registers; `POST /api/device-revoke` drops a compromised device.
+//! a new phone registers; only the local signer can revoke a compromised device.
 //!
 //! The [`DeviceRegistry`](crate::signer::device_auth::DeviceRegistry) is the audited protocol
 //! core; this module only persists enrolled devices (so they survive a restart) and exposes
@@ -16,7 +16,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use axum::{extract::State, http::HeaderMap, Json};
+use axum::{extract::{FromRequest, Request, State}, http::HeaderMap, Json};
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -312,8 +312,19 @@ pub(super) async fn login(State(st): State<Shared>, Json(body): Json<Value>) -> 
     })
 }
 
-/// POST /api/device-revoke { device_pub } — revoke a compromised device's login.
-pub(super) async fn revoke(State(st): State<Shared>, Json(body): Json<Value>) -> Reply {
+/// Revoke locally, never on the authority of a shared wallet token.
+pub(super) async fn revoke(State(st): State<Shared>, req: Request) -> Reply {
+    #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
+    let local = st.config.native && req.extensions().get::<super::native_member::InProcess>().is_some();
+    #[cfg(not(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))))]
+    let local = false;
+    if !local {
+        return err(StatusCode::FORBIDDEN, "Revoke login devices locally in LokiSigner.");
+    }
+    let Json(body) = match Json::<Value>::from_request(req, &st).await {
+        Ok(body) => body,
+        Err(e) => return err(e.status(), e.body_text()),
+    };
     let device_pub = match hex_field(&body, "device_pub") {
         Ok(v) => v,
         Err(e) => return e,

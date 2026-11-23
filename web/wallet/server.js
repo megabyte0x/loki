@@ -23,10 +23,14 @@ const publicPort = Number(publicUrl.port || (https ? 443 : 80));
 const app = next({ dev: false, hostname: publicUrl.hostname, port: publicPort });
 const handle = app.getRequestHandler();
 
-const cacheFor = (url) =>
-  url && url.startsWith("/_next/static")
-    ? "public, max-age=0, must-revalidate"
-    : "no-store, must-revalidate";
+function cacheFor(url) {
+  try {
+    if (new URL(url, "http://x").pathname.startsWith("/_next/static/")) {
+      return "public, max-age=0, must-revalidate";
+    }
+  } catch { /* An invalid request target is never cacheable. */ }
+  return "no-store, must-revalidate";
+}
 
 app.prepare().then(() => {
   createServer((req, res) => {
@@ -51,5 +55,6 @@ app.prepare().then(() => {
       return writeHead(...args);
     };
     handle(req, res);
-  }).listen(port, bind, () => console.log(`loki web on ${bind}:${port} for ${origin}`));
+  }).on("upgrade", (_req, socket) => socket.destroy())
+    .listen(port, bind, () => console.log(`loki web on ${bind}:${port} for ${origin}`));
 });

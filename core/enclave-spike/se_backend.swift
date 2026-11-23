@@ -390,7 +390,8 @@ public func se_wrap(_ handle: UInt64,
                     _ out: UnsafeMutablePointer<UInt8>, _ outCap: Int) -> Int {
     guard let k = fetch(handle)?.key else { return -8 }
     guard let pub = SecKeyCopyPublicKey(k) else { return -1 }
-    let data = Data(bytes: dek, count: dekLen)
+    // Borrow the caller's DEK; any internal Security.framework copy is out of our control.
+    let data = Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: dek), count: dekLen, deallocator: .none)
     guard let ct = SecKeyCreateEncryptedData(pub, algo, data as CFData, nil) as Data? else { return -2 }
     if ct.count > outCap { return -3 }
     ct.copyBytes(to: out, count: ct.count)
@@ -405,10 +406,11 @@ public func se_unwrap(_ handle: UInt64,
     let data = Data(bytes: ct, count: ctLen)
     // Unscoped persistent keys prompt here. Scoped keys already have their authorization.
     var failure: Unmanaged<CFError>?
-    guard let pt = SecKeyCreateDecryptedData(k, algo, data as CFData, &failure) as Data? else {
+    guard var pt = SecKeyCreateDecryptedData(k, algo, data as CFData, &failure) as Data? else {
         let code = keyOperationFailure(failure.map { $0.takeRetainedValue() as Error as NSError }, fallback: -4)
         return checkedBiometricFailure(code, recorded: biometry, current: keychain.biometry)
     }
+    defer { pt.resetBytes(in: 0..<pt.count) }
     if pt.count > outCap { return -3 }
     pt.copyBytes(to: out, count: pt.count)
     return pt.count

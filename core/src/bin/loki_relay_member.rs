@@ -1880,7 +1880,15 @@ fn read_text(path: &Path, max: usize) -> Result<Vec<String>, Exit> {
 }
 
 fn read_exact(path: &Path, max: usize, private: bool) -> Result<zeroize::Zeroizing<Vec<u8>>, Exit> {
-    let metadata = fs::symlink_metadata(path).map_err(|_| Exit::Member(MemberError::Io))?;
+    #[cfg(unix)]
+    let mut file = {
+        use rustix::fs::{open, Mode, OFlags};
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+        fs::File::from(open(path, flags, Mode::empty()).map_err(|_| Exit::Member(MemberError::Io))?)
+    };
+    #[cfg(not(unix))]
+    let mut file = fs::File::open(path).map_err(|_| Exit::Member(MemberError::Io))?;
+    let metadata = file.metadata().map_err(|_| Exit::Member(MemberError::Io))?;
     if !metadata.is_file() || metadata.len() > max as u64 {
         return Err(Exit::Member(if metadata.is_file() {
             MemberError::Bounds
@@ -1891,10 +1899,9 @@ fn read_exact(path: &Path, max: usize, private: bool) -> Result<zeroize::Zeroizi
     if private {
         private_file(&metadata)?;
     }
-    let mut file = fs::File::open(path).map_err(|_| Exit::Member(MemberError::Io))?;
-    let mut bytes = vec![0; metadata.len() as usize];
+    let mut bytes = zeroize::Zeroizing::new(vec![0; metadata.len() as usize]);
     io::Read::read_exact(&mut file, &mut bytes).map_err(|_| Exit::Member(MemberError::Io))?;
-    Ok(zeroize::Zeroizing::new(bytes))
+    Ok(bytes)
 }
 
 fn private_file(metadata: &fs::Metadata) -> Result<(), Exit> {

@@ -391,14 +391,15 @@ async fn scan_wallet(data: &Path, pass: &str, vault: &str, v: &Vault, url: &str)
     }
     let birthday = zcash_client_backend::data_api::AccountBirthday::from_treestate(prior, None)
         .map_err(|e| format!("parse birth tree state: {e}"))?;
-    let mut w = VaultWallet::open(
-        &member_dir(data, vault)?.path().join("wallet.sqlite"),
+    let w = VaultWallet::open_and_sync(
+        member_dir(data, vault)?.path(),
         v.network,
         &v.fvk,
         &birthday,
         pass,
-    )?;
-    w.sync_from_provider(&mut client, &birthday, url).await?;
+        &mut client,
+        url,
+    ).await?;
     Ok((w, client))
 }
 fn relay_login(identity: &Identity) -> Result<FrostdLoginKey, String> {

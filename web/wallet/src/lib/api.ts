@@ -62,7 +62,7 @@ async function nativeApi<T>(session: Pairing, path: string, body?: unknown, sign
 
 /** Pair this tab with a native member from the link it printed (`http://127.0.0.1:<port>/#<capability>`).
  *  The member's identity must be the one the public roster lists for its slot. */
-export async function pairDevice(link: string, cancel?: AbortSignal): Promise<Slot> {
+export async function pairDevice(link: string, expectedSlot?: number, cancel?: AbortSignal): Promise<Slot> {
   const url = new URL(link.trim());
   if (url.protocol !== "http:" || !["127.0.0.1", "[::1]"].includes(url.hostname)
     || !url.port || Number(url.port) < 1024 || url.pathname !== "/" || url.search || url.username || url.password
@@ -73,6 +73,9 @@ export async function pairDevice(link: string, cancel?: AbortSignal): Promise<Sl
   let member: Slot;
   try {
     member = await nativeApi<Slot>(session, "registration", undefined, signal);
+    if (expectedSlot !== undefined && member.slot !== expectedSlot) {
+      throw new Error(`Pairing link belongs to a different member. Use the link for slot ${expectedSlot}.`);
+    }
     const roster = await listSlots(signal);
     if (!roster.some((m) => m.slot === member.slot && m.signing_pubkey === member.signing_pubkey && m.relay_pubkey === member.relay_pubkey && m.advertise_url === member.advertise_url)) {
       throw new Error("Device identity does not match the public roster; register the device first");
@@ -298,9 +301,9 @@ export async function logout(): Promise<boolean> {
   finally { forgetSession(); }
 }
 
-/** Development faucet accepts only a public regtest address. */
-export async function fund(address: string): Promise<{ mined: boolean }> {
-  const res = await fetch("/api/fund", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address }) });
+/** Development faucet accepts a public regtest address and a stable attempt key. */
+export async function fund(address: string, idempotency_key: string): Promise<{ mined: boolean }> {
+  const res = await fetch("/api/fund", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address, idempotency_key }) });
   if (!res.ok) throw new Error((await res.json()).error ?? "could not request funds");
   return { mined: res.status === 200 };
 }
@@ -316,9 +319,8 @@ function browserOnly(): void {
 export async function setupBrowserRecovery(): Promise<{ recovery: boolean }> { browserOnly(); return signer.request("recovery-setup", {}); }
 /** Download this vault's recovery backup on the signer page (ciphertext only the words open). */
 export async function exportRecoveryBackup(vault: string): Promise<void> { browserOnly(); await signer.request("recovery-export", { vault }); }
-/** Fresh browser: restore a vault member from its words (typed on the signer page) and its backup:
- *  the file the member picks there, or `backup` (hex ciphertext) + `vault` the wallet already holds. */
-export async function restoreSigner(opts: CreateSignerOpts & { vault?: string; backup?: string }): Promise<SignerSession> { browserOnly(); return signer.request("restore", opts); }
+/** Restore in the separate signer tab. Only a fresh signer needs new custody. */
+export async function restoreSigner(opts: Partial<CreateSignerOpts> & { vault?: string; backup?: string }): Promise<SignerSession> { browserOnly(); return signer.request("restore", opts); }
 /** Open signer controls and report whether the member removed custody in the signer tab. */
 export async function manageBrowserCustody(): Promise<boolean> {
   browserOnly();

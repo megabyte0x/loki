@@ -282,18 +282,51 @@ pub async fn sync_member_wallet(
     }
     let birthday = AccountBirthday::from_treestate(prior, None)
         .map_err(|e| format!("parse birth tree state: {e}"))?;
-    let mut wallet = VaultWallet::open(
-        &owner.join("wallet.sqlite"),
+    let wallet = VaultWallet::open_and_sync(
+        owner,
         member.network,
         &member.fvk,
         &birthday,
         passphrase,
-    )?;
-    wallet.sync_from_provider(&mut client, &birthday, url).await?;
+        &mut client,
+        url,
+    ).await?;
     Ok((wallet, client))
 }
 
 impl VaultWallet {
+    pub(crate) async fn open_and_sync(
+        owner: &Path,
+        network: VaultNetwork,
+        fvk: &FullViewingKey,
+        birthday: &AccountBirthday,
+        passphrase: &str,
+        client: &mut Lightwalletd,
+        url: &str,
+    ) -> Result<Self, String> {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let sync_lock = options.open(owner.join("wallet.sqlite.sync.lock"))
+            .map_err(|e| format!("open wallet sync lock: {e}"))?;
+        // The host drops its per-request runtime on stop; a blocking OS lock would
+        // hold that shutdown open. Wait asynchronously without losing cancellation.
+        loop {
+            match sync_lock.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => tokio::time::sleep(Duration::from_millis(50)).await,
+                Err(e) => return Err(format!("lock wallet for provider sync: {e}")),
+            }
+        }
+        let mut wallet = Self::open(&owner.join("wallet.sqlite"), network, fvk, birthday, passphrase)?;
+        wallet.sync_from_provider(client, birthday, url).await?;
+        Ok(wallet)
+    }
+
     async fn sync(&mut self, client: &mut Lightwalletd, tip: BlockHeight) -> Result<(), String> {
         let deadline = Duration::from_secs(30);
         self.db.put_sapling_subtree_roots(0, &client.subtree_roots(ShieldedProtocol::Sapling, tip).await?)
@@ -548,7 +581,7 @@ impl VaultWallet {
             .ok_or_else(|| "wallet has no hash for its scanned height".into())
     }
 
-    pub async fn sync_from_provider(
+    async fn sync_from_provider(
         &mut self,
         client: &mut Lightwalletd,
         birthday: &AccountBirthday,

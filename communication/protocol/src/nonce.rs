@@ -77,6 +77,8 @@ pub fn claim_input(
 pub struct NonceReceipt {
     pub pin: RelayPin,
     pub mailbox: Id32,
+    pub vault: Id32,
+    pub slot: u16,
     pub cid: Id32,
     pub record_hash: Id32,
     pub challenge: Id32,
@@ -85,7 +87,7 @@ pub struct NonceReceipt {
 
 pub fn encode_body(receipt: &NonceReceipt) -> WireResult<Vec<u8>> {
     canonical::encode(&Value::Array(vec![
-        Value::Integer(1.into()),
+        Value::Integer(2.into()),
         Value::Bytes(receipt.pin.key.to_vec()),
         Value::Bytes(receipt.pin.run.to_vec()),
         Value::Bytes(receipt.mailbox.to_vec()),
@@ -93,6 +95,8 @@ pub fn encode_body(receipt: &NonceReceipt) -> WireResult<Vec<u8>> {
         Value::Bytes(receipt.record_hash.to_vec()),
         Value::Bytes(receipt.challenge.to_vec()),
         Value::Integer(u64::from(receipt.created).into()),
+        Value::Bytes(receipt.vault.to_vec()),
+        Value::Integer(receipt.slot.into()),
     ]))
 }
 
@@ -101,7 +105,7 @@ pub fn decode_body(raw: &[u8]) -> WireResult<NonceReceipt> {
     let Value::Array(fields) = value else {
         return Err(WireError::Schema);
     };
-    if fields.len() != 8 || fields[0] != Value::Integer(1.into()) {
+    if fields.len() != 10 || fields[0] != Value::Integer(2.into()) {
         return Err(WireError::Schema);
     }
     let id = |index: usize| -> WireResult<Id32> {
@@ -115,12 +119,17 @@ pub fn decode_body(raw: &[u8]) -> WireResult<NonceReceipt> {
         Value::Integer(n) if n == 1.into() => true,
         _ => return Err(WireError::Schema),
     };
+    let Value::Integer(slot) = fields[9] else {
+        return Err(WireError::Schema);
+    };
     Ok(NonceReceipt {
         pin: RelayPin {
             key: id(1)?,
             run: id(2)?,
         },
         mailbox: id(3)?,
+        vault: id(8)?,
+        slot: u16::try_from(i128::from(slot)).map_err(|_| WireError::Schema)?,
         cid: id(4)?,
         record_hash: id(5)?,
         challenge: id(6)?,

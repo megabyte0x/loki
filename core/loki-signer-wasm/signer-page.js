@@ -341,44 +341,50 @@ async function showRecoveryExport({ vault, blob }) {
   } }]);
 }
 
-// Restore a vault member into this (fresh) browser from its words and backup file.
+// Restore a vault member into this browser from its words and backup file.
 // The backup is opaque ciphertext, so the wallet may hand it over (`backup`, hex, with its
 // `vault`), e.g. one the member kept with the coordinator; otherwise the member picks the file.
-async function restore({ vault, name, method, backup }) {
+async function restore({ vault, name, method = "platform", backup }) {
+  const existing = current !== null;
+  if (!existing && await call({ op: "has" })) throw new SignerError("Unlock your signer before restoring another vault", 401);
   await persistent();
   name = String(name || "You");
-  const result = await openRecovery("restore", { vault, name, method, backup }, async ({
-    input: { vaultHex, words, blob, fingerprint }, secret: { passphrase, prfSecret }, credentialId,
+  const result = await openRecovery("restore", { vault, name, method, backup, existing }, async ({
+    input: { vaultHex, words, blob, fingerprint }, secret: { passphrase, prfSecret } = {}, credentialId,
   }) => {
+    if (existing) return call({ op: "restore", method: "", vaultHex, words, blob, fingerprint });
     const restored = await call({ op: "restore", method, name, vaultHex, words, blob, fingerprint, passphrase, prfSecret });
     if (credentialId) rememberCredential(credentialId);
     return restored;
   });
-  current = { profile: result.profile, se: method === "passphrase" ? "software" : "passkey" };
+  if (!existing) current = { profile: result.profile, se: method === "passphrase" ? "software" : "passkey" };
   return { ...result, persisted };
 }
 
-async function showRestore({ vault, name, method, backup }, _context, submit) {
+async function showRestore({ vault, name, method, backup, existing }, _context, submit) {
   const words = el("textarea", { autocomplete: "off", spellcheck: false, rows: 4 });
   const file = el("input", { type: "file" });
   const fingerprint = el("input", { autocomplete: "off", spellcheck: false });
   const given = typeof backup === "string" && /^([0-9a-f]{2})+$/i.test(backup) && /^[0-9a-f]{64}$/i.test(vault ?? "");
-  const input = await prompt("Restore your signer", [
+  const input = await prompt(existing ? "Restore another vault" : "Restore your signer", [
     el("label", { textContent: "Your 24 recovery words" }, words),
     given ? el("p", { className: "mono", textContent: `Backup for vault ${vault.slice(0, 16)}… provided by the wallet` })
       : el("label", { textContent: "The vault's recovery backup file" }, file),
     el("label", { textContent: "SHA-256 fingerprint saved separately from the backup" }, fingerprint),
     el("p", { textContent: "For an older backup you saved yourself, you can compute the fingerprint from that original offline copy. Do not use a value supplied with an untrusted file." }),
-  ], [cancelButton, { label: "Continue", abortable: true, run: async () => {
+  ], [cancelButton, { label: "Continue", abortable: true, run: async (_signal, commit) => {
     const typed = words.value.trim().toLowerCase().split(/\s+/).join(" ");
     const expected = fingerprint.value.trim();
     if (!/^[0-9a-f]{64}$/i.test(expected)) throw new SignerError("Enter the 64-character SHA-256 fingerprint.", 400);
-    if (given) return { vaultHex: vault, words: typed, blob: fromHex(backup), fingerprint: expected };
     const f = file.files[0];
     const vaultHex = vault || f?.name.match(/[0-9a-f]{64}/i)?.[0];
-    if (!f || !vaultHex) throw new SignerError("Choose the loki-recovery-<vault>.bin file you saved.", 400);
-    return { vaultHex, words: typed, blob: new Uint8Array(await f.arrayBuffer()), fingerprint: expected };
+    if (!given && (!f || !vaultHex)) throw new SignerError("Choose the loki-recovery-<vault>.bin file you saved.", 400);
+    const input = { vaultHex, words: typed, blob: given ? fromHex(backup) : new Uint8Array(await f.arrayBuffer()), fingerprint: expected };
+    if (!existing) return input;
+    commit();
+    return submit({ input });
   } }]);
+  if (existing) return input;
   return newCustody(name, method, (secret, credentialId) => submit({ input, secret, credentialId }));
 }
 
@@ -791,7 +797,7 @@ const ops = {
   // A vault backup must also seal to recovery words, so set them up before the first join.
   join: async (p) => {
     if (!(await call({ op: "recovery-status" })).recovery_identity) await recoverySetup();
-    return call({ op: "join", join: relay(p) });
+    return call({ op: "join", join: { ...relay(p), network: cfg.network } });
   },
   "payment-review": (p) => call({ op: "payment-review", payment: relay(p) }),
   "payment-approve": (p) => call({ op: "payment-approve", payment: relay(p) }),
@@ -816,7 +822,7 @@ let queue = Promise.resolve(); // one op (and so one prompt) at a time
 addEventListener("message", (e) => {
   if (!embedded || e.origin !== wallet || e.source !== parent) return;
   const { id, op, params } = e.data ?? {};
-  if (typeof id !== "number" || !Object.hasOwn(ops, op)) return;
+  if (typeof id !== "number" || typeof op !== "string" || !Object.hasOwn(ops, op)) return;
   const run = async () => {
     try {
       if (workerFailure) throw workerFailure;

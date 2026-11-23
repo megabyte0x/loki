@@ -117,10 +117,12 @@ but cannot replace that key or reset its usage. If a legacy ledger is already ov
 keep it intact and keep signing paused rather than creating an empty replacement.
 
 Restart the upgraded witnesses and update the native clients and both browser WASM packages
-before resuming signing. The public configuration contains only endpoints and pins. A `read`
-field in an old witness file is ignored by signing clients; the provisioning tool can still
-use it to check the mailbox. Read capabilities no longer authorize claims. For browser use,
-the witness TLS proxy must allow the signer origin, `PUT`, and the `Authorization`,
+before resuming signing. Receipt format v2 requires a lockstep upgrade of both witnesses and
+all native and browser clients; mixed versions cannot sign. The public configuration contains
+only endpoints and pins. A `read` field in an old witness file is ignored by signing clients;
+the provisioning tool can still use it to check the mailbox. Read capabilities no longer
+authorize claims. For browser use, the witness TLS proxy must allow the signer origin, `PUT`,
+and the `Authorization`,
 `Content-Type`, and `X-Loki-Challenge` headers. Do not downgrade or roll either witness back.
 
 ## frostd behind TLS + CORS for the in-browser signer (`frostd-tls.sh`)
@@ -169,10 +171,11 @@ Node.js 22+ to translate binary gRPC-web to native gRPC over verified TLS. It en
 for the exact signer origin, not the wallet origin, and forwards only `GetLatestBlock` and
 height-only `GetBlockRange` (up to 500 blocks inclusive).
 
-The proxy allows four simultaneous RPCs per peer IP and 32 overall, with a 25-second
-deadline through the end of the response. A TLS terminator or tunnel shares the peer budget
-and should enforce its own per-client limits for fairness. Untrusted forwarding headers do
-not change the proxy's budget.
+The proxy allows four simultaneous RPCs per peer IP and 32 overall, after validating each
+request, with a 25-second deadline through the end of the response. A TLS terminator or tunnel
+shares the peer budget by default. Set `TRUST_FORWARDED=1` only when a trusted loopback proxy
+is the only caller and sets or appends the actual downstream client's IP as the rightmost
+`X-Forwarded-For` entry. Requests from non-loopback socket addresses never use that header.
 
 ```sh
 ORIGIN=http://localhost:3002 communication/deploy/lightwalletd-grpcweb.sh

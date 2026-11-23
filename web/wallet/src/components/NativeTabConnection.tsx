@@ -28,7 +28,7 @@ export function NativeTabConnection({ member, slot, disabled, onBusy, onConnecte
     request.current = attempt;
     try {
       if (lokiSigner) await connectLokiSigner(slot, setProgress, attempt.signal);
-      else await pairDevice(link, attempt.signal);
+      else await pairDevice(link, slot ?? member?.slot, attempt.signal);
       if (!attempt.signal.aborted) onConnected();
     } catch (e) { if (!attempt.signal.aborted) setError(e as Error); }
     finally { request.current = null; setProgress(undefined); onBusy(false); }

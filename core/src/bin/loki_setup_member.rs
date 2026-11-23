@@ -14,7 +14,7 @@ use bip39::{Language, Mnemonic};
 use blake2b_simd::Params;
 use loki_poc::{
     distributed_setup::Member, member_state::Roster, network::VaultNetwork, rpc::Rpc,
-    setup_transport::Identity, state::MemberDir, vault, zip2005,
+    setup_transport::{FreshKey, Identity}, state::MemberDir, vault, zip2005,
 };
 use rand_core::{OsRng, RngCore};
 use reddsa_frost::frost::redpallas as frost;
@@ -906,7 +906,9 @@ fn run(args: &[String]) -> Result<(), String> {
     );
     let (member, own_r1) =
         Member::start_with_policy(own.id, roster.threshold, roster.members.len() as u16)?;
+    let fresh = FreshKey::generate();
     let mut r1_body = commitment.to_vec();
+    r1_body.extend_from_slice(&fresh.public());
     r1_body.extend_from_slice(&own_r1);
     publish(
         exchange,
@@ -916,22 +918,27 @@ fn run(args: &[String]) -> Result<(), String> {
 
     let mut round1 = BTreeMap::new();
     let mut commitments = BTreeMap::new();
+    let mut fresh_keys = BTreeMap::<u16, [u8; 32]>::new();
     round1.insert(own.id, own_r1);
     commitments.insert(own.id, commitment);
     for peer in roster.members.values().filter(|peer| peer.id != own.id) {
         let wire = wait_file(&courier, &name(&roster.vault, "r1", peer.id, None))?;
         let body = secret.verify_round1(peer, &roster.vault, &wire)?;
-        if body.len() <= 32 {
+        if body.len() <= 64 {
             return Err("short round-one package".into());
         }
         commitments.insert(peer.id, body[..32].try_into().unwrap());
-        round1.insert(peer.id, body[32..].to_vec());
+        fresh_keys.insert(peer.id, body[32..64].try_into().unwrap());
+        round1.insert(peer.id, body[64..].to_vec());
     }
     let (member, outgoing) = member.advance(&round1)?;
     for (&peer_id, bytes) in &outgoing {
         let mut body = contribution.to_vec();
         body.extend_from_slice(bytes);
-        let sealed = secret.seal_round2(&roster.members[&peer_id], &roster.vault, &body)?;
+        let sealed = secret.seal_round2_v2(
+            &fresh, &roster.members[&peer_id], &fresh_keys[&peer_id], &roster.vault,
+            &member.transcript, &body,
+        )?;
         publish(
             exchange,
             &name(&roster.vault, "r2", own.id, Some(peer_id)),
@@ -944,7 +951,9 @@ fn run(args: &[String]) -> Result<(), String> {
     contributions.insert(own.id, contribution);
     for peer in roster.members.values().filter(|peer| peer.id != own.id) {
         let wire = wait_file(&courier, &name(&roster.vault, "r2", peer.id, Some(own.id)))?;
-        let body = secret.open_round2(peer, &roster.vault, &wire)?;
+        let body = secret.open_round2_v2(
+            &fresh, peer, &fresh_keys[&peer.id], &roster.vault, &member.transcript, &wire,
+        )?;
         if body.len() <= 32 {
             return Err("short round-two package".into());
         }
@@ -959,6 +968,7 @@ fn run(args: &[String]) -> Result<(), String> {
         contributions.insert(peer.id, theirs);
         incoming.insert(peer.id, body[32..].to_vec());
     }
+    drop(fresh);
     let completed = member.finish(&incoming)?;
     let mut vs_state = Params::new()
         .hash_length(32)

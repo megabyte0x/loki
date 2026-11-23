@@ -27,13 +27,20 @@ export function grantDigest(value: unknown): string {
   return createHash("sha256").update(value).digest("hex");
 }
 
-export function grantedSlot(digest: string): number | undefined {
+function onboardingGrants(): [string, number | null][] {
   const data: unknown = JSON.parse(process.env.LOKI_ONBOARDING_GRANTS ?? "{}");
   if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("invalid onboarding configuration");
   const grants = Object.entries(data);
   if (grants.length > MAX_SLOT || grants.some(([key]) => !DIGEST.test(key))) throw new Error("invalid onboarding configuration");
-  for (const [, value] of grants) if (value !== null) registrationSlot(value);
-  const found = grants.find(([key]) => key === digest);
+  return grants.map(([key, value]) => [key, value === null ? null : registrationSlot(value)]);
+}
+
+export function grantedSlot(digest: string): number | undefined {
+  const found = onboardingGrants().find(([key]) => key === digest);
   if (!found) throw new Error("a valid onboarding grant is required");
-  return found[1] === null ? undefined : found[1];
+  return found[1] ?? undefined;
+}
+
+export function otherPinnedSlots(digest: string): number[] {
+  return onboardingGrants().flatMap(([key, slot]) => key !== digest && slot !== null ? [slot] : []);
 }
