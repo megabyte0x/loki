@@ -1365,9 +1365,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             Nonce witnesses:
               \(witnesses)
 
-            The coordinator above chose these endpoints, except any you set with launch flags \
-            (those apply to this launch only, and then nothing is saved).
-            """
+            The coordinator above chose these endpoints, except any you set with launch flags.
+            """ + (launchOverrideText(config).map { "\n\n" + $0 } ?? "")
     }
 
     private func endpointRows(_ config: [String: Any]) -> [NSView] {
@@ -1379,9 +1378,26 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         }
     }
 
-    private var launchOverrideNotice: [NSView] {
+    /// What launch flags change, and which witness pair this launch and the next one without
+    /// flags sign with. Flags are never saved; the saved pin is always the coordinator's pair.
+    private func launchOverrideText(_ config: [String: Any]) -> String? {
         let flags = ["--network", "--frostd-url", "--lightwalletd-url", "--nonce-witnesses"].filter { args.contains($0) }
-        return flags.isEmpty ? [] : [SignerReview.info("Launch-only settings", "Overrides: \(flags.joined(separator: ", ")). The configuration shown is not saved.", warning: true)]
+        guard !flags.isEmpty else { return nil }
+        var text = "Overrides: \(flags.joined(separator: ", ")). They apply to this launch only and are never saved."
+        let next = config["next_witness_fingerprint"] as? String
+        if args.contains("--nonce-witnesses") {
+            let running = (config["witness_fingerprint"] as? String).map(shortFingerprint) ?? "unknown"
+            text += " This launch signs with the nonce witnesses from your file (pair \(running))."
+            text += next.map { " The next launch without that flag signs with the coordinator’s saved pair (\(shortFingerprint($0)))." }
+                ?? " The next launch without that flag asks you to approve the coordinator’s pair first."
+        } else if let next {
+            text += " The nonce witness pair shown (\(shortFingerprint(next))) is saved for future launches."
+        }
+        return text
+    }
+
+    private func launchOverrideNotice(_ config: [String: Any]) -> [NSView] {
+        launchOverrideText(config).map { [SignerReview.info("Launch-only settings", $0, warning: true)] } ?? []
     }
 
     /// A witness pair this paired profile has not approved, if any. `saved` is nil when the
@@ -1494,7 +1510,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 let reply = nativeQuery(loki_member_app_trust_witnesses, launch)
                 DispatchQueue.main.async {
                     defer { self.walletWork.leave() }
-                    if reply["trusted"] as? Bool == true {
+                    if reply["trusted"] as? Bool == true, reply["unsynced"] as? Bool == true {
+                        finish("LokiSigner replaced the saved nonce witnesses, but couldn’t confirm the save finished. The next unlock will most likely use the new witnesses. If LokiSigner asks about them again, review them again.")
+                    } else if reply["trusted"] as? Bool == true {
                         finish("LokiSigner saved the new nonce witnesses. Signing uses them after you lock and unlock LokiSigner again.")
                     } else {
                         let reason = reply["error"] as? String ?? "LokiSigner couldn’t save them."
@@ -1573,7 +1591,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 title: pairing ? "Review configuration" : "Unlock signer",
                 intro: pairing ? "Check the endpoints chosen by the coordinator before pairing this Mac."
                     : "Unlocking opens the local profile. It never approves a payment.",
-                content: [origin] + content + launchOverrideNotice,
+                content: [origin] + content + launchOverrideNotice(config),
                 hint: pairing ? "Pairing is not a payment approval." : "The coordinator address is read-only.",
                 actions: [pairing ? "Pair" : "Unlock", "Cancel"], primary: 0), fields: fields,
                 escape: .alertSecondButtonReturn, completion: confirmed)
@@ -1636,6 +1654,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 case 9: failure = .invalidProfileName
                 case 10: failure = .cancelled
                 case 11: failure = .witnessesNotSaved
+                case 13: failure = .witnessesSaveUncertain
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil
@@ -1714,7 +1733,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 intro: "Confirm the network and endpoints before choosing the encrypted backup.", content: [
                     r.origin("Original coordinator", config["coordinator"] as? String ?? "", "Testnet · Member slot is resolved from the backup and roster."),
                     r.card("Signer endpoints", endpointRows(config)),
-                ] + launchOverrideNotice, hint: "Continue opens the macOS file picker.", actions: ["Continue", "Cancel"], primary: 0), completion: next)
+                ] + launchOverrideNotice(config), hint: "Continue opens the macOS file picker.", actions: ["Continue", "Cancel"], primary: 0), completion: next)
             return
         }
         let alert = NSAlert()

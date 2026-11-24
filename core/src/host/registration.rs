@@ -503,17 +503,23 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         // Keep the resume destination before sending the one-use claim. A first pairing saves
         // its witness pin before the coordinator pin and fails closed: a paired profile must
         // never sign without a durable pin, or a later launch could not tell a change apart.
-        if let Some(fetched) = st.fetched_config.as_ref().filter(|_| !restored) {
+        // A fresh restore saved its configuration in the profile it published. A later launch of
+        // a restored profile (for example a re-pair with an approved change) saves as usual.
+        if let Some(fetched) = st.fetched_config.as_ref().filter(|fetched| !fetched.staged()) {
             if first_pairing {
                 fetched.save_first_use(&st.config.data).map_err(|e| {
                     eprintln!("could not save the signer configuration for this first pairing: {e}");
-                    "signer-config-not-saved".to_string()
+                    if e == super::native_config::SAVED_UNSYNCED { "signer-config-unsynced" } else { "signer-config-not-saved" }.to_string()
                 })?;
             } else {
                 match fetched.save_unlocked(&st.config.data) {
                     // Never sign with a pair whose pin another launch replaced, nor with an
                     // approved change that didn't persist (the next unlock would silently
                     // return to the old pair): stop and tell the member instead.
+                    Err(e) if e == super::native_config::SAVED_UNSYNCED && fetched.approved_change() => {
+                        eprintln!("signer configuration: {e}");
+                        return Err("signer-config-unsynced".into());
+                    }
                     Err(e) if e == super::native_config::PIN_CONFLICT || fetched.approved_change() => {
                         eprintln!("signer configuration not saved: {e}");
                         return Err("signer-config-not-saved".into());

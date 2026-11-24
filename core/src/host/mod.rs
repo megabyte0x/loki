@@ -49,6 +49,8 @@ pub use registration::RegistrationConfig;
 pub(crate) use registration::pairing_pending;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_config::SAVED_UNSYNCED as NATIVE_SAVED_UNSYNCED;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::can_view_addresses as native_can_view_addresses;

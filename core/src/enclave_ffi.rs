@@ -432,7 +432,8 @@ pub unsafe extern "C" fn loki_member_app_configuration(launch: *const std::ffi::
 /// The member approved, with Touch ID, the nonce-witness pair a `witness-change` notice offered.
 /// `launch` is `{"args": [...], "offered_fingerprint": "<hex>"}`. LokiSigner asks the paired
 /// coordinator again and saves its pair only if it is still the offered one; the next unlock
-/// uses it. Returns `{"trusted": true}` or `{"error": "..."}`; free it with
+/// uses it. Returns `{"trusted": true}`, `{"trusted": true, "unsynced": true}` when the new
+/// pair is in place but its save couldn't be confirmed durable, or `{"error": "..."}`; free it with
 /// [`loki_member_app_free`]. Call from a worker: it contacts the coordinator.
 ///
 /// # Safety
@@ -446,8 +447,12 @@ pub unsafe extern "C" fn loki_member_app_trust_witnesses(launch: *const std::ffi
     native_query_as(launch, |trust: Trust| {
         crate::host::config_from_args(&trust.args)?;
         let args = crate::host::native_locked_args(&trust.args)?;
-        crate::host::NativeConfig::trust_witnesses(&args, &trust.offered_fingerprint)?;
-        Ok(serde_json::json!({ "trusted": true }))
+        match crate::host::NativeConfig::trust_witnesses(&args, &trust.offered_fingerprint) {
+            Ok(()) => Ok(serde_json::json!({ "trusted": true })),
+            // The new pair is in place, but its save may not survive a crash.
+            Err(e) if e == crate::host::NATIVE_SAVED_UNSYNCED => Ok(serde_json::json!({ "trusted": true, "unsynced": true })),
+            Err(e) => Err(e),
+        }
     })
 }
 
@@ -581,9 +586,10 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
         launch.args = crate::host::native_locked_args(&launch.args).map_err(|_| error)?;
         let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref()).map_err(|_| error)?;
-        let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
+        let mut fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         if launch.embedded { crate::host::NativeConfig::validate_wallet(&config).map_err(|_| error)?; }
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), fingerprint, &launch.restore_origin, fetched.as_ref())?;
+        if let Some(fetched) = fetched.as_mut() { fetched.mark_staged(); }
         published = true;
         let notice = native_notice(notify);
         crate::host::run_native(config, pass, notice, native_approval(approve),
@@ -687,6 +693,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "recovery-not-confirmed" => 10,
             "signer-config-not-saved" => 11,
             "profile-in-use" => 12,
+            "signer-config-unsynced" => 13,
             _ => 1,
         },
         Err(_) => 2,
