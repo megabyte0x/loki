@@ -509,8 +509,16 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
                     eprintln!("could not save the signer configuration for this first pairing: {e}");
                     "signer-config-not-saved".to_string()
                 })?;
-            } else if let Err(e) = fetched.save_unlocked(&st.config.data) {
-                eprintln!("could not save signer configuration for future launches: {e}");
+            } else {
+                match fetched.save_unlocked(&st.config.data) {
+                    // Never sign with a pair whose pin another launch replaced: stop instead.
+                    Err(e) if e == super::native_config::PIN_CONFLICT => {
+                        eprintln!("signer configuration not saved: {e}");
+                        return Err("signer-config-not-saved".into());
+                    }
+                    Err(e) => eprintln!("could not save signer configuration for future launches: {e}"),
+                    Ok(()) => {},
+                }
             }
         }
         if let Some(slot) = launch.slot { save_coordinator(&st.config.data, &launch.coordinator, slot)?; }
