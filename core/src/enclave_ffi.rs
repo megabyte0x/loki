@@ -643,6 +643,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "coordinator-roster-unreachable" => 8,
             "invalid-profile-name" => 9,
             "recovery-not-confirmed" => 10,
+            "signer-config-not-saved" => 11,
             _ => 1,
         },
         Err(_) => 2,

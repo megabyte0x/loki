@@ -78,8 +78,9 @@ pub struct NativeConfig {
     /// Include the full selected pair in the preview/apply comparison, not just its endpoints.
     witness_config: [WitnessConfig; 2],
     pub witness_fingerprint: String,
-    /// Set only when a saved, approved pair differs from this one. The first pair is trusted
-    /// on first use; a change needs the member's approval (Touch ID) before it is used or saved.
+    /// Set when this pair is not the saved, approved one on a profile that is already paired,
+    /// including when nothing is saved. Only a first pairing or a fresh restore trusts the
+    /// pair on first use; a change needs the member's approval (Touch ID) before it is used or saved.
     pub witness_change: Option<WitnessChange>,
     /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
@@ -88,12 +89,12 @@ pub struct NativeConfig {
     pub save: bool,
 }
 
-/// A nonce-witness pair change, as two pair fingerprints in hex: the saved, approved pair and
-/// the one the coordinator now serves.
+/// A nonce-witness pair change, as two pair fingerprints in hex: the saved, approved pair
+/// (`None` when a paired profile has none saved) and the one the coordinator now serves.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WitnessChange {
-    pub saved: String,
+    pub saved: Option<String>,
     pub offered: String,
 }
 
@@ -104,8 +105,8 @@ pub struct FetchedConfig {
     origin: String,
     deployment: Deployment,
     save: bool,
-    /// The witnesses came from the coordinator, not a `--nonce-witnesses` flag, so a later
-    /// change on the coordinator is worth telling the member about.
+    /// No launch flag overrides this configuration, so a later witness change on the
+    /// coordinator is worth telling the member about, and approving it can be saved.
     #[cfg_attr(not(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")), allow(dead_code))]
     watch: bool,
 }
@@ -116,6 +117,13 @@ impl FetchedConfig {
     /// Called once the profile has unlocked, after the paired coordinator is saved.
     pub(super) fn save_unlocked(&self, data: &Path) -> Result<(), String> {
         if self.save { save(data, &self.origin, &self.deployment) } else { Ok(()) }
+    }
+
+    /// For a first pairing or a fresh restore: the witness pin must be durable before the
+    /// profile can sign, so a save that a launch flag would skip, or that fails, is an error.
+    pub(super) fn save_first_use(&self, data: &Path) -> Result<(), String> {
+        if !self.save { return Err("launch flags override the configuration, so it can't be saved for a first pairing".into()); }
+        save(data, &self.origin, &self.deployment)
     }
 }
 
@@ -153,7 +161,9 @@ impl NativeConfig {
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     fn resolve_restore(args: &[String], origin: String, deployment: Deployment) -> Result<Self, String> {
         // The coordinator slot is unknown until we open the backup and find its identity.
-        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), super::native_config_from_args(args)?.development_http, None)
+        let config = super::native_config_from_args(args)?;
+        let paired = paired_coordinator(&config.data, config.development_http)?.is_some();
+        Self::merge(args, Some((origin, 0)), Some(deployment.clone()), Some(deployment), config.development_http, None, paired)
     }
 
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
@@ -192,7 +202,7 @@ impl NativeConfig {
         config.network = deployment.network.clone();
         config.frostd_url = deployment.frostd_url.clone();
         config.lightwalletd = deployment.lightwalletd_url.clone();
-        let watch = value(args, "--nonce-witnesses").is_none();
+        let watch = OVERRIDES.iter().all(|name| value(args, name).is_none());
         Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save, watch }))
     }
 
@@ -207,27 +217,27 @@ impl NativeConfig {
         {
             return Err("the new nonce witnesses were not approved".into());
         }
-        eprintln!("[verbose] nonce witnesses: member trusted the new pair {} (was {})", short(&change.offered), short(&change.saved));
+        eprintln!("[verbose] nonce witnesses: member trusted the new pair {} (was {})", short(&change.offered),
+            change.saved.as_deref().map_or_else(|| "none saved".to_owned(), short));
         super::native_member::emit(super::diagnostics::Event::WitnessChangeTrusted);
         Ok(())
     }
 
     /// The member approved, with Touch ID, the pair a `witness-change` notice offered while the
-    /// signer ran. Fetch the paired coordinator's configuration again and save its witness pair
-    /// only if it is still exactly that pair. The other saved endpoints stay as they are. The
-    /// running signer keeps its pair; the next unlock uses the new one.
+    /// signer ran. Only the running, unlocked profile for this launch's data directory can take
+    /// it, and only for the coordinator it runs with. Fetch that coordinator's configuration
+    /// again and save its witness pair only if it is still exactly the offered pair. The save
+    /// happens while holding the running member's handle, so a lock or set-aside that started
+    /// meanwhile makes it fail instead of writing into a moved profile. The other saved
+    /// endpoints stay as they are. The running signer keeps its pair; the next unlock uses the new one.
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     pub(crate) fn trust_witnesses(args: &[String], offered: &str) -> Result<(), String> {
-        if OVERRIDES.iter().any(|name| value(args, name).is_some()) {
-            return Err("launch flags override this configuration, so LokiSigner saved nothing".into());
-        }
         let config = super::native_config_from_args(args)?;
         let (data, development_http) = (&config.data, config.development_http);
-        let (coordinator, _) = paired_coordinator(data, development_http)?.ok_or("this signer is not paired yet")?;
-        let saved = load(data, development_http)?;
-        if let Some(saved) = saved.as_ref().filter(|saved| saved.origin != coordinator) {
-            return Err(format!("the saved configuration belongs to {}, not {coordinator}", saved.origin));
-        }
+        let member = super::native_member::running_state(data).ok_or("LokiSigner was locked, so it saved nothing")?;
+        let running = member.fetched_config.as_ref().filter(|fetched| fetched.watch)
+            .ok_or("launch flags override this configuration, so LokiSigner saved nothing")?;
+        let coordinator = running.origin.clone();
         let served = fetch(&coordinator)?;
         served.check(development_http).map_err(|e| format!("signer configuration from {coordinator}: {e}"))?;
         let fingerprint = nonce_witness::fingerprint(&served.nonce_witnesses);
@@ -235,11 +245,16 @@ impl NativeConfig {
             eprintln!("[verbose] nonce witnesses: the coordinator now serves {}, not the approved {}", short(&fingerprint), short(offered));
             return Err("the coordinator changed its nonce witnesses again. LokiSigner saved nothing; check with the coordinator's operator".into());
         }
-        let deployment = match saved.and_then(|saved| saved.deployment) {
-            Some(saved) => Deployment { nonce_witnesses: served.nonce_witnesses, ..saved },
-            None => served,
-        };
-        save(data, &coordinator, &deployment)?;
+        super::native_member::while_running(&member, || {
+            if paired_coordinator(data, development_http)?.is_none_or(|(paired, _)| paired != coordinator) {
+                return Err("this profile is no longer paired with that coordinator".into());
+            }
+            let deployment = match load(data, development_http)?.filter(|saved| saved.origin == coordinator).and_then(|saved| saved.deployment) {
+                Some(saved) => Deployment { nonce_witnesses: served.nonce_witnesses, ..saved },
+                None => served,
+            };
+            save(data, &coordinator, &deployment)
+        }).map_err(|e| { eprintln!("[verbose] nonce witnesses: not saved: {e}"); e })?;
         eprintln!("[verbose] nonce witnesses: member trusted the new pair {}; it applies at the next unlock", short(&fingerprint));
         super::native_member::emit(super::diagnostics::Event::WitnessChangeTrusted);
         Ok(())
@@ -274,6 +289,7 @@ impl NativeConfig {
             if origin != coordinator { return Err(format!("the saved configuration belongs to {origin}, not {coordinator}")); }
         }
         let approved_fingerprint = saved.as_ref().and_then(|saved| saved.witness_fingerprint.as_deref());
+        let paired = paired_coordinator(data, development_http)?.is_some();
         let flag = |name: &str| value(args, name);
         let flags_complete = ["--network", "--frostd-url", "--nonce-witnesses"].iter().all(|name| flag(name).is_some())
             && (flag("--network").as_deref() == Some("regtest") || flag("--lightwalletd-url").is_some());
@@ -284,14 +300,14 @@ impl NativeConfig {
                 .map_err(|_| "saved-endpoints-refresh-failed")?),
             (Some((coordinator, _)), _) if pairing_url.is_some() => Some(fetch(coordinator)?),
             (_, Some(SavedDeployment { deployment: Some(saved), .. })) =>
-                return Self::merge(args, target, Some(saved.clone()), None, development_http, approved_fingerprint),
+                return Self::merge(args, target, Some(saved.clone()), None, development_http, approved_fingerprint, paired),
             (Some((coordinator, _)), None) if !flags_complete => Some(fetch(coordinator)?),
             _ => None,
         };
-        Self::merge(args, target, fetched.clone(), fetched, development_http, approved_fingerprint)
+        Self::merge(args, target, fetched.clone(), fetched, development_http, approved_fingerprint, paired)
     }
 
-    fn merge(args: &[String], target: Option<(String, u32)>, deployment: Option<Deployment>, fetched: Option<Deployment>, development_http: bool, approved_fingerprint: Option<&str>) -> Result<Self, String> {
+    fn merge(args: &[String], target: Option<(String, u32)>, deployment: Option<Deployment>, fetched: Option<Deployment>, development_http: bool, approved_fingerprint: Option<&str>, paired: bool) -> Result<Self, String> {
         if let (Some(deployment), Some((coordinator, _))) = (&deployment, &target) {
             deployment.check(development_http).map_err(|e| format!("signer configuration from {coordinator}: {e}"))?;
         }
@@ -327,9 +343,14 @@ impl NativeConfig {
         let witness_fingerprint = nonce_witness::fingerprint(&witness_config);
         // Trust on first use: with nothing approved yet, the coordinator's pair is saved as is.
         // An explicit `--nonce-witnesses` file is the member's own choice and never prompts.
-        let witness_change = approved_fingerprint
-            .filter(|saved| flag("--nonce-witnesses").is_none() && *saved != witness_fingerprint)
-            .map(|saved| WitnessChange { saved: saved.into(), offered: witness_fingerprint.clone() });
+        // Trust on first use only while the profile has no paired coordinator: a first pairing
+        // or a fresh restore, whose save then fails closed. A paired profile without a saved
+        // pin never accepts a pair silently. An explicit `--nonce-witnesses` file is the
+        // member's own choice and never prompts.
+        let witness_change = (flag("--nonce-witnesses").is_none()
+            && approved_fingerprint != Some(witness_fingerprint.as_str())
+            && (paired || approved_fingerprint.is_some()))
+            .then(|| WitnessChange { saved: approved_fingerprint.map(str::to_owned), offered: witness_fingerprint.clone() });
         let unsaved = approved_fingerprint != Some(witness_fingerprint.as_str());
         Ok(Self {
             coordinator, slot,
