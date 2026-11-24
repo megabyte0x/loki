@@ -1,6 +1,6 @@
 # LokiSigner — member-owned native signer
 
-The native app claims a `loki://pair` link, sets up a persistent Secure Enclave P-256 device
+The native app pairs from a typed coordinator address (or a `loki://pair` link), sets up a persistent Secure Enclave P-256 device
 key for a new profile (or opens the existing key), and runs S4a self-registration. The coordinator receives public enrollment
 and a challenge signature. Profile passphrases, local session capabilities and FROST shares
 stay on the member device. The FROST share is encrypted with an Enclave-wrapped key; it is
@@ -13,7 +13,21 @@ LOKI_DEV_TEAM=B399KAT22M bash core/signer-app/build.sh
 open core/signer-app/out/LokiSigner.app
 ```
 
-On the wallet's sign-in screen open **Use a native member app instead**. It has two steps.
+The embedded app (the Flutter Runner, see [`apps/macos`](../../apps/macos/README.md)) pairs
+by address: choose **Pair this Mac**, type the coordinator address (for example
+`loki.megabyte.sh`), then review the coordinator and slot, the configuration, your passphrase
+and Touch ID. LokiSigner asks `POST /api/members/pairing` for the link itself and checks that it
+names the typed origin and the reserved slot. If the reservation expires before registration
+finishes, LokiSigner requests the same slot again without asking for your passphrase. If the
+reservation ran out before anything was signed, that happens by itself; if it ran out after
+Touch ID, LokiSigner first explains that Touch ID will ask once more. A refusal of that
+request is shown as its own reason, and only a slot registered to another member suggests
+removing the profile. A profile whose registration never finished asks for the address again,
+then unlocks and registers without a claim first, which also recovers a registration whose
+reply was lost; it requests its slot again only if that has expired.
+
+The standalone app and the wallet still work with links. On the wallet's sign-in screen open
+**Use a native member app instead**. It has two steps.
 
 1. **Pair a new native signer**: choose **Get a pairing link**. The wallet shows the reserved
    slot, the time left on the link, an **Open LokiSigner** button and **Copy link** (to open
@@ -37,8 +51,9 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
    the wallet says so and you can continue to step 2. The roster alone cannot tell you whose
    app registered the slot. Compare the code on your own Mac before allowing the tab. When the two
    minutes run out first, the link and copy button go away; **Get a new link** asks for the
-   same slot again. A lapsed slot can go to another member: the wallet then says the slot was
-   taken, and the next link uses another slot. The wallet never asks for a new link by itself,
+   same slot again. While a link is live, nobody can ask for its slot, not even this wallet. A
+   lapsed slot can go to another member: the wallet then says the slot was taken, and the next
+   link uses another slot. The wallet never asks for a new link by itself,
    because each one reserves a slot.
 2. **Connect this wallet tab**: on **that same Mac**, unlock LokiSigner, select its slot in
    the wallet, and choose **Connect LokiSigner**. If the app is still registering, the tab
@@ -62,8 +77,8 @@ LokiSigner shows a warning, stays unlocked and keeps trying in the background. A
 a new pairing link waits for the registration result before reporting success.
 
 If you cancel, enter the wrong passphrase, or LokiSigner cannot start, choose **Try again**
-or **Quit**. If the coordinator refuses a pairing, retry the saved pairing or get a new link
-from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
+or **Quit**. If the coordinator refuses a pairing, retry the saved pairing, pair again with
+the coordinator address, or get a new link from the wallet. When the existing profile has no vault data, **Start over…** lets you set it
 aside before pairing or restoring. Choose it from the **LokiSigner** menu or a retry dialog.
 Opening a pairing link while the signer is running does not interrupt it or replace its profile.
 LokiSigner moves the whole data folder to a dated sibling;
@@ -312,8 +327,10 @@ This applies only to the native app's pairing and unlock. `LokiSigner serve` and
 
 Pairing reserves a slot for 120 seconds. Both claim and registration are consumed once,
 including failed proofs; claiming does not extend the deadline. If it expires while saving
-recovery words, choose **Get a new link** in the wallet, which asks for the same slot (or,
-if another member took it meanwhile, a new one). After
+recovery words, enter the coordinator address again in LokiSigner (or choose **Get a new link**
+in the wallet), which asks for the same slot (or, from the wallet, a new one if another member
+took it meanwhile). A pairing started from an address renews an expired reservation once
+(after telling you Touch ID will ask again, if you had already approved). After
 a lost response, choose **Try again** and unlock; an outstanding reservation may need to expire before
 retry. Public device bindings prevent a different identity or slot from reusing the enrolled
 key.

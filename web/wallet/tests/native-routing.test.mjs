@@ -1,12 +1,10 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { api, pairDevice, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
+import { api, pairDevice, PairingSlotTaken, requestPairingLink, signerKind, logout } from '../src/lib/api.ts';
 import * as members from '../src/lib/members.ts';
-import { admitGrant } from './grants.mjs';
 
 test('a tab paired with a native member routes member calls to it, with its capability', async () => {
   const sess = new Map();
@@ -54,10 +52,6 @@ test('the wallet asks for a pairing link, then for the same slot again only once
   const dir = mkdtempSync(join(tmpdir(), 'loki-wallet-pairing-'));
   process.env.LOKI_REGISTRY = join(dir, 'roster.json');
   const origin = 'http://localhost:3001';
-  const grant = '1a'.repeat(32);
-  const otherGrant = '2b'.repeat(32);
-  const digest = (token) => createHash('sha256').update(token).digest('hex');
-  for (const token of [grant, otherGrant]) admitGrant(digest(token));
   const bodies = [];
   let reply = null; // replaces the real coordinator for one request
   const originalFetch = globalThis.fetch;
@@ -71,27 +65,26 @@ test('the wallet asks for a pairing link, then for the same slot again only once
     catch (e) { return Response.json({ error: e.message }, { status: 400 }); }
   };
   const originalWindow = globalThis.window;
-  const location = { origin, pathname: '/', search: '', hash: `#onboarding=${grant}` };
+  const location = { origin, pathname: '/', search: '', hash: '' };
   globalThis.window = { location, history: { replaceState: () => { location.hash = ''; } } };
   try {
     const first = await requestPairingLink();
-    assert.deepEqual(bodies[0], { onboarding_grant: grant }, 'the first link lets the coordinator pick the slot');
+    assert.deepEqual(bodies[0], {}, 'the first link lets the coordinator pick the slot');
     assert.equal(first.slot, 1);
     assert(first.url.startsWith('loki://pair?') && first.expires > Date.now());
     // Another member's link takes the next slot, so a request without a slot no longer returns 1.
-    assert.equal((await members.issuePairingChallenge({ onboarding_grant: otherGrant }, origin)).slot, 2);
+    assert.equal((await members.issuePairingChallenge({}, origin)).slot, 2);
 
-    // While the link is live its owner receives the same claim, not a new reservation.
-    assert.equal((await requestPairingLink(first.slot)).url, first.url);
+    // While the link is live nobody else can take its slot, not even with a request naming it.
+    await assert.rejects(requestPairingLink(first.slot), PairingSlotTaken);
 
     // Once it expired, a new link is for slot 1 again, with a new claim.
     const file = process.env.LOKI_REGISTRY;
     const snapshot = JSON.parse(readFileSync(file));
     snapshot.challenges = snapshot.challenges.map((c) => c.pairing_slot === 1 ? { ...c, expires: 0 } : c);
-    snapshot.grants[digest(grant)].retry_after = 0;
     writeFileSync(file, JSON.stringify(snapshot));
     const again = await requestPairingLink(first.slot);
-    assert.deepEqual(bodies.at(-1), { slot: 1, onboarding_grant: grant });
+    assert.deepEqual(bodies.at(-1), { slot: 1 });
     assert.equal(again.slot, 1);
     assert.notEqual(new URL(again.url).searchParams.get('challenge'), new URL(first.url).searchParams.get('challenge'));
 

@@ -57,13 +57,10 @@ member_bin="$core/target/release/loki_member_app"
 
 echo "== coordinator on :$web_port =="
 private_output "$root/coordinator.log"
-for n in $(seq 1 "$members"); do
-  grant=$(openssl rand -hex 32)
-  onboarding[n]=$grant
-  digest=$(printf '%s' "$grant" | openssl dgst -sha256 -r)
-  ( cd "$web" && LOKI_REGISTRY="$root/registry.json" node scripts/grants.ts register "${digest%% *}" --slot "$n" )
-done
+# Every member registers from this one machine at once: raise the admission limits for this
+# local stack only (see web/wallet/README.md#admission-and-rate-limits).
 ( cd "$web" && export HOSTNAME=localhost PORT="$web_port" PUBLIC_PORT="$web_port" LOKI_REGISTRY="$root/registry.json" \
+  LOKI_SIGNUPS_PER_HOUR=16 LOKI_IP_PAIRING_PER_MINUTE=100 LOKI_IP_PAIRING_PER_DAY=1000 \
   && exec node server.js >"$root/coordinator.log" 2>&1 ) &
 echo $! >> "$root/pids"
 for _ in {1..50}; do curl -sf --max-time 1 "$coordinator/api/members" >/dev/null && break; sleep 0.2; done
@@ -77,7 +74,7 @@ for n in $(seq 1 "$members"); do
   ports[n]=$port
   pass="$root/member-$n.pass"
   ensure_passphrase "$pass"
-  LOKI_ONBOARDING_GRANT="${onboarding[n]}" start_member "$port" "$root/member-$n.log" "$root/pids" \
+  start_member "$port" "$root/member-$n.log" "$root/pids" \
     "$member_bin" --data "$root/member-$n" --port "$port" --network "$network" \
     --lightwalletd-url "$lwd" --frostd-url "$frostd" \
     --allow-loopback-peers --secure-element software --development-http \
@@ -86,7 +83,6 @@ for n in $(seq 1 "$members"); do
   tokens[n]=${pairing_link##*#}
   unset pairing_link
 done
-unset onboarding grant
 
 # Readiness means the local API is ready, not that background registration has finished.
 registered=0

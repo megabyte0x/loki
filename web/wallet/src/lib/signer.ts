@@ -119,19 +119,6 @@ const SEALED = "loki_signer_sealed"; // localStorage: a share exists in this bro
 // can also take longer on the first scan and resume from their last saved batch.
 const LONG_CALLS = new Set(["create", "unlock", "join", "verify-address", "payment-approve", "recovery-setup", "recovery-export", "restore", "remove", "chain", "payment-status"]);
 
-let grant: string | undefined;
-export function onboardingGrant(): string | undefined {
-  const { pathname, search, hash } = window.location;
-  const fragment = new URLSearchParams(hash.slice(1));
-  const supplied = fragment.get("onboarding");
-  if (supplied !== null) {
-    grant = /^[0-9a-f]{64}$/.test(supplied) ? supplied : undefined;
-    fragment.delete("onboarding");
-    window.history.replaceState(window.history.state, "", pathname + search + (fragment.size ? `#${fragment}` : ""));
-  }
-  return grant;
-}
-
 async function postJson<T>(url: string, body: unknown): Promise<T> {
   const signal = AbortSignal.timeout(30_000);
   const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal });
@@ -209,10 +196,9 @@ function browserSigner(origin: string): SignerModule {
       const origin = window.location.origin;
       const enrollment = await call<Record<string, string>>("enroll-begin");
       // No advertise_url (frostd-only) and no slot (coordinator allocates).
-      const reply = await postJson<{ challenge: string; replacement_generation?: number; relay_challenge_pubkey: string }>(`${origin}/api/members/challenge`, { ...enrollment, onboarding_grant: onboardingGrant() });
+      const reply = await postJson<{ challenge: string; replacement_generation?: number; relay_challenge_pubkey: string }>(`${origin}/api/members/challenge`, enrollment);
       const proof = await call<{ signature: string; replacement_authorization?: string; relay_proof: string }>("enroll-sign", reply);
       const { member } = await postJson<{ member: EnrolledMember }>(`${origin}/api/members`, { ...enrollment, challenge: reply.challenge, ...proof });
-      grant = undefined;
       return member;
     },
     async request<T>(pathAndQuery: string, body?: unknown): Promise<T> {

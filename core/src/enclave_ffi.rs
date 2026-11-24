@@ -386,6 +386,36 @@ pub unsafe extern "C" fn loki_member_app_pairing_target(launch: *const std::ffi:
     })
 }
 
+/// Pair by typing the coordinator address. `launch` is `{"args": [...], "coordinator": "..."}`,
+/// where `coordinator` is what the member typed (`loki.megabyte.sh` or an HTTPS origin).
+/// For a fresh profile, LokiSigner asks that coordinator for a `loki://pair` link and checks it
+/// names the same origin and the slot reserved: `{"link": "loki://pair?..."}`, for
+/// [`loki_member_app_pairing_target`] and the usual pairing flow. A profile already pinned to
+/// that coordinator gets `{"resume": true}` without any request: unlock it (pass
+/// `"renew_pairing": true` to [`loki_member_app_pair`]) so it registers without a claim first.
+/// Otherwise `{"error": "..."}` in fixed words (`different-pairing` when the profile is pinned
+/// elsewhere). Call from a worker: it contacts the coordinator. Free it with
+/// [`loki_member_app_free`].
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_request_pairing(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request { args: Vec<String>, coordinator: String }
+    native_query_as(launch, |request: Request| {
+        crate::host::config_from_args(&request.args)?;
+        // Profile reads use the locked canonical path.
+        let args = crate::host::native_locked_args(&request.args)?;
+        Ok(match crate::host::request_pairing(&args, &request.coordinator)? {
+            crate::host::AddressPairing::Link(link) => serde_json::json!({ "link": link }),
+            crate::host::AddressPairing::Resume => serde_json::json!({ "resume": true }),
+        })
+    })
+}
+
 /// Execute an allowlisted wallet request. `export` permits only the native backup save path.
 ///
 /// # Safety
@@ -651,6 +681,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
             config: crate::host::NativeConfig,
             witness_confirmation: Option<String>,
             #[serde(default)] embedded: bool,
+            /// Pairing started from a typed coordinator address: renew an expired reservation once.
+            #[serde(default)] renew_pairing: bool,
         }
         let mut launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         crate::host::native_config_from_args(&launch.args)?;
@@ -668,9 +700,14 @@ pub unsafe extern "C" fn loki_member_app_pair(
             Some(link) => {
                 let mut registration = crate::host::RegistrationConfig::pairing(&link, config.development_http)?;
                 if let Some(name) = launch.profile_name { registration.name = name; }
+                registration.renew_pairing = launch.renew_pairing;
                 registration
             }
-            None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
+            None => {
+                let mut registration = crate::host::RegistrationConfig::resume(&config.data, config.development_http)?;
+                registration.renew_pairing = launch.renew_pairing;
+                registration
+            }
         };
         config.registration = Some(registration);
         crate::host::run_native(config, pass, notice.clone(), native_approval(approve),
@@ -694,6 +731,16 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "signer-config-not-saved" => 11,
             "profile-in-use" => 12,
             "signer-config-unsynced" => 13,
+            "registration-expired" => 14,
+            // Renewing an expired reservation was refused; these replace the expiry.
+            "renewal-rate-limited" => 15,
+            "renewal-slots-full" => 16,
+            "renewal-slot-registered" => 17,
+            "renewal-slot-held" => 20,
+            // The member chose Cancel before a renewal's second Touch ID: like other setup dialogs.
+            "renewal-cancelled" => 10,
+            "renewal-unreachable" => 18,
+            "renewal-refused" => 19,
             _ => 1,
         },
         Err(_) => 2,

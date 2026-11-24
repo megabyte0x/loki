@@ -8,16 +8,15 @@ S3 nonce state and the two Gap-C witnesses are unchanged.
 
 ## Co-located development
 
-Use Node.js 24 or newer. For a disposable software-signer stack with grants configured
-automatically, see [`selfcustody-testnet.sh`](../../communication/deploy/README.md).
-For a separate local coordinator, configure the [onboarding grants](#onboarding-grants)
-and start Next in this directory:
+Use Node.js 24 or newer. For a disposable software-signer stack, see
+[`selfcustody-testnet.sh`](../../communication/deploy/README.md). For a separate local
+coordinator, start Next in this directory (see [admission and rate limits](#admission-and-rate-limits)):
 
 ```sh
 LOKI_REGISTRY=/absolute/path/public-roster.json npx next dev --hostname localhost -p 3001
 ```
 
-Open the onboarding link in the wallet to pair a native LokiSigner. For a direct
+To pair a native LokiSigner, type this coordinator's address in LokiSigner. For a direct
 headless start, see the [member binary example](../../communication/deploy/README.md)
 and configure both nonce witness routes. Keep each member's data and local unlock
 file separate. Save recovery words privately when shown.
@@ -90,7 +89,7 @@ web` in `core/loki-signer-wasm`, and `wasm-pack build --target web` in `core/was
    - the browser generates a non-extractable **WebCrypto P-256 device key** (persisted in
      IndexedDB, reused on re-enroll) and the Worker's `authorizeDevice()` signs it with the
      member identity — the same Ed25519/P-256 proof as `core/src/host/registration.rs`;
-   - `POST /api/members/challenge` with the first-time onboarding grant → the browser signs the
+   - `POST /api/members/challenge` → the browser signs the
      registration transcript with the device key and proves possession of the relay key against
      the coordinator's one-use X25519 challenge → `POST /api/members` returns the member and slot.
 3. **Discover** the ceremony params. The public coordinator (this Next app) owns only the roster;
@@ -125,7 +124,7 @@ Safari may block the wallet's loopback request; this has not been verified.
 Native setup and recovery use `GET /api/members?signing_pubkey=<lowercase hex>` to look up
 at most one public row without downloading the roster.
 
-The coordinator stores the roster, device generations, onboarding history, and challenges in one owner-only
+The coordinator stores the roster, device generations, recent sign-up times, and challenges in one owner-only
 snapshot at `.access.json` (or `LOKI_REGISTRY`). Before upgrading, stop all old coordinator
 workers and back up the registry and any legacy `.devices` sidecar together. Update signer
 clients for the relay proof, and reissue pairing links. Do not run old and new workers on the
@@ -145,31 +144,75 @@ the native app. The coordinator-served JavaScript can still read a grant held by
 device-side consent remains required for signing. Co-location under one OS account is not
 independent custody against that OS operator.
 
-### Onboarding grants
+### Admission and rate limits
 
-The coordinator admits at most 16 active members in slots 1–16. Onboarding grants live in the
-coordinator registry, so adding one needs no restart. Use the same registry path as the
-coordinator:
+Anyone who knows the coordinator's address can pair a member: there is no operator step.
+A member types the address (for example `loki.megabyte.sh`) in LokiSigner, which asks
+`POST /api/members/pairing` for a `loki://pair` link and continues with the usual review,
+passphrase and Touch ID. The wallet's own pairing-link step still works the same way.
 
-```sh
-LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts add [--slot N] [--origin https://wallet.example]
-LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts register <sha256 digest> [--slot N]   # scripts with their own bearer
-LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts list    # digest prefix, slot, unused/pending/used
-LOKI_REGISTRY=/path/to/registry.json node scripts/grants.ts prune   # drop used grants
-```
+The coordinator admits at most 16 active members in slots 1–16. A pairing link reserves the
+lowest free slot (or the slot it names, to finish a pairing that never registered) for two
+minutes, and so does a new identity that enrolls directly (the in-browser signer). Together
+these unfinished new-identity reservations can hold at most eight distinct slots, so they
+never fill the roster; a further request gets "too many pending registrations". At most 32
+registration challenges can be pending in all.
+Funds stay protected without an admission gate: joining a vault still needs the creator's
+private invite and the roster-code comparison.
 
-`add` prints the bearer (or the wallet link with `#onboarding=`) once and stores only its digest.
-At most 16 registry grants can be unused at once; pruning a used grant keeps its use recorded, so it
-can never admit again. Without `--slot` the coordinator picks the lowest free slot.
+The limits below apply only to requests that could admit a **new** identity: a pairing link,
+and direct enrollment of an identity the registry doesn't know (claiming a pairing link
+spends the reservation its link was counted for). A registered member's roster refresh at
+unlock, recovery and device replacement are exempt, but only because the request's
+`authorization`, that identity's own signature over its device key, verifies first;
+registering then still needs the device signature and the relay proof.
 
-Share `${grant}` privately with the new member, not the digest. For the wallet, append
-`#onboarding=<grant>` to the wallet URL; the page holds it in memory after reading it.
-For headless onboarding, set `LOKI_ONBOARDING_GRANT` before running `join-loki.sh`.
-Do not put the bearer in a query string, process arguments, or logs. Each grant admits
-one identity. Equivalent requests reuse a live challenge; a grant cannot issue another
-until its two-minute issuance window ends. Pairing has eight reservations separate
-from the 32 registration challenges. Existing members can refresh or replace their
-device without a new grant. If an unfinished pairing expires, obtain a new link.
+Registry writes come from two separate budgets. New-identity work (pairing links, enrolling,
+resuming or claiming for an identity the registry doesn't know) uses one. A registered
+member's refresh or replacement, completing an issued proof and operator tools use the other,
+so new-identity traffic can never make an existing member wait for "registration is busy". The
+per-address check and every cheap refusal (a malformed request, a full roster, no pending
+slot, the sign-up cap, a taken slot, an unknown proof) happen before either budget or the
+registry lock is spent. Those checks use a parsed copy of the registry kept in memory and
+re-read only when the file changes; the locked write checks everything again.
+
+Every request to the direct registration routes (`POST /api/members/challenge` and
+`POST /api/members`), members' included, also counts in a generous per-address attempt limit
+before any registry access. An unlock is two requests and background retries back off from
+five seconds, so only a client hammering the routes reaches it. An identical retry of a
+pending registration gets the same challenge without touching the registry lock; other
+retries of one pending registration are limited to six a minute for that identity.
+
+The coordinator reads these settings from its own process environment. Changing a service's
+environment file or exporting a variable in a shell doesn't reach a running coordinator:
+restart it to apply a change.
+
+| Setting | Default | Limits |
+| --- | --- | --- |
+| `LOKI_SIGNUPS_PER_HOUR` | 6 | New identities registered in a rolling hour, across the coordinator. Stored in the registry. Refreshing or replacing a registered member's device and resuming a pending registration don't count. |
+| `LOKI_IP_PAIRING_PER_MINUTE` | 5 | New-identity requests (above) per client address per minute. |
+| `LOKI_IP_PAIRING_PER_DAY` | 30 | The same requests per client address per rolling day. |
+| `LOKI_IP_REGISTRATION_PER_MINUTE` | 60 | Any direct registration-challenge or proof request per client address per minute, members included. |
+| `LOKI_CLIENT_IP_HEADER` | unset | The one header your proxy sets to the client address, for example `cf-connecting-ip` behind a Cloudflare tunnel. |
+
+The per-address counts live in memory, use the process's monotonic clock (a wall-clock
+step changes nothing) and reset when the coordinator restarts. The hourly sign-up times are
+wall-clock and stored in the registry; a time later than the current clock still counts
+until the clock passes it. They track at
+most 10,000 addresses. When that's full, addresses idle for a day are dropped oldest first,
+and if none are, new addresses share one overflow bucket with the same limits, so they're
+still admitted. The coordinator reads only the header named by `LOKI_CLIENT_IP_HEADER`,
+takes its first value and accepts it only if it's an IP address. IPv6 addresses are counted
+in one canonical spelling, and an IPv4-mapped IPv6 address counts as its IPv4 address. It never trusts `X-Forwarded-For` or any other
+client header on its own. Without the setting, or when the header is missing or invalid,
+every request shares one bucket, so the limits still apply to everyone together. Set it
+only when a proxy you run always overwrites that header.
+
+A refused request gets HTTP 429 with a short plain message and a `Retry-After` header: the
+seconds until the exhausted window admits again (up to a day for the daily limit). The coordinator logs one fixed
+line per refusal reason, never the client address. A value that isn't a whole number stops
+admission until it's fixed. These limits slow spam but don't stop it: the 16 slots can
+still fill up.
 
 To permanently retire a roster identity and release its slot, use the same registry path
 as the coordinator: `LOKI_REGISTRY=/path/to/registry.json node scripts/retire-member.ts <signing_pubkey>`.

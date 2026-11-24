@@ -21,6 +21,9 @@ func loki_member_app_disconnect_wallet_tabs()
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("loki_member_app_request_pairing")
+func loki_member_app_request_pairing(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
 @_silgen_name("loki_member_app_configuration")
 func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
@@ -686,6 +689,34 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         DispatchQueue.main.async { NativeSigner.current?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return 0
     }
+    // Renewing an expired reservation means a second Touch ID approval: ask first, and wait.
+    if event == "pairing-renew" {
+        guard !Thread.isMainThread else { return 0 }
+        let done = DispatchSemaphore(value: 0)
+        var renew = false
+        DispatchQueue.main.async {
+            if let signer = NativeSigner.embeddedSigner {
+                let r = SignerReview.self
+                signer.presentPrompt(SignerReview(section: "Pairing", title: "Approve once more",
+                    intro: text, content: [r.info("Why Touch ID asks again", "Your first approval answered the reservation that ran out. The new one needs its own approval. Your passphrase isn’t needed again.")],
+                    hint: "Cancel stops pairing; you can pair again later with the coordinator address.",
+                    actions: ["Continue", "Cancel"], primary: 0), escape: .alertSecondButtonReturn) { answer in
+                    renew = answer == .alertFirstButtonReturn
+                    done.signal()
+                }
+            } else {
+                let alert = NSAlert()
+                alert.messageText = "Approve once more"
+                alert.informativeText = text
+                alert.addButton(withTitle: "Continue")
+                alert.addButton(withTitle: "Cancel")
+                renew = runDecisionAlert(alert, escape: .alertSecondButtonReturn) == .alertFirstButtonReturn
+                done.signal()
+            }
+        }
+        done.wait()
+        return renew ? 1 : 0
+    }
     // Do not finish pairing unless the member explicitly confirms saving the words.
     if event == "recovery" {
         guard !Thread.isMainThread else { return 0 }
@@ -789,6 +820,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var retryLink: String?
     private var queuedLink: String?
     private var attemptedPairingClaims: Set<String> = []
+    /// Pairing links LokiSigner fetched from a typed coordinator address (see `requestPairing`).
+    private var addressLinks: Set<String> = []
+    /// The member typed the address of the coordinator this profile is already pinned to: the
+    /// next unlock registers without a claim, renewing the reservation once only if that expires.
+    private var resumeRenewal = false
+    private static let renewalTouchID = "The coordinator holds this Mac’s slot for two minutes. If that runs out while you’re still reviewing, LokiSigner asks for the same slot again by itself, and Touch ID asks only once. If it runs out after you approve with Touch ID, LokiSigner asks you before requesting the slot again, and Touch ID then asks once more."
     private var startingOver = false
     private var recoveringKey = false
     private var discardingPending = false
@@ -972,6 +1009,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private func finishWalletOperation(_ failure: SignerStartFailure? = nil) {
         prompting = false
         retryLink = nil
+        resumeRenewal = false
         let completion = walletCompletion
         walletCompletion = nil
         completion?(failure)
@@ -982,14 +1020,43 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         start(nil)
     }
 
-    func pairWallet(link: String) {
+    /// Pair from what the member entered: a coordinator address (`loki.megabyte.sh`), or a
+    /// pasted `loki://pair` link, which works as before.
+    func pairWallet(link input: String) {
         guard !running else { finishWalletOperation(.differentPairing); return }
         prompting = true
         let state = startupProfile()
         guard let profile = state["profile"] as? String else { retry(.dataFolderUnavailable, link: nil); return }
         if profile == "fresh", !canSetUp() { return }
-        guard let link = unusedPairingLink(link) else { finishWalletOperation(.invalidLink); return }
+        guard input.lowercased().hasPrefix("loki:") else { requestPairing(address: input); return }
+        guard let link = unusedPairingLink(input) else { finishWalletOperation(.invalidLink); return }
         loadConfiguration(link: link)
+    }
+
+    /// Rust asks the typed coordinator for a pairing link and checks it. The link then goes
+    /// through the usual review: coordinator and slot, configuration, passphrase and Touch ID. A
+    /// profile already pinned to that coordinator unlocks instead, registering without a claim.
+    private func requestPairing(address: String) {
+        let launch: [String: Any] = ["args": args, "coordinator": address]
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = nativeQuery(loki_member_app_request_pairing, launch)
+            DispatchQueue.main.async {
+                if reply["resume"] as? Bool == true {
+                    // Pinned to this coordinator: finish with a claim-free unlock first.
+                    self.resumeRenewal = true
+                    self.loadConfiguration(link: nil)
+                    return
+                }
+                guard let link = reply["link"] as? String, let checked = self.unusedPairingLink(link) else {
+                    let error = reply["error"] as? String
+                    self.retry(error == "different-pairing" ? .differentPairing
+                        : .pairingRefused(error ?? SignerStartFailure.unexpected.message), link: nil)
+                    return
+                }
+                self.addressLinks.insert(checked)
+                self.loadConfiguration(link: checked)
+            }
+        }
     }
 
     func restoreWallet() {
@@ -1087,7 +1154,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         let r = SignerReview.self
         presentPrompt(SignerReview(section: "Pairing", title: "Remove this unregistered profile?",
             intro: "The coordinator never accepted this Mac’s registration, so this profile has no recovery words or vaults yet.",
-            content: [r.info("Nothing is deleted", "LokiSigner renames the local data folder and returns to Pair this Mac. Pair again with a new link from the wallet.")],
+            content: [r.info("Nothing is deleted", "LokiSigner renames the local data folder and returns to Pair this Mac. Pair again with the coordinator address.")],
             hint: "Cancel keeps this profile.", actions: ["Cancel", "Remove and pair again"], primary: 1, destructive: true)) { answer in
             guard answer == .alertSecondButtonReturn else { self.finishWalletOperation(.cancelled); return }
             self.discardingPending = true
@@ -1575,9 +1642,11 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             if let name = nameField?.stringValue, !name.isEmpty { namedLaunch["profile_name"] = name }
             self.startConfirmed(link: link, launch: namedLaunch, config: config, password: password)
         }
+        let renewable = link.map(addressLinks.contains) ?? resumeRenewal
         if embedded {
             let r = SignerReview.self
             let pairing = link != nil
+            let renewal = renewable ? [r.info("If the slot reservation runs out", Self.renewalTouchID)] : []
             let origin = r.origin(pairing ? "Coordinator" : "Paired coordinator", config["coordinator"] as? String ?? "",
                                   "Member slot \(slot) · Testnet")
             let local = (nameField.map { r.field("Profile name (optional)", $0) } ?? []) + r.field("Local profile passphrase", password)
@@ -1591,7 +1660,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 title: pairing ? "Review configuration" : "Unlock signer",
                 intro: pairing ? "Check the endpoints chosen by the coordinator before pairing this Mac."
                     : "Unlocking opens the local profile. It never approves a payment.",
-                content: [origin] + content + launchOverrideNotice(config),
+                content: [origin] + content + renewal + launchOverrideNotice(config),
                 hint: pairing ? "Pairing is not a payment approval." : "The coordinator address is read-only.",
                 actions: [pairing ? "Pair" : "Unlock", "Cancel"], primary: 0), fields: fields,
                 escape: .alertSecondButtonReturn, completion: confirmed)
@@ -1602,6 +1671,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             alert.informativeText = link == nil
                 ? "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
                 : "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
+            if renewable { alert.informativeText += "\n\n" + Self.renewalTouchID }
             if let nameField {
                 let group = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 60))
                 group.addSubview(nameField)
@@ -1629,6 +1699,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         var confirmed = launch
         confirmed["config"] = config
         if embedded { confirmed["embedded"] = true }
+        // Pairing from a typed address can renew an expired reservation once.
+        if link.map(addressLinks.contains) ?? resumeRenewal { confirmed["renew_pairing"] = true }
+        resumeRenewal = false
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             password.stringValue = ""
             retry(.unexpected, link: link)
@@ -1655,6 +1728,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 case 10: failure = .cancelled
                 case 11: failure = .witnessesNotSaved
                 case 13: failure = .witnessesSaveUncertain
+                case 14: failure = .registrationExpired
+                case 15...20: failure = .pairingRefused(SignerStartFailure.renewalRefusal(code))
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil

@@ -5,6 +5,7 @@ use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use super::diagnostics::PairingRefusal;
 use super::state::{write_native_key_scope, Config, Session, Shared};
 use crate::member_state::MAX_MEMBERS;
 use crate::signer::device_auth::{verify_device_signature, DeviceRegistry};
@@ -19,6 +20,10 @@ pub struct RegistrationConfig {
     pub passphrase_file: Option<PathBuf>,
     pub name: String,
     pub pairing_challenge: Option<String>,
+    /// The member typed the coordinator address: LokiSigner fetched the pairing link itself, or
+    /// is finishing a pending profile's registration without a link. If that expires before
+    /// registration finishes, ask for a new reservation for the same slot once.
+    pub renew_pairing: bool,
 }
 
 impl RegistrationConfig {
@@ -42,14 +47,14 @@ impl RegistrationConfig {
         if challenge.len() != 64 || !challenge.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
             return Err("invalid pairing challenge".into());
         }
-        Ok(Self { coordinator, slot: Some(slot), passphrase_file: None, name: "Member".into(), pairing_challenge: Some(challenge) })
+        Ok(Self { coordinator, slot: Some(slot), passphrase_file: None, name: "Member".into(), pairing_challenge: Some(challenge), renew_pairing: false })
     }
 
     pub fn resume(data: &std::path::Path, development_http: bool) -> Result<Self, String> {
         let saved: PairedCoordinator = serde_json::from_slice(&std::fs::read(data.join("paired-coordinator.json")).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         if !valid_slot(saved.slot) { return Err("invalid saved slot".into()); }
         Ok(Self { coordinator: plain_origin(&saved.origin, development_http)?, slot: Some(saved.slot),
-            passphrase_file: None, name: "Member".into(), pairing_challenge: None })
+            passphrase_file: None, name: "Member".into(), pairing_challenge: None, renew_pairing: false })
     }
 
     pub(super) fn from_args(args: &[String], development_http: bool) -> Result<Option<Self>, String> {
@@ -72,7 +77,7 @@ impl RegistrationConfig {
             _ => return Err("invalid coordinator pairing reservation".into()),
         };
         let passphrase_file = value("--local-passphrase-file").ok_or("--local-passphrase-file is required for local unlock")?.into();
-        Ok(Some(Self { coordinator, slot, passphrase_file: Some(passphrase_file), name: value("--profile-name").unwrap_or_else(|| "Member".into()), pairing_challenge }))
+        Ok(Some(Self { coordinator, slot, passphrase_file: Some(passphrase_file), name: value("--profile-name").unwrap_or_else(|| "Member".into()), pairing_challenge, renew_pairing: false }))
     }
 }
 
@@ -170,18 +175,31 @@ enum RegistrationFailure {
     WrongSlot,
 }
 
+// The coordinator's exact rate-limit refusals (web/wallet/src/lib/admission-limits.ts).
+const SIGNUP_LIMIT: &str = "This coordinator has reached its sign-up limit for this hour. Try again later.";
+const IP_LIMIT: &str = "Too many pairing requests from this network. Try again later.";
+const ATTEMPT_LIMIT: &str = "Too many registration attempts. Try again in a minute.";
+
 /// Why the coordinator refused a registration. It is recognised only from the coordinator's exact
 /// error text, so none of that text reaches logs or the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Refusal { ExpiredChallenge, GrantRequired, GrantUsed, SlotTaken, WrongSlot, Other }
+pub(super) enum Refusal {
+    /// An expiry refused while asking for a challenge: nothing was signed yet (the reservation
+    /// ran out during review, or the link changed). Set from the request stage, never the text.
+    ExpiredClaim,
+    /// An expiry refused for a signed proof (possibly while Touch ID was open), or before the
+    /// stage is known.
+    ExpiredChallenge,
+    RateLimited, SlotTaken, WrongSlot, Other,
+}
 
 impl Refusal {
     fn from_coordinator(error: Option<&str>) -> Self {
         match error {
+            // Any expiry wording; `register` decides from its own stage whether anything was signed.
             Some("unknown, expired or changed pairing challenge" | "unknown, expired or changed registration challenge"
                 | "registration generation changed; request a new challenge") => Self::ExpiredChallenge,
-            Some("a valid onboarding grant is required") => Self::GrantRequired,
-            Some("onboarding grant already used") => Self::GrantUsed,
+            Some(SIGNUP_LIMIT | IP_LIMIT | ATTEMPT_LIMIT) => Self::RateLimited,
             Some("slot already registered or reserved") => Self::SlotTaken,
             Some("registered identity cannot change slot" | "registered identity cannot change slot or relay key") => Self::WrongSlot,
             _ => Self::Other,
@@ -198,6 +216,15 @@ impl From<&str> for RegistrationFailure {
 }
 
 impl RegistrationFailure {
+    /// An expiry refusal takes the kind of the stage this device was at (before or after
+    /// signing), whatever wording the coordinator used.
+    fn at_stage(self, expired: Refusal) -> Self {
+        match self {
+            Self::Refused(error, Refusal::ExpiredClaim | Refusal::ExpiredChallenge) => Self::Refused(error, expired),
+            other => other,
+        }
+    }
+
     fn native_code(&self) -> &'static str {
         match self {
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
@@ -205,6 +232,7 @@ impl RegistrationFailure {
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
             Self::Device(DeviceKeyError::CoordinatorUnavailable(_)) => "coordinator-roster-unreachable",
             Self::Device(_) => "device-key",
+            Self::Refused(_, Refusal::ExpiredClaim | Refusal::ExpiredChallenge) => "registration-expired",
             Self::WrongSlot | Self::Refused(..) => "registration-refused",
             Self::Connection(_) => "registration-failed",
             Self::Other(_) => "native registration stopped",
@@ -230,12 +258,15 @@ async fn registration_response<T: serde::de::DeserializeOwned>(
     let status = response.status();
     if !status.is_success() {
         let error = format!("{step}: {status}");
-        if native && status.is_client_error()
-            && !matches!(status, reqwest::StatusCode::REQUEST_TIMEOUT | reqwest::StatusCode::TOO_MANY_REQUESTS) {
+        if native && status.is_client_error() && status != reqwest::StatusCode::REQUEST_TIMEOUT {
             // The text only selects a fixed reason; it is never kept or shown.
             let body = read_bounded(&mut response, 1024).await.ok();
             let json = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
             let reason = Refusal::from_coordinator(json.as_ref().and_then(|json| json["error"].as_str()));
+            // Any other 429 (a proxy's, say) stays a connection failure, retried later.
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS && reason != Refusal::RateLimited {
+                return Err(RegistrationFailure::Connection(error));
+            }
             if status == reqwest::StatusCode::BAD_REQUEST && reason == Refusal::WrongSlot {
                 return Err(RegistrationFailure::WrongSlot);
             }
@@ -397,19 +428,14 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     };
     let mut claim = serde_json::to_value(&enrollment).map_err(|e| e.to_string())?;
     if let Some(challenge) = pairing_claim { claim["pairing_challenge"] = challenge.into(); }
-    else if !config.native {
-        if let Ok(grant) = std::env::var("LOKI_ONBOARDING_GRANT") {
-            if !lowercase_key(&grant) { return Err("invalid onboarding grant".into()); }
-            claim["onboarding_grant"] = grant.into();
-        }
-    }
     let request = client.post(format!("{}/api/members/challenge", launch.coordinator))
         .json(&claim).build().map_err(|e| e.to_string())?;
     // After handing the request to the client even a lost response may mean the claim was used.
     if let (Some(notice), Some(claim)) = (notice, pairing_claim) { notice("pairing-claim-attempted", claim); }
     let response = client.execute(request).await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
     let RegistrationChallenge { challenge, replacement_generation, relay_challenge_pubkey } =
-        registration_response(response, "registration challenge", config.native, 1024).await?;
+        registration_response(response, "registration challenge", config.native, 1024).await
+            .map_err(|e| e.at_stage(Refusal::ExpiredClaim))?;
     if !lowercase_key(&challenge) || !lowercase_key(&relay_challenge_pubkey) {
         return Err("invalid coordinator challenge".into());
     }
@@ -430,7 +456,8 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     body["challenge"] = challenge.into();
     let response = client.post(format!("{}/api/members", launch.coordinator))
         .json(&body).send().await.map_err(|e| RegistrationFailure::Connection(format!("self-registration: {e}")))?;
-    let RegistrationReply { member } = registration_response(response, "self-registration", config.native, 8 * 1024).await?;
+    let RegistrationReply { member } = registration_response(response, "self-registration", config.native, 8 * 1024).await
+        .map_err(|e| e.at_stage(Refusal::ExpiredChallenge))?;
     if !valid_slot(member.slot) || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
         || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url
         || member.lokisigner_url != enrollment.lokisigner_url {
@@ -542,7 +569,35 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         save_destination(first_pairing)?;
         // Complete enrollment before minting words: the slot then belongs to this identity,
         // not to an expiring claim.
-        register_once(st, pass.clone(), launch.pairing_challenge.clone(), notice.cloned()).await.map_err(|e| {
+        let mut registered = register_once(st, pass.clone(), launch.pairing_challenge.clone(), notice.cloned()).await;
+        let expired = match &registered {
+            Err(RegistrationFailure::Refused(_, reason @ (Refusal::ExpiredClaim | Refusal::ExpiredChallenge))) => Some(*reason),
+            _ => None,
+        };
+        if let (true, Some(slot), Some(expired)) = (launch.renew_pairing, launch.slot, expired) {
+            // The reservation ran out. Before signing (during review), renew silently: the member
+            // already approved this origin and slot. After signing (possibly while Touch ID was
+            // open), that approval answered the old challenge and the new one needs its own, so
+            // say so first; Cancel stops like any other setup dialog. The passphrase stays here.
+            if expired == Refusal::ExpiredChallenge && notice.is_some_and(|notice| !notice("pairing-renew", RENEW_NOTICE)) {
+                return Err("renewal-cancelled".into());
+            }
+            // A fresh reservation for the same slot, once. Its own refusal (the slot is held or
+            // registered, a limit, an outage) is what the member sees, not the expiry.
+            let link = match request_pairing_link(&launch.coordinator, Some(slot), st.config.development_http).await {
+                Ok(link) => link,
+                Err(reason) => {
+                    let reason = if reason == PairingRefusal::SlotHeld { slot_conflict(st, &pass, &launch.coordinator, slot).await } else { reason };
+                    native_event!(st, Event::PairingRefused(reason));
+                    eprintln!("native pairing renewal refused: {reason:?}");
+                    return Err(reason.native_code().into());
+                }
+            };
+            native_event!(st, Event::ChallengeRenewed);
+            let renewed = RegistrationConfig::pairing(&link, st.config.development_http)?;
+            registered = register_once(st, pass.clone(), renewed.pairing_challenge, notice.cloned()).await;
+        }
+        registered.map_err(|e| {
             eprintln!("native coordinator registration failed: {e}");
             e.native_code()
         })?;
@@ -581,6 +636,7 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
 }
 
 const PAIRING_PENDING: &str = "pairing-registration-pending";
+const RENEW_NOTICE: &str = "The coordinator’s reservation for this Mac ran out before registration finished. LokiSigner can ask for the same slot again. Touch ID will then ask once more, because the new reservation needs its own approval.";
 
 /// True while a native pairing has written its profile but the coordinator never accepted the
 /// registration (for example, the pairing link expired). Such a profile has no recovery words yet.
@@ -707,7 +763,7 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
                     RESTORE_RETRY.to_owned()
                 } else if st.config.native {
                     let reason = match e.native_code() {
-                        "registration-refused" => "The coordinator refused to register this device.",
+                        "registration-refused" | "registration-expired" => "The coordinator refused to register this device.",
                         "registration-failed" => "LokiSigner couldn’t reach the coordinator.",
                         "device-key" => "LokiSigner couldn’t use the device key it needs to connect.",
                         _ => "LokiSigner couldn’t finish connecting to the coordinator.",
@@ -726,6 +782,132 @@ async fn keep_registering(st: Shared, pass: Zeroizing<String>, restored: bool, n
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(std::time::Duration::from_secs(300));
     }
+}
+
+const ADDRESS_INVALID: &str = "Enter the coordinator address, for example loki.megabyte.sh.";
+
+/// What the member typed as the coordinator address, as a plain origin. A bare host means
+/// HTTPS. Paths, queries, fragments and credentials are refused, and so is HTTP except on
+/// loopback with `--development-http`, as for a pairing link's origin.
+pub(super) fn coordinator_address(typed: &str, development_http: bool) -> Result<String, String> {
+    let typed = typed.trim();
+    if typed.is_empty() || typed.len() > 253 + 16 || typed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(ADDRESS_INVALID.into());
+    }
+    // Check the authority as typed, before URL parsing normalises a path like `/x/..` to `/`.
+    let (scheme, rest) = match typed.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") => (scheme, rest),
+        Some(_) => return Err(ADDRESS_INVALID.into()),
+        None => ("https", typed),
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() || authority.contains(['/', '\\', '?', '#', '@', '%']) {
+        return Err(ADDRESS_INVALID.into());
+    }
+    let url = reqwest::Url::parse(&format!("{}://{authority}", scheme.to_ascii_lowercase())).map_err(|_| ADDRESS_INVALID)?;
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some()
+        || !url.username().is_empty() || url.password().is_some() || url.host_str().is_none_or(str::is_empty) {
+        return Err(ADDRESS_INVALID.into());
+    }
+    plain_origin(&url.origin().ascii_serialization(), development_http).map_err(|_| ADDRESS_INVALID.into())
+}
+
+/// Ask `origin` for a `loki://pair` link: for `slot` again (a profile whose registration never
+/// finished), or for the lowest free slot. The link must name this origin, the slot the coordinator
+/// reserved (the asked-for one, if any) and a fresh challenge. A refusal maps to a fixed reason;
+/// the coordinator's text and the challenge are never logged.
+pub(super) async fn request_pairing_link(origin: &str, slot: Option<u32>, development_http: bool) -> Result<String, PairingRefusal> {
+    #[derive(Deserialize)]
+    struct Reply { slot: u32, url: String }
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(15)).build().map_err(|_| PairingRefusal::Unreachable)?;
+    let body = slot.map_or_else(|| serde_json::json!({}), |slot| serde_json::json!({ "slot": slot }));
+    let mut response = client.post(format!("{origin}/api/members/pairing")).json(&body).send().await
+        .map_err(|_| PairingRefusal::Unreachable)?;
+    let status = response.status();
+    if !status.is_success() {
+        // The body only refines the reason; a large or unreadable one (a proxy's error page)
+        // still leaves the status, so a proxy's 429 reads as a rate limit, not an outage.
+        let body = read_bounded(&mut response, 2048).await.ok();
+        let json = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
+        return Err(match json.as_ref().and_then(|json| json["error"].as_str()) {
+            Some(SIGNUP_LIMIT | IP_LIMIT) => PairingRefusal::RateLimited,
+            Some("no free slot (1..16)" | "too many pending registrations") => PairingRefusal::SlotsFull,
+            Some("slot already registered or reserved") => PairingRefusal::SlotHeld,
+            _ if status == reqwest::StatusCode::TOO_MANY_REQUESTS => PairingRefusal::RateLimited,
+            _ if status.is_server_error() => PairingRefusal::Unreachable,
+            _ => PairingRefusal::Other,
+        });
+    }
+    let body = read_bounded(&mut response, 2048).await.map_err(|_| PairingRefusal::Unreachable)?;
+    let reply: Reply = serde_json::from_slice(&body).map_err(|_| PairingRefusal::Other)?;
+    let link = RegistrationConfig::pairing(&reply.url, development_http).map_err(|_| PairingRefusal::Other)?;
+    if link.coordinator != origin || link.slot != Some(reply.slot) || slot.is_some_and(|slot| slot != reply.slot) {
+        return Err(PairingRefusal::Other);
+    }
+    Ok(reply.url)
+}
+
+/// Whether a held `slot` is confirmed registered to another identity on the public roster
+/// (`SlotRegistered`), or may be a temporary reservation that will expire (`SlotHeld`). Only a
+/// confirmed conflict justifies telling the member to remove this profile.
+async fn slot_conflict(st: &Shared, pass: &Zeroizing<String>, origin: &str, slot: u32) -> PairingRefusal {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Roster { slots: Vec<PublicMember> }
+    let (data, secret) = (st.config.data.clone(), pass.clone());
+    let own = tokio::task::spawn_blocking(move || super::ceremony::identity(&data, &secret, 1).map(|identity| hex::encode(identity.public().signing))).await;
+    let Ok(Ok(own)) = own else { return PairingRefusal::SlotHeld };
+    let roster = async {
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15)).build().ok()?;
+        let mut response = client.get(format!("{origin}/api/members")).send().await.ok()?;
+        if !response.status().is_success() { return None; }
+        serde_json::from_slice::<Roster>(&read_bounded(&mut response, 32 * 1024).await.ok()?).ok()
+    }.await;
+    // Removal advice needs one unambiguous, well-formed row for this slot naming another identity,
+    // and this identity on no row. Anything else may be a hold or a faulty roster: retryable.
+    let Some(roster) = roster else { return PairingRefusal::SlotHeld };
+    let key = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let rows: Vec<_> = roster.slots.iter().filter(|m| m.slot == slot).collect();
+    let mine = roster.slots.iter().any(|m| m.signing_pubkey.eq_ignore_ascii_case(&own));
+    match rows.as_slice() {
+        [row] if !mine && key(&row.signing_pubkey) && key(&row.relay_pubkey) && row.signing_pubkey != own => PairingRefusal::SlotRegistered,
+        _ => PairingRefusal::SlotHeld,
+    }
+}
+
+/// What pairing by address should do next.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) enum AddressPairing {
+    /// A fresh profile: run the usual review with this `loki://pair` link.
+    Link(String),
+    /// The profile is already pinned to this coordinator (for example its registration never
+    /// finished, or finished but the reply was lost): unlock it and register without a claim,
+    /// proving the identity's keys. Only if that expires is a new reservation requested.
+    Resume,
+}
+
+/// The native app's "pair by address". A pinned profile never asks for a reservation up front:
+/// its own slot may already be registered to it, which a new reservation could never free.
+/// `args` carry the locked canonical `--data`.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) fn request_pairing(args: &[String], typed: &str) -> Result<AddressPairing, String> {
+    use super::{diagnostics::Event, native_member::emit};
+    let config = super::native_config_from_args(args)?;
+    let development_http = config.development_http;
+    let origin = coordinator_address(typed, development_http)?;
+    if config.data.join("paired-coordinator.json").try_exists().map_err(|_| "LokiSigner could not access its profile.")? {
+        let saved = RegistrationConfig::resume(&config.data, development_http).map_err(|_| "LokiSigner could not open its existing profile.")?;
+        return if saved.coordinator == origin { Ok(AddressPairing::Resume) } else { Err("different-pairing".into()) };
+    }
+    emit(Event::PairingRequested);
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    runtime.block_on(request_pairing_link(&origin, None, development_http)).map(AddressPairing::Link).map_err(|reason| {
+        emit(Event::PairingRefused(reason));
+        reason.message().to_owned()
+    })
 }
 
 pub(super) fn save_coordinator(data: &std::path::Path, origin: &str, slot: u32) -> Result<(), String> {
@@ -753,14 +935,14 @@ mod tests {
         for (text, reason) in [
             ("unknown, expired or changed pairing challenge", Refusal::ExpiredChallenge),
             ("unknown, expired or changed registration challenge", Refusal::ExpiredChallenge),
-            ("a valid onboarding grant is required", Refusal::GrantRequired),
-            ("onboarding grant already used", Refusal::GrantUsed),
+            (SIGNUP_LIMIT, Refusal::RateLimited),
+            (IP_LIMIT, Refusal::RateLimited),
             ("slot already registered or reserved", Refusal::SlotTaken),
             ("registered identity cannot change slot", Refusal::WrongSlot),
         ] {
             assert_eq!(Refusal::from_coordinator(Some(text)), reason, "{text}");
         }
-        for other in [None, Some(""), Some("a valid onboarding grant is required\u{202e}"), Some("A VALID ONBOARDING GRANT IS REQUIRED")] {
+        for other in [None, Some(""), Some("slot already registered or reserved\u{202e}"), Some("SLOT ALREADY REGISTERED OR RESERVED")] {
             assert_eq!(Refusal::from_coordinator(other), Refusal::Other, "{other:?}");
         }
     }

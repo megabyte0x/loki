@@ -71,8 +71,8 @@ and keep the default `FROSTD_URL`:
 ssh -N -L 2744:localhost:2744 your-frostd-host   # then run selfcustody-testnet.sh
 ```
 
-One member app on its own (for first enrollment, set `LOKI_ONBOARDING_GRANT` to
-an [operator-issued grant](../../web/wallet/README.md#onboarding-grants) pinned to slot 1):
+One member app on its own. The coordinator admits new members without an operator step,
+within its [admission rate limits](../../web/wallet/README.md#admission-and-rate-limits):
 
 ```sh
 core/target/release/loki_member_app --data /absolute/member-1 --port 3601 \
@@ -252,9 +252,9 @@ or share the link; the fragment authorizes the local API for the member process'
 If recovery is not set up, use the wallet to set it up and save the words privately.
 
 It self-registers to the coordinator URL (slot = 2nd arg), using `software` device storage.
-For first enrollment, set `LOKI_ONBOARDING_GRANT` to a grant pinned to that slot, or
-use `join-loki.sh <https-coordinator-url> [slot]` with the grant to reserve an eligible slot
-before launch. Existing members can restart with `run-member.sh` without a grant.
+For first enrollment, use `join-loki.sh <https-coordinator-url> [slot]` to reserve a free
+slot before launch (no operator grant is needed), or let `run-member.sh` ask for that slot
+directly. Existing members restart with `run-member.sh`.
 The wrapper advertises an HTTPS tunnel to the ceremony-only listener on
 `127.0.0.1:$PEER_PORT` (default `4610 + slot`). Only enrollment, roster, agreement
 and session peer requests reach that listener; the full member API on `PORT` stays private.
