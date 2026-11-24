@@ -9,6 +9,23 @@ pub(super) use super::registration::Refusal;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DraftRefusal { WaitingForConfirmations, NoSingleNote, InsufficientFunds, Other }
 
+/// Why the coordinator gave no pairing link for a typed address, without its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairingRefusal { RateLimited, SlotsFull, SlotTaken, Unreachable, Other }
+
+impl PairingRefusal {
+    /// What the member sees. Fixed wording; never the coordinator's.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::RateLimited => "The coordinator is limiting new pairings right now. Try again later.",
+            Self::SlotsFull => "The coordinator has no free member slot right now. Try again later, or ask whoever runs it.",
+            Self::SlotTaken => "This Mac’s member slot is still reserved or already taken. Wait two minutes and try again, or remove this profile and pair again.",
+            Self::Unreachable => "LokiSigner couldn’t reach the coordinator. Check the address and your connection, then try again.",
+            Self::Other => "The coordinator didn’t give this Mac a pairing link. Try again, or ask whoever runs it.",
+        }
+    }
+}
+
 /// Why a signing attempt ended, without any peer or coordinator text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PaymentFailure { ApprovalTimeout, Refused, ShareDeadline, Other }
@@ -37,6 +54,11 @@ pub(super) enum Event {
     WitnessChangeKept,
     /// The member approved the new pair with Touch ID.
     WitnessChangeTrusted,
+    /// The member typed a coordinator address; LokiSigner asked it for a pairing link.
+    PairingRequested,
+    PairingRefused(PairingRefusal),
+    /// The pairing link expired before registration finished; LokiSigner asked for a new one once.
+    ChallengeRenewed,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,9 +79,8 @@ impl Event {
             Event::RegistrationFailed => ("LokiSigner couldn’t register with the coordinator.", Kind::Error),
             Event::CoordinatorUnavailable => ("LokiSigner couldn’t reach the coordinator. Check your connection.", Kind::Error),
             Event::RegistrationRefused(reason) => (match reason {
-                Refusal::ExpiredChallenge => "The coordinator refused to register this device: the pairing link expired, was already used or changed. Paste a new pairing link.",
-                Refusal::GrantRequired => "The coordinator refused to register this device: it needs a valid onboarding grant. The pairing link has probably expired; paste a new one.",
-                Refusal::GrantUsed => "The coordinator refused to register this device: its onboarding grant was already used.",
+                Refusal::ExpiredChallenge => "The coordinator refused to register this device: the pairing link expired, was already used or changed. Pair again with the coordinator address.",
+                Refusal::RateLimited => "The coordinator refused to register this device: it has reached its sign-up or request limit. Try again later.",
                 Refusal::SlotTaken => "The coordinator refused to register this device: that member slot is already registered or reserved.",
                 Refusal::WrongSlot => "The coordinator refused to register this device: this identity is registered to a different slot.",
                 Refusal::Other => "The coordinator refused to register this device.",
@@ -87,6 +108,15 @@ impl Event {
             Event::WitnessChangeNoticed => ("The coordinator changed its nonce witnesses. LokiSigner keeps using the saved ones until you approve the change.", Kind::Info),
             Event::WitnessChangeKept => ("You kept the current nonce witnesses.", Kind::Info),
             Event::WitnessChangeTrusted => ("You approved the coordinator's new nonce witnesses with Touch ID.", Kind::Info),
+            Event::PairingRequested => ("Asked the coordinator for a pairing link.", Kind::Info),
+            Event::PairingRefused(reason) => (match reason {
+                PairingRefusal::RateLimited => "Pairing refused: the coordinator is rate limiting new pairings.",
+                PairingRefusal::SlotsFull => "Pairing refused: the coordinator has no free member slot.",
+                PairingRefusal::SlotTaken => "Pairing refused: this profile’s member slot is reserved or taken.",
+                PairingRefusal::Unreachable => "Pairing failed: LokiSigner couldn’t reach the coordinator.",
+                PairingRefusal::Other => "Pairing refused by the coordinator.",
+            }, Kind::Error),
+            Event::ChallengeRenewed => ("The pairing link expired before registration finished; LokiSigner asked the coordinator for a new one.", Kind::Info),
         }
     }
 
@@ -110,12 +140,16 @@ mod tests {
             Event::Registered, Event::RegistrationFailed, Event::CoordinatorUnavailable, Event::RegistrationKeyUnavailable,
             Event::RelayUnavailable, Event::RelayReachable, Event::WalletSyncFailed, Event::WalletSynced,
             Event::PaymentApproved, Event::PaymentRefused, Event::PaymentSigned,
+            Event::PairingRequested, Event::ChallengeRenewed,
         ];
-        for reason in [Refusal::ExpiredChallenge, Refusal::GrantRequired, Refusal::GrantUsed, Refusal::SlotTaken, Refusal::WrongSlot, Refusal::Other] {
+        for reason in [Refusal::ExpiredChallenge, Refusal::RateLimited, Refusal::SlotTaken, Refusal::WrongSlot, Refusal::Other] {
             events.push(Event::RegistrationRefused(reason));
         }
         for reason in [DraftRefusal::WaitingForConfirmations, DraftRefusal::NoSingleNote, DraftRefusal::InsufficientFunds, DraftRefusal::Other] {
             events.push(Event::DraftRefused(reason));
+        }
+        for reason in [PairingRefusal::RateLimited, PairingRefusal::SlotsFull, PairingRefusal::SlotTaken, PairingRefusal::Unreachable, PairingRefusal::Other] {
+            events.push(Event::PairingRefused(reason));
         }
         for reason in [PaymentFailure::ApprovalTimeout, PaymentFailure::Refused, PaymentFailure::ShareDeadline, PaymentFailure::Other] {
             events.push(Event::PaymentFailed(reason));

@@ -21,6 +21,9 @@ func loki_member_app_disconnect_wallet_tabs()
 @_silgen_name("loki_member_app_pairing_target")
 func loki_member_app_pairing_target(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
+@_silgen_name("loki_member_app_request_pairing")
+func loki_member_app_request_pairing(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
 @_silgen_name("loki_member_app_configuration")
 func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
@@ -789,6 +792,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var retryLink: String?
     private var queuedLink: String?
     private var attemptedPairingClaims: Set<String> = []
+    /// Pairing links LokiSigner fetched from a typed coordinator address (see `requestPairing`).
+    private var addressLinks: Set<String> = []
     private var startingOver = false
     private var recoveringKey = false
     private var discardingPending = false
@@ -982,14 +987,37 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         start(nil)
     }
 
-    func pairWallet(link: String) {
+    /// Pair from what the member entered: a coordinator address (`loki.megabyte.sh`), or a
+    /// pasted `loki://pair` link, which works as before.
+    func pairWallet(link input: String) {
         guard !running else { finishWalletOperation(.differentPairing); return }
         prompting = true
         let state = startupProfile()
         guard let profile = state["profile"] as? String else { retry(.dataFolderUnavailable, link: nil); return }
         if profile == "fresh", !canSetUp() { return }
-        guard let link = unusedPairingLink(link) else { finishWalletOperation(.invalidLink); return }
+        guard input.lowercased().hasPrefix("loki:") else { requestPairing(address: input); return }
+        guard let link = unusedPairingLink(input) else { finishWalletOperation(.invalidLink); return }
         loadConfiguration(link: link)
+    }
+
+    /// Rust asks the typed coordinator for a pairing link (for this profile's saved slot, if it
+    /// has one) and checks it. The link then goes through the usual review: coordinator and
+    /// slot, configuration, passphrase and Touch ID.
+    private func requestPairing(address: String) {
+        let launch: [String: Any] = ["args": args, "coordinator": address]
+        DispatchQueue.global(qos: .userInitiated).async {
+            let reply = nativeQuery(loki_member_app_request_pairing, launch)
+            DispatchQueue.main.async {
+                guard let link = reply["link"] as? String, let checked = self.unusedPairingLink(link) else {
+                    let error = reply["error"] as? String
+                    self.retry(error == "different-pairing" ? .differentPairing
+                        : .pairingRefused(error ?? SignerStartFailure.unexpected.message), link: nil)
+                    return
+                }
+                self.addressLinks.insert(checked)
+                self.loadConfiguration(link: checked)
+            }
+        }
     }
 
     func restoreWallet() {
@@ -1087,7 +1115,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         let r = SignerReview.self
         presentPrompt(SignerReview(section: "Pairing", title: "Remove this unregistered profile?",
             intro: "The coordinator never accepted this Mac’s registration, so this profile has no recovery words or vaults yet.",
-            content: [r.info("Nothing is deleted", "LokiSigner renames the local data folder and returns to Pair this Mac. Pair again with a new link from the wallet.")],
+            content: [r.info("Nothing is deleted", "LokiSigner renames the local data folder and returns to Pair this Mac. Pair again with the coordinator address.")],
             hint: "Cancel keeps this profile.", actions: ["Cancel", "Remove and pair again"], primary: 1, destructive: true)) { answer in
             guard answer == .alertSecondButtonReturn else { self.finishWalletOperation(.cancelled); return }
             self.discardingPending = true
@@ -1629,6 +1657,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         var confirmed = launch
         confirmed["config"] = config
         if embedded { confirmed["embedded"] = true }
+        // A link from a typed address can be renewed once if it expires before registration ends.
+        if let link, addressLinks.contains(link) { confirmed["renew_pairing"] = true }
         guard let json = try? JSONSerialization.data(withJSONObject: confirmed), let request = String(data: json, encoding: .utf8) else {
             password.stringValue = ""
             retry(.unexpected, link: link)
@@ -1655,6 +1685,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 case 10: failure = .cancelled
                 case 11: failure = .witnessesNotSaved
                 case 13: failure = .witnessesSaveUncertain
+                case 14: failure = .registrationExpired
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil

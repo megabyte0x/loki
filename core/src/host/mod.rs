@@ -46,7 +46,7 @@ pub use state::Config;
 pub(crate) use connect::{ConnectAttempt, LocalConnect};
 pub use registration::RegistrationConfig;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use registration::pairing_pending;
+pub(crate) use registration::{pairing_pending, request_pairing};
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_config::SAVED_UNSYNCED as NATIVE_SAVED_UNSYNCED;

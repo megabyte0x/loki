@@ -10,6 +10,7 @@ enum SignerStartFailure: Error, Equatable {
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
     case notFresh, dataFolderUnavailable, protectedProfile, setAsideFailed
     case key(String), keyGone(String), registrationRosterUnavailable, testnetOnly
+    case registrationExpired, pairingRefused(String)
 
     var keyIsGone: Bool {
         if case .keyGone = self { return true }
@@ -19,7 +20,7 @@ enum SignerStartFailure: Error, Equatable {
     var message: String {
         switch self {
         case .cancelled: return "You cancelled. Try again to continue setting up or unlocking LokiSigner."
-        case .pairingLinkNeeded: return "Open a pairing link from the wallet, then try again."
+        case .pairingLinkNeeded: return "Enter the coordinator address in LokiSigner, or open a pairing link from the wallet, then try again."
         case .invalidLink: return "This pairing link isn’t valid. Get a new link from the wallet and open it in LokiSigner."
         case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
         case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
@@ -32,7 +33,9 @@ enum SignerStartFailure: Error, Equatable {
         case .emptyPassphrase: return "Enter your local profile passphrase and try again."
         case .unlock: return "LokiSigner couldn’t unlock this profile. Check your passphrase and try again."
         case .deviceKey: return "This Mac couldn’t use the device key LokiSigner needs to connect. Try again, or set aside the profile if it has no vaults."
-        case .registrationRefused: return "The coordinator refused this pairing. If the pairing link expired, paste a new link for the same slot. If the slot has gone to another member, ask the coordinator for a new pairing link."
+        case .registrationRefused: return "The coordinator refused this pairing. Enter the coordinator address to try the same slot again. If the slot has gone to another member, remove this profile and pair again."
+        case .registrationExpired: return "The pairing expired before this Mac finished registering. Enter the coordinator address again; LokiSigner asks for the same slot."
+        case .pairingRefused(let message): return message
         case .registrationFailed: return "LokiSigner couldn’t finish connecting to the coordinator. Check your connection and try again."
         case .registrationRosterUnavailable: return "LokiSigner couldn’t reach the coordinator. Check your connection, then try again."
         case .key(let message), .keyGone(let message): return message

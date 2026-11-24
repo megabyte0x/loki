@@ -386,6 +386,32 @@ pub unsafe extern "C" fn loki_member_app_pairing_target(launch: *const std::ffi:
     })
 }
 
+/// Pair by typing the coordinator address. `launch` is `{"args": [...], "coordinator": "..."}`,
+/// where `coordinator` is what the member typed (`loki.megabyte.sh` or an HTTPS origin).
+/// LokiSigner asks that coordinator for a `loki://pair` link, for this profile's saved slot when
+/// it is already pinned there, and checks the link names the same origin and the slot reserved.
+/// Returns `{"link": "loki://pair?..."}` for [`loki_member_app_pairing_target`] and the usual
+/// pairing flow, or `{"error": "..."}` in fixed words (`different-pairing` when the profile is
+/// pinned elsewhere). Call from a worker: it contacts the coordinator. Free it with
+/// [`loki_member_app_free`].
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_request_pairing(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request { args: Vec<String>, coordinator: String }
+    native_query_as(launch, |request: Request| {
+        crate::host::config_from_args(&request.args)?;
+        // Profile reads use the locked canonical path.
+        let args = crate::host::native_locked_args(&request.args)?;
+        let link = crate::host::request_pairing(&args, &request.coordinator)?;
+        Ok(serde_json::json!({ "link": link }))
+    })
+}
+
 /// Execute an allowlisted wallet request. `export` permits only the native backup save path.
 ///
 /// # Safety
@@ -651,6 +677,8 @@ pub unsafe extern "C" fn loki_member_app_pair(
             config: crate::host::NativeConfig,
             witness_confirmation: Option<String>,
             #[serde(default)] embedded: bool,
+            /// The link came from a typed coordinator address: renew it once if it expires.
+            #[serde(default)] renew_pairing: bool,
         }
         let mut launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         crate::host::native_config_from_args(&launch.args)?;
@@ -668,6 +696,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             Some(link) => {
                 let mut registration = crate::host::RegistrationConfig::pairing(&link, config.development_http)?;
                 if let Some(name) = launch.profile_name { registration.name = name; }
+                registration.renew_pairing = launch.renew_pairing;
                 registration
             }
             None => crate::host::RegistrationConfig::resume(&config.data, config.development_http)?,
@@ -694,6 +723,7 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "signer-config-not-saved" => 11,
             "profile-in-use" => 12,
             "signer-config-unsynced" => 13,
+            "registration-expired" => 14,
             _ => 1,
         },
         Err(_) => 2,

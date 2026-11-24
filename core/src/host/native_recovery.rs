@@ -332,7 +332,7 @@ pub(crate) fn restore_new(
         Ok(())
     })?;
     config.registration = Some(RegistrationConfig {
-        coordinator: origin, slot: Some(slot), passphrase_file: None, name: name.into(), pairing_challenge: None,
+        coordinator: origin, slot: Some(slot), passphrase_file: None, name: name.into(), pairing_challenge: None, renew_pairing: false,
     });
     Ok(())
 }
