@@ -438,7 +438,12 @@ fn run_local_with<G>(
         let serve = async {
             let ready = registration::start(&state, pass, notice.as_ref()).await?;
             if state.config.native {
-                if let Some(notice) = notice { notice(ready, ""); }
+                if let Some(notice) = notice {
+                    notice(ready, "");
+                    // Once per unlock, in the background: has the coordinator changed its witnesses?
+                    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+                    tokio::spawn(native_config::watch_witnesses(state.clone(), notice));
+                }
             } else if let Some(notice) = notice {
                 notice(ready, &format!("http://{addr}/#{}", state.config.token));
             } else if pairing_stdout {

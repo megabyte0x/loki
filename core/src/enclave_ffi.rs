@@ -252,6 +252,15 @@ unsafe fn native_query(
     launch: *const std::ffi::c_char,
     query: impl FnOnce(NativeLaunch) -> Result<serde_json::Value, String>,
 ) -> *mut std::ffi::c_char {
+    native_query_as(launch, query)
+}
+
+/// [`native_query`] for a launch JSON of another shape.
+#[cfg(feature = "relay-communication")]
+unsafe fn native_query_as<T: serde::de::DeserializeOwned>(
+    launch: *const std::ffi::c_char,
+    query: impl FnOnce(T) -> Result<serde_json::Value, String>,
+) -> *mut std::ffi::c_char {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if launch.is_null() { return Err("missing native launch".to_string()); }
         let launch = std::ffi::CStr::from_ptr(launch).to_str().map_err(|_| "invalid native launch")?;
@@ -385,6 +394,33 @@ pub unsafe extern "C" fn loki_member_app_configuration(launch: *const std::ffi::
         };
         Ok(serde_json::json!({ "config": config }))
     })
+}
+
+/// The member approved, with Touch ID, the nonce-witness pair a `witness-change` notice offered.
+/// `launch` is `{"args": [...], "offered_fingerprint": "<hex>"}`. LokiSigner asks the paired
+/// coordinator again and saves its pair only if it is still the offered one; the next unlock
+/// uses it. Returns `{"trusted": true}` or `{"error": "..."}`; free it with
+/// [`loki_member_app_free`]. Call from a worker: it contacts the coordinator.
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_trust_witnesses(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Trust { args: Vec<String>, offered_fingerprint: String }
+    native_query_as(launch, |trust: Trust| {
+        crate::host::NativeConfig::trust_witnesses(&trust.args, &trust.offered_fingerprint)?;
+        Ok(serde_json::json!({ "trusted": true }))
+    })
+}
+
+/// The member kept the current nonce witnesses after a change. Nothing changes; it is logged.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_keep_witnesses() {
+    crate::host::NativeConfig::keep_witnesses();
 }
 
 /// Lists active vault receive addresses for the running native member, as `{"vaults": [...]}`

@@ -78,12 +78,23 @@ pub struct NativeConfig {
     /// Include the full selected pair in the preview/apply comparison, not just its endpoints.
     witness_config: [WitnessConfig; 2],
     pub witness_fingerprint: String,
-    pub confirm_witness_fingerprint: bool,
+    /// Set only when a saved, approved pair differs from this one. The first pair is trusted
+    /// on first use; a change needs the member's approval (Touch ID) before it is used or saved.
+    pub witness_change: Option<WitnessChange>,
     /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
     /// Whether the approved configuration is saved once the profile unlocks: not when a launch
     /// flag overrides any field, because the member was then shown something else.
     pub save: bool,
+}
+
+/// A nonce-witness pair change, as two pair fingerprints in hex: the saved, approved pair and
+/// the one the coordinator now serves.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WitnessChange {
+    pub saved: String,
+    pub offered: String,
 }
 
 /// The configuration approved for this launch. Witnesses are used from memory, including when
@@ -93,6 +104,10 @@ pub struct FetchedConfig {
     origin: String,
     deployment: Deployment,
     save: bool,
+    /// The witnesses came from the coordinator, not a `--nonce-witnesses` flag, so a later
+    /// change on the coordinator is worth telling the member about.
+    #[cfg_attr(not(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")), allow(dead_code))]
+    watch: bool,
 }
 
 impl FetchedConfig {
@@ -146,7 +161,7 @@ impl NativeConfig {
         let origin = Self::recovery_origin(args, origin)?;
         let deployment = self.fetched.clone().ok_or("missing restored profile configuration")?;
         let resolved = Self::resolve_restore(args, origin, deployment)?;
-        self.apply_resolved(config, resolved)
+        self.apply_resolved(config, resolved, args)
     }
 
     /// The coordinator and slot a pairing link names, checked without any network request, for
@@ -162,10 +177,10 @@ impl NativeConfig {
     pub fn apply(self, config: &mut Config, args: &[String], pairing_url: Option<&str>) -> Result<Option<FetchedConfig>, String> {
         let shown = self.fetched.clone();
         let resolved = Self::resolve(args, pairing_url, |_| shown.ok_or_else(|| "the confirmed configuration is missing".to_string()))?;
-        self.apply_resolved(config, resolved)
+        self.apply_resolved(config, resolved, args)
     }
 
-    fn apply_resolved(self, config: &mut Config, resolved: Self) -> Result<Option<FetchedConfig>, String> {
+    fn apply_resolved(self, config: &mut Config, resolved: Self, args: &[String]) -> Result<Option<FetchedConfig>, String> {
         if resolved != self {
             return Err("the configuration changed after it was shown; open LokiSigner again".into());
         }
@@ -177,17 +192,64 @@ impl NativeConfig {
         config.network = deployment.network.clone();
         config.frostd_url = deployment.frostd_url.clone();
         config.lightwalletd = deployment.lightwalletd_url.clone();
-        Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save }))
+        let watch = value(args, "--nonce-witnesses").is_none();
+        Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save, watch }))
     }
 
+    /// A first pairing, an unchanged pair or a `--nonce-witnesses` override needs nothing. A
+    /// changed pair needs `confirmation`: the offered fingerprint, which LokiSigner sends only
+    /// after the member approved the change with Touch ID.
     #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
     pub(crate) fn verify_witness_confirmation(&self, confirmation: Option<&str>) -> Result<(), String> {
-        if self.confirm_witness_fingerprint
-            && !confirmation.is_some_and(|code| code.eq_ignore_ascii_case(&self.witness_fingerprint))
+        let Some(change) = &self.witness_change else { return Ok(()) };
+        if change.offered != self.witness_fingerprint
+            || !confirmation.is_some_and(|code| code.eq_ignore_ascii_case(&change.offered))
         {
-            return Err("the independently verified nonce witness fingerprint does not match".into());
+            return Err("the new nonce witnesses were not approved".into());
         }
+        eprintln!("[verbose] nonce witnesses: member trusted the new pair {} (was {})", short(&change.offered), short(&change.saved));
+        super::native_member::emit(super::diagnostics::Event::WitnessChangeTrusted);
         Ok(())
+    }
+
+    /// The member approved, with Touch ID, the pair a `witness-change` notice offered while the
+    /// signer ran. Fetch the paired coordinator's configuration again and save its witness pair
+    /// only if it is still exactly that pair. The other saved endpoints stay as they are. The
+    /// running signer keeps its pair; the next unlock uses the new one.
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn trust_witnesses(args: &[String], offered: &str) -> Result<(), String> {
+        if OVERRIDES.iter().any(|name| value(args, name).is_some()) {
+            return Err("launch flags override this configuration, so LokiSigner saved nothing".into());
+        }
+        let config = super::native_config_from_args(args)?;
+        let (data, development_http) = (&config.data, config.development_http);
+        let (coordinator, _) = paired_coordinator(data, development_http)?.ok_or("this signer is not paired yet")?;
+        let saved = load(data, development_http)?;
+        if let Some(saved) = saved.as_ref().filter(|saved| saved.origin != coordinator) {
+            return Err(format!("the saved configuration belongs to {}, not {coordinator}", saved.origin));
+        }
+        let served = fetch(&coordinator)?;
+        served.check(development_http).map_err(|e| format!("signer configuration from {coordinator}: {e}"))?;
+        let fingerprint = nonce_witness::fingerprint(&served.nonce_witnesses);
+        if !fingerprint.eq_ignore_ascii_case(offered) {
+            eprintln!("[verbose] nonce witnesses: the coordinator now serves {}, not the approved {}", short(&fingerprint), short(offered));
+            return Err("the coordinator changed its nonce witnesses again. LokiSigner saved nothing; check with the coordinator's operator".into());
+        }
+        let deployment = match saved.and_then(|saved| saved.deployment) {
+            Some(saved) => Deployment { nonce_witnesses: served.nonce_witnesses, ..saved },
+            None => served,
+        };
+        save(data, &coordinator, &deployment)?;
+        eprintln!("[verbose] nonce witnesses: member trusted the new pair {}; it applies at the next unlock", short(&fingerprint));
+        super::native_member::emit(super::diagnostics::Event::WitnessChangeTrusted);
+        Ok(())
+    }
+
+    /// The member kept the current pair. Nothing changes; only the log records it.
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn keep_witnesses() {
+        eprintln!("[verbose] nonce witnesses: member kept the current pair");
+        super::native_member::emit(super::diagnostics::Event::WitnessChangeKept);
     }
 
     /// The pairing link's coordinator and slot, or the paired ones for an unlock. A link for a
@@ -263,8 +325,12 @@ impl NativeConfig {
         let (coordinator, slot) = target.ok_or("this signer is not paired yet: open a pairing link from the wallet")?;
         let witness_config = witness_config.expect("missing configuration fields were checked");
         let witness_fingerprint = nonce_witness::fingerprint(&witness_config);
-        let confirm_witness_fingerprint = flag("--nonce-witnesses").is_none()
-            && approved_fingerprint != Some(witness_fingerprint.as_str());
+        // Trust on first use: with nothing approved yet, the coordinator's pair is saved as is.
+        // An explicit `--nonce-witnesses` file is the member's own choice and never prompts.
+        let witness_change = approved_fingerprint
+            .filter(|saved| flag("--nonce-witnesses").is_none() && *saved != witness_fingerprint)
+            .map(|saved| WitnessChange { saved: saved.into(), offered: witness_fingerprint.clone() });
+        let unsaved = approved_fingerprint != Some(witness_fingerprint.as_str());
         Ok(Self {
             coordinator, slot,
             network: network.unwrap_or_default(),
@@ -273,8 +339,8 @@ impl NativeConfig {
             nonce_witnesses: witness_config.each_ref().map(|w| w.endpoint.clone()),
             witness_config,
             witness_fingerprint,
-            confirm_witness_fingerprint,
-            save: (fetched.is_some() || confirm_witness_fingerprint) && OVERRIDES.iter().all(|name| flag(name).is_none()),
+            witness_change,
+            save: (fetched.is_some() || unsaved) && OVERRIDES.iter().all(|name| flag(name).is_none()),
             fetched,
         })
     }
@@ -389,13 +455,53 @@ fn write_private(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// After a native unlock, ask the paired coordinator once for its current witness pair. If it
+/// differs from the pair this launch signs with, tell LokiSigner (`witness-change`) so the
+/// member can approve or keep it. Never blocks unlock or signing, never switches the running
+/// pair, and a failed fetch only reaches the verbose log.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(super) async fn watch_witnesses(st: super::state::Shared, notice: super::LocalNotice) {
+    let Some(running) = st.fetched_config.as_ref().filter(|fetched| fetched.watch) else { return };
+    let current = nonce_witness::fingerprint(&running.deployment.nonce_witnesses);
+    let served = match fetch_async(&running.origin).await {
+        Ok(served) => served,
+        Err(e) => { eprintln!("[verbose] nonce witnesses: could not check the coordinator: {e}"); return; }
+    };
+    if let Err(e) = served.check(st.config.development_http) {
+        eprintln!("[verbose] nonce witnesses: the coordinator's configuration is invalid: {e}");
+        return;
+    }
+    let offered = nonce_witness::fingerprint(&served.nonce_witnesses);
+    if offered == current {
+        eprintln!("[verbose] nonce witnesses: unchanged ({})", short(&current));
+        return;
+    }
+    if st.is_stopping() { return; }
+    eprintln!("[verbose] nonce witnesses: the coordinator now serves {} instead of {}", short(&offered), short(&current));
+    native_event!(&st, Event::WitnessChangeNoticed);
+    notice("witness-change", &serde_json::json!({ "saved": current, "offered": offered }).to_string());
+}
+
+/// A pair fingerprint's first and last 8 hex characters, for the verbose log.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+fn short(fingerprint: &str) -> String {
+    match (fingerprint.get(..8), fingerprint.get(fingerprint.len().saturating_sub(8)..)) {
+        (Some(head), Some(tail)) if fingerprint.len() > 16 => format!("{head}…{tail}"),
+        _ => fingerprint.to_owned(),
+    }
+}
+
 /// `GET <origin>/api/signer-config`, following no redirect, with a timeout and a size limit.
 /// The caller checks what it returns. Errors name only the origin and the HTTP status: the
 /// reply's own text never reaches the member.
 fn fetch(origin: &str) -> Result<Deployment, String> {
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-    runtime.block_on(async {
+    runtime.block_on(fetch_async(origin))
+}
+
+async fn fetch_async(origin: &str) -> Result<Deployment, String> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
         let failed = |e: reqwest::Error| if e.is_timeout() { format!("{origin} did not answer in time") } else { format!("could not reach {origin}") };
@@ -410,7 +516,7 @@ fn fetch(origin: &str) -> Result<Deployment, String> {
             return Err(format!("{origin} did not serve a signer configuration (HTTP {})", status.as_u16()));
         }
         serde_json::from_slice(&body).map_err(|_| format!("invalid signer configuration from {origin}"))
-    })
+    }
 }
 
 #[cfg(test)]

@@ -207,7 +207,7 @@ pub(crate) fn set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
     DIAGNOSTICS.lock().unwrap().sink = Some(sink);
 }
 
-fn emit(event: Event) {
+pub(super) fn emit(event: Event) {
     DIAGNOSTICS.lock().unwrap().record(event);
 }
 
