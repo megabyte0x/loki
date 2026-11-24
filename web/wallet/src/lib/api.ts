@@ -7,7 +7,7 @@
 // A tab paired with a native member routes every member call there; otherwise to the browser
 // signer. Only coordinator calls (/api/members, /api/fund) go to this origin.
 // Explicit .ts extension so Node's test loader resolves the chained import.
-import { signer, ApiError, onboardingGrant, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
+import { signer, ApiError, type CreateSignerOpts, type EnrolledMember, type SignerSession, type UnlockOpts } from "./signer.ts";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
 export { ApiError };
 export type { CustodyMethod, CreateSignerOpts, EnrolledMember, UnlockOpts } from "./signer";
@@ -201,8 +201,9 @@ export class PairingSlotTaken extends Error {}
 const PAIRING_LINK = /^loki:\/\/pair\?[A-Za-z0-9%*._+=&-]+$/;
 const PAIRING_TTL_MS = 120_000;
 const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
-  ["a valid onboarding grant is required", () => "Open the onboarding link from your coordinator operator to pair a new signer."],
-  ["onboarding grant already used", () => "This onboarding link has already been used. Ask your coordinator operator for a new one."],
+  ["This coordinator has reached its sign-up limit", () => "This coordinator has reached its sign-up limit for this hour. Try again later."],
+  ["Too many pairing requests", () => "Too many pairing requests from this network. Wait a minute, then try again."],
+  ["no free slot", () => "All 16 member slots on this coordinator are taken."],
   ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
   ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
   ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
@@ -213,7 +214,7 @@ const PAIRING_REFUSALS: [string, (slot?: number) => string][] = [
 export async function requestPairingLink(slot?: number): Promise<PairingLink> {
   const res = await fetch("/api/members/pairing", {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ slot, onboarding_grant: onboardingGrant() }), cache: "no-store",
+    body: JSON.stringify({ slot }), cache: "no-store",
   });
   const now = Date.now();
   const data = await res.json().catch(() => ({}));

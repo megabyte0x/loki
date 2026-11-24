@@ -1,18 +1,12 @@
 import assert from 'node:assert/strict';
-import { createHash, createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, sign } from 'node:crypto';
+import { createPublicKey, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes, sign } from 'node:crypto';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import * as members from '../src/lib/members.ts';
-import { admitGrant } from './grants.mjs';
 
 const origin = 'http://localhost:3001';
-function grant(slot = null) {
-  const onboarding_grant = randomBytes(32).toString('hex');
-  admitGrant(createHash('sha256').update(onboarding_grant).digest('hex'), slot);
-  return { onboarding_grant };
-}
 function cleanup(dir) {
   rmSync(dir, { recursive: true, force: true });
   delete process.env.LOKI_REGISTRY;
@@ -51,7 +45,6 @@ function expirePending() {
   const file = process.env.LOKI_REGISTRY;
   const snapshot = JSON.parse(readFileSync(file));
   snapshot.challenges = snapshot.challenges.map((c) => ({ ...c, expires: 0 }));
-  for (const use of Object.values(snapshot.grants)) use.retry_after = 0;
   writeFileSync(file, JSON.stringify(snapshot));
 }
 
@@ -61,7 +54,7 @@ test('device self-registration binds identity, endpoint and slot; consumes chall
   try {
     assert.equal(typeof members.issueRegistrationChallenge, 'function', 'device challenge endpoint is required');
     const d = device();
-    const challenge = await members.issueRegistrationChallenge({ ...d.input, ...grant() }, origin);
+    const challenge = await members.issueRegistrationChallenge(d.input, origin);
     const member = await members.registerMember(response(d, challenge), origin);
     assert.deepEqual(Object.keys(member).sort(), ['advertise_url', 'relay_pubkey', 'signing_pubkey', 'slot']);
     assert.equal(member.slot, 1);
@@ -74,7 +67,7 @@ test('device self-registration binds identity, endpoint and slot; consumes chall
     const tampered = await members.issueRegistrationChallenge(d.input, origin);
     await assert.rejects(members.registerMember(response(d, tampered, { advertise_url: 'http://127.0.0.1:3602' }), origin), /registration|challenge/);
     const foreign = device(1);
-    await assert.rejects(members.issueRegistrationChallenge({ ...foreign.input, ...grant(1) }, origin), /slot/);
+    await assert.rejects(members.issueRegistrationChallenge(foreign.input, origin), /slot/);
     await assert.rejects(members.issueRegistrationChallenge({ ...d.input, authorization: '00'.repeat(64) }, origin), /authorization/);
     await assert.rejects(members.issueRegistrationChallenge({ ...d.input, passphrase: 'never accept' }, origin), /field/);
   } finally { cleanup(dir); }
@@ -86,14 +79,14 @@ test('a frostd-only in-browser signer enrolls without an advertise_url, beside n
   try {
     // No advertise_url: the browser signer has no inbound peer HTTP (peer-over-frostd).
     const browser = device(undefined, { advertise_url: null });
-    const challenge = await members.issueRegistrationChallenge({ ...browser.input, ...grant() }, origin);
+    const challenge = await members.issueRegistrationChallenge(browser.input, origin);
     const member = await members.registerMember(response(browser, challenge), origin);
     assert.equal(member.slot, 1);
     assert.equal(member.advertise_url, '', 'frostd-only member stores an empty advertise_url');
     assert.deepEqual(members.memberById(1), member);
     // A native member that still advertises a loopback origin registers alongside it.
     const native = device();
-    const nativeChallenge = await members.issueRegistrationChallenge({ ...native.input, ...grant() }, origin);
+    const nativeChallenge = await members.issueRegistrationChallenge(native.input, origin);
     const nativeMember = await members.registerMember(response(native, nativeChallenge), origin);
     assert.equal(nativeMember.slot, 2);
     assert.equal(nativeMember.advertise_url, 'http://127.0.0.1:3601');
@@ -124,8 +117,7 @@ test('registration signs the separate LokiSigner loopback port and refuses unsig
     const transcript = `loki-member-registration-v2\n${origin}\n${slot}\n${signing_pubkey}\n${relay_pubkey}\n${advertise_url}\n${signed}\n${device_pubkey}\n${challenge}`;
     return { ...d.input, lokisigner_url: value, challenge, relay_proof: relayProof(d, issued), signature: sign('sha256', Buffer.from(transcript), d.key.privateKey).toString('hex') };
   };
-  const onboarding = grant(7);
-  const issue = (value) => members.issueRegistrationChallenge({ ...d.input, ...onboarding, lokisigner_url: value }, origin);
+  const issue = (value) => members.issueRegistrationChallenge({ ...d.input, lokisigner_url: value }, origin);
   try {
     for (const invalid of [null, '', 'http://127.0.0.2:43812', 'http://localhost:43812', 'https://127.0.0.1:43812',
       'http://127.0.0.1', 'http://127.0.0.1:0', 'http://127.0.0.1:65536', ` ${endpoint}`, `${endpoint}\n`,
@@ -164,16 +156,16 @@ test('failed, expired and wrong-origin proofs cannot be replayed; allocations ar
   process.env.LOKI_REGISTRY = join(dir, '.access.json');
   try {
     const d = device();
-    let challenge = await members.issueRegistrationChallenge({ ...d.input, ...grant() }, origin);
+    let challenge = await members.issueRegistrationChallenge(d.input, origin);
     await assert.rejects(members.registerMember({ ...response(d, challenge), signature: '00'.repeat(64) }, origin));
     await assert.rejects(members.registerMember(response(d, challenge), origin), /challenge/);
-    challenge = await members.issueRegistrationChallenge({ ...d.input, ...grant() }, origin);
+    challenge = await members.issueRegistrationChallenge(d.input, origin);
     await assert.rejects(members.registerMember(response(d, challenge), 'https://other.example'), /challenge/);
-    challenge = await members.issueRegistrationChallenge({ ...d.input, ...grant() }, origin);
+    challenge = await members.issueRegistrationChallenge(d.input, origin);
     expirePending();
     await assert.rejects(members.registerMember(response(d, challenge), origin), /challenge/);
     const devices = Array.from({ length: 6 }, () => device());
-    const pending = await Promise.all(devices.map((d) => members.issueRegistrationChallenge({ ...d.input, ...grant() }, origin)));
+    const pending = await Promise.all(devices.map((d) => members.issueRegistrationChallenge(d.input, origin)));
     const registered = await Promise.all(devices.map((d, i) => members.registerMember(response(d, pending[i]), origin)));
     assert.equal(new Set(registered.map((m) => m.slot)).size, 6);
     assert.equal(members.slots().length, 6);
@@ -189,7 +181,7 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
   const dir = mkdtempSync(join(tmpdir(), 'loki-pairing-'));
   process.env.LOKI_REGISTRY = join(dir, 'roster.json');
   try {
-    const pair = await members.issuePairingChallenge(grant(), origin);
+    const pair = await members.issuePairingChallenge({}, origin);
     assert.equal(pair.slot, 1);
     assert(pair.expires > Date.now() && pair.expires <= Date.now() + 120_000);
     const link = new URL(pair.url);
@@ -199,19 +191,18 @@ test('pairing reserves one slot, claims once, and pins one device to one identit
     assert.equal(link.searchParams.get('challenge'), pair.challenge);
     assert.equal(link.searchParams.get('slot'), '1');
     assert.deepEqual(members.slots(), []);
-    const competing = grant(1);
-    await assert.rejects(members.issuePairingChallenge({ slot: 1, ...competing }, origin), /slot/);
+    await assert.rejects(members.issuePairingChallenge({ slot: 1 }, origin), /slot/);
     const d = device(1);
-    await assert.rejects(members.issueRegistrationChallenge({ ...d.input, ...competing }, origin), /reserved/);
+    await assert.rejects(members.issueRegistrationChallenge(d.input, origin), /reserved/);
     const claims = await Promise.allSettled([1, 2].map(() => members.issueRegistrationChallenge({ ...d.input, pairing_challenge: pair.challenge }, origin)));
     assert.equal(claims.filter((r) => r.status === 'fulfilled').length, 1);
     const claim = claims.find((r) => r.status === 'fulfilled').value;
-    await assert.rejects(members.issueRegistrationChallenge({ ...device(1).input, ...competing }, origin), /reserved/);
+    await assert.rejects(members.issueRegistrationChallenge(device(1).input, origin), /reserved/);
     const member = await members.registerMember(response(d, claim), origin);
     assert.equal(member.slot, 1);
     await assert.rejects(members.registerMember(response(d, claim), origin), /challenge/);
-    await assert.rejects(members.issuePairingChallenge({ slot: 1, ...competing }, origin), /slot/);
-    const next = await members.issuePairingChallenge(grant(), origin);
+    await assert.rejects(members.issuePairingChallenge({ slot: 1 }, origin), /slot/);
+    const next = await members.issuePairingChallenge({}, origin);
     assert.equal(next.slot, 2);
     // A different identity cannot reuse the same device, even with valid authorization.
     const other = generateKeyPairSync('ed25519');
@@ -249,7 +240,7 @@ test('pairing rejects expired, wrong-origin and changed-slot claims without revi
   try {
     const d = device(1);
     for (const failure of ['origin', 'slot', 'expiry']) {
-      const pair = await members.issuePairingChallenge({ slot: 1, ...grant(1) }, origin);
+      const pair = await members.issuePairingChallenge({ slot: 1 }, origin);
       if (failure === 'expiry') {
         expirePending();
       }
@@ -270,12 +261,12 @@ test('native pairing retries a cancelled proof on the same reservation without e
     const d = device(7);
     const first = { ...d.input, lokisigner_url: 'http://127.0.0.1:3601' };
     const retry = { ...first, advertise_url: 'http://127.0.0.1:3687', lokisigner_url: 'http://127.0.0.1:3687' };
-    const pair = await members.issuePairingChallenge({ slot: 7, ...grant(7) }, origin);
+    const pair = await members.issuePairingChallenge({ slot: 7 }, origin);
     const issue = (input, from = origin) => members.issueRegistrationChallenge(input, from);
     const issued = await issue({ ...first, pairing_challenge: pair.challenge });
     const { challenge } = issued;
     await assert.rejects(issue({ ...first, pairing_challenge: pair.challenge }), /pairing challenge/);
-    await assert.rejects(issue({ ...device(7).input, ...grant(7), lokisigner_url: retry.lokisigner_url }), /reserved/);
+    await assert.rejects(issue({ ...device(7).input, lokisigner_url: retry.lokisigner_url }), /reserved/);
     await assert.rejects(issue({ ...newDevice(d).input, lokisigner_url: retry.lokisigner_url }), /pending registration/);
     await assert.rejects(issue(retry, 'https://other.example'), /pending registration/);
     assert.deepEqual(await issue(retry), issued);
@@ -288,12 +279,11 @@ test('native pairing retries a cancelled proof on the same reservation without e
     });
     await assert.rejects(members.registerMember(proof, origin), /challenge/);
 
-    const nextGrant = grant(8);
-    const next = await members.issuePairingChallenge({ slot: 8, ...nextGrant }, origin);
+    const next = await members.issuePairingChallenge({ slot: 8 }, origin);
     const fresh = { ...device(8).input, lokisigner_url: first.lokisigner_url };
     const pending = await issue({ ...fresh, pairing_challenge: next.challenge });
     expirePending();
-    assert.notEqual((await issue({ ...fresh, ...nextGrant })).challenge, pending.challenge);
+    assert.notEqual((await issue(fresh)).challenge, pending.challenge);
   } finally { cleanup(dir); }
 });
 
@@ -306,9 +296,9 @@ test('a binding saved before a crashed roster write still reserves and recovers 
     // Legacy crash after the binding write but before the roster write.
     writeFileSync(process.env.LOKI_REGISTRY + '.devices', JSON.stringify([{ slot: 1, signing_pubkey, device_pubkey }]));
     const first = { slot: 1, signing_pubkey, relay_pubkey, advertise_url };
-    const pair = await members.issuePairingChallenge(grant(), origin);
+    const pair = await members.issuePairingChallenge({}, origin);
     assert.equal(pair.slot, 2);
-    await assert.rejects(members.issueRegistrationChallenge({ ...device(1).input, ...grant(1) }, origin), /slot/);
+    await assert.rejects(members.issueRegistrationChallenge({ ...device(1).input }, origin), /slot/);
     const retry = await members.issueRegistrationChallenge(d.input, origin);
     assert.deepEqual(await members.registerMember(response(d, retry), origin), first);
   } finally { cleanup(dir); }
