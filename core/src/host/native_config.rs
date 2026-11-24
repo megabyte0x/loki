@@ -75,6 +75,9 @@ struct SavedDeployment {
 /// A pin write found a different saved pin than the one this launch was shown: it never
 /// overwrites it, and startup stops instead of signing with an unpinned pair.
 pub(super) const PIN_CONFLICT: &str = "the saved nonce witnesses changed after this configuration was shown";
+/// The new record replaced `signer-config.json`, but syncing its directory failed: the next
+/// launch most likely reads the new record, though a crash could still lose it.
+pub(crate) const SAVED_UNSYNCED: &str = "the signer configuration was replaced, but LokiSigner couldn't confirm it is stored durably";
 
 /// What LokiSigner shows the member before it pairs or unlocks, and then runs with unchanged.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -101,6 +104,9 @@ pub struct NativeConfig {
     /// a launch-only `--nonce-witnesses` file. `None` only when a flag sets the witnesses and
     /// neither the coordinator nor the profile supplied a pair.
     pin_witnesses: Option<[WitnessConfig; 2]>,
+    /// The pair fingerprint the next launch without witness flags signs with: the saved pin, or
+    /// the pair this launch pins. `None` when that launch must first ask the member to approve one.
+    pub next_witness_fingerprint: Option<String>,
     /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
     /// Whether the approved configuration is saved once the profile unlocks: not when a launch
@@ -130,6 +136,10 @@ pub struct FetchedConfig {
     changed: bool,
     /// See [`NativeConfig`]'s field: the coordinator's pair, kept apart from this launch's.
     pin_witnesses: Option<[WitnessConfig; 2]>,
+    /// A `--nonce-witnesses` file sets this launch's pair. It never authorizes changing a pin.
+    launch_witnesses: bool,
+    /// A fresh restore already wrote this configuration into its staged profile.
+    staged: bool,
     /// No launch flag overrides this configuration, so a later witness change on the
     /// coordinator is worth telling the member about, and approving it can be saved.
     #[cfg_attr(not(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")), allow(dead_code))]
@@ -142,14 +152,26 @@ impl FetchedConfig {
     /// The member approved a witness change for this launch, so its save must not fail silently.
     pub(super) fn approved_change(&self) -> bool { self.changed }
 
+    /// A fresh restore already saved this configuration in the profile it published.
+    pub(super) fn staged(&self) -> bool { self.staged }
+
+    /// Record that a fresh restore saved this configuration into its staged profile, so the
+    /// launch that publishes it doesn't save it again. A later launch saves as usual.
+    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+    pub(crate) fn mark_staged(&mut self) { self.staged = true; }
+
     /// Called once the profile has unlocked. Saves the whole configuration when no launch flag
     /// overrides it; with overrides, only a witness pair the member approved for this launch.
     pub(super) fn save_unlocked(&self, data: &Path) -> Result<(), String> {
-        if self.save { return commit(data, &self.origin, self.snapshot.as_deref(), Pin::Full(&self.deployment)); }
+        if self.save { return self.commit(data, Pin::Full(&self.deployment)); }
         match (&self.pin_witnesses, self.changed) {
-            (Some(pin), true) => commit(data, &self.origin, self.snapshot.as_deref(), Pin::Witnesses(pin)),
+            (Some(pin), true) => self.commit(data, Pin::Witnesses(pin)),
             _ => Ok(()),
         }
+    }
+
+    fn commit(&self, dir: &Path, pin: Pin) -> Result<(), String> {
+        commit(dir, &self.origin, self.snapshot.as_deref(), pin, self.changed, self.launch_witnesses)
     }
 
     /// For a first pairing: the trusted witness pin must be durable before the profile can
@@ -166,7 +188,7 @@ impl FetchedConfig {
             Some(pin) => Pin::Witnesses(pin),
             None => return Err("the coordinator supplied no nonce witness pair to pin".into()),
         };
-        commit(dir, &self.origin, self.snapshot.as_deref(), pin)
+        self.commit(dir, pin)
     }
 }
 
@@ -247,7 +269,8 @@ impl NativeConfig {
         config.frostd_url = deployment.frostd_url.clone();
         config.lightwalletd = deployment.lightwalletd_url.clone();
         let watch = OVERRIDES.iter().all(|name| value(args, name).is_none());
-        Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save, snapshot, changed, pin_witnesses, watch }))
+        Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save, snapshot, changed, pin_witnesses,
+            launch_witnesses: value(args, "--nonce-witnesses").is_some(), staged: false, watch }))
     }
 
     /// A first pairing, an unchanged pair or a `--nonce-witnesses` override needs nothing. A
@@ -413,6 +436,13 @@ impl NativeConfig {
             && (paired || approved_fingerprint.is_some()))
             .then(|| WitnessChange { saved: approved_fingerprint.map(str::to_owned), offered: witness_fingerprint.clone() });
         let unsaved = approved_fingerprint != Some(witness_fingerprint.as_str());
+        let next_witness_fingerprint = match (&witness_change, approved_fingerprint) {
+            // Proceeding with a change needs the member's approval, which then pins it.
+            (Some(change), _) => Some(change.offered.clone()),
+            (None, Some(pin)) => Some(pin.to_owned()),
+            (None, None) if !paired => pin_witnesses.as_ref().map(nonce_witness::fingerprint),
+            (None, None) => None,
+        };
         Ok(Self {
             coordinator, slot,
             network: network.unwrap_or_default(),
@@ -424,6 +454,7 @@ impl NativeConfig {
             witness_change,
             saved_witness_fingerprint: approved_fingerprint.map(str::to_owned),
             pin_witnesses,
+            next_witness_fingerprint,
             save: (fetched.is_some() || unsaved) && OVERRIDES.iter().all(|name| flag(name).is_none()),
             fetched,
         })
@@ -528,7 +559,7 @@ fn save_record(data: &Path, origin: &str, saved: &Saved) -> Result<(), String> {
     }
     let dir = crate::state::MemberDir::create(data, "").map_err(|e| e.to_string())?;
     let bytes = Zeroizing::new(serde_json::to_vec(saved).map_err(|e| e.to_string())?);
-    write_private(dir.path(), &bytes).map_err(|e| format!("{SAVED}: {e}"))
+    write_private(dir.path(), &bytes)
 }
 
 /// What a launch pins once its profile unlocks.
@@ -541,10 +572,12 @@ enum Pin<'a> {
 }
 
 /// Write `pin` into the configuration in `dir`. Every native launch holds the profile's
-/// process-lifetime lock, so no other process writes meanwhile; this checks the record is still
-/// the one this launch was shown against. The saved pin must still be `snapshot`, or already
-/// the pin being written, else [`PIN_CONFLICT`]: a pin is never silently replaced.
-fn commit(dir: &Path, origin: &str, snapshot: Option<&str>, pin: Pin) -> Result<(), String> {
+/// process-lifetime lock, so no other process writes meanwhile. An existing pin is never
+/// replaced except by a change the member `approved` (Touch ID) against that same pin, the
+/// `snapshot` they were shown. Only when no pin exists is a first pin written. A launch-only
+/// `--nonce-witnesses` file (`launch_witnesses`) never authorizes a change: the existing pin is
+/// kept and nothing is written. Any other mismatch is [`PIN_CONFLICT`].
+fn commit(dir: &Path, origin: &str, snapshot: Option<&str>, pin: Pin, approved: bool, launch_witnesses: bool) -> Result<(), String> {
     let witnesses = match &pin { Pin::Full(deployment) => &deployment.nonce_witnesses, Pin::Witnesses(witnesses) => *witnesses };
     let fingerprint = nonce_witness::fingerprint(witnesses);
     let (current_pin, current_deployment) = match read_saved(dir)? {
@@ -552,8 +585,12 @@ fn commit(dir: &Path, origin: &str, snapshot: Option<&str>, pin: Pin) -> Result<
         Some(Saved::Witnesses { witness_fingerprint, .. }) => (Some(witness_fingerprint), None),
         Some(Saved::Legacy { .. }) | None => (None, None),
     };
-    if current_pin.as_deref() != snapshot && current_pin.as_deref() != Some(fingerprint.as_str()) {
-        return Err(PIN_CONFLICT.into());
+    match current_pin.as_deref() {
+        None => {},
+        Some(current) if current == fingerprint => {},
+        Some(current) if approved && snapshot == Some(current) => {},
+        Some(_) if launch_witnesses => return Ok(()),
+        Some(_) => return Err(PIN_CONFLICT.into()),
     }
     match (pin, current_deployment) {
         (Pin::Full(deployment), _) => save(dir, origin, deployment),
@@ -564,8 +601,16 @@ fn commit(dir: &Path, origin: &str, snapshot: Option<&str>, pin: Pin) -> Result<
     }
 }
 
-/// Publish the complete owner-only record with one rename, then sync the directory entry.
-fn write_private(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// Publish the complete owner-only record with one rename, then sync the directory entry. A
+/// failure before the rename leaves the old record; one after it is [`SAVED_UNSYNCED`].
+fn write_private(dir: &Path, bytes: &[u8]) -> Result<(), String> {
+    write_private_record(dir, bytes).map_err(|e| format!("{SAVED}: {e}"))?;
+    #[cfg(unix)]
+    if std::fs::File::open(dir).and_then(|dir| dir.sync_all()).is_err() { return Err(SAVED_UNSYNCED.into()); }
+    Ok(())
+}
+
+fn write_private_record(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::{fs, io::Write};
     let tmp = dir.join(format!("{SAVED}.{}.tmp", uuid::Uuid::new_v4()));
     let mut options = fs::OpenOptions::new();
@@ -578,8 +623,6 @@ fn write_private(dir: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = fs::remove_file(tmp);
         return Err(e);
     }
-    #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
     Ok(())
 }
 
