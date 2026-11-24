@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 
 enum SignerStartFailure: Error, Equatable {
     case cancelled, pairingLinkNeeded, invalidLink, differentPairing, configuration, coordinatorOrigin
-    case savedEndpointsRefreshFailed
+    case savedEndpointsRefreshFailed, witnessesNotSaved, witnessesSaveUncertain
     case invalidProfileName, emptyPassphrase, unlock, deviceKey, registrationRefused, registrationFailed, unexpected
     case missingRecoveryInput, missingRecoveryWords, invalidBackup, backupMismatch, badBackupFingerprint, wrongProfile
     case vaultExists, rosterUnavailable, rosterMismatch, restoredButStopped, unlockToRestore
@@ -23,6 +23,8 @@ enum SignerStartFailure: Error, Equatable {
         case .invalidLink: return "This pairing link isn’t valid. Get a new link from the wallet and open it in LokiSigner."
         case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
         case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
+        case .witnessesSaveUncertain: return "LokiSigner saved the nonce witnesses, but couldn’t confirm the save finished, so it didn’t start and signed nothing. The next unlock will most likely use those witnesses. If LokiSigner asks about them again, review them again."
+        case .witnessesNotSaved: return "LokiSigner couldn’t save the nonce witnesses for this profile, so it didn’t start and signed nothing. If you approved new witnesses, they did not take effect. Check that the profile folder is writable, then try again."
         case .testnetOnly: return "The LokiSigner wallet only supports testnet. This coordinator did not provide a testnet configuration."
         case .savedEndpointsRefreshFailed: return "A saved server address contains a path LokiSigner no longer supports. LokiSigner couldn’t load updated settings from your paired coordinator. Check that you can reach the coordinator, or ask its operator for help, then try again."
         case .coordinatorOrigin: return "Enter the original coordinator’s HTTPS address, without a page or path, and try again."

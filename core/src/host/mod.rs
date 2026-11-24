@@ -32,6 +32,8 @@ mod native_member;
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
 mod native_recovery;
 mod nonce_witness;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+mod profile_lock;
 mod recovery;
 mod registration;
 #[cfg(test)]
@@ -47,9 +49,13 @@ pub use registration::RegistrationConfig;
 pub(crate) use registration::pairing_pending;
 pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use native_config::SAVED_UNSYNCED as NATIVE_SAVED_UNSYNCED;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::can_view_addresses as native_can_view_addresses;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use profile_lock::locked_args as native_locked_args;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
@@ -438,7 +444,12 @@ fn run_local_with<G>(
         let serve = async {
             let ready = registration::start(&state, pass, notice.as_ref()).await?;
             if state.config.native {
-                if let Some(notice) = notice { notice(ready, ""); }
+                if let Some(notice) = notice {
+                    notice(ready, "");
+                    // Once per unlock, in the background: has the coordinator changed its witnesses?
+                    #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+                    tokio::spawn(native_config::watch_witnesses(state.clone(), notice));
+                }
             } else if let Some(notice) = notice {
                 notice(ready, &format!("http://{addr}/#{}", state.config.token));
             } else if pairing_stdout {

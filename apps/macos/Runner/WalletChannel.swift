@@ -14,8 +14,6 @@ final class WalletChannel {
     /// Why this launch can't open a profile, shown instead of pairing or unlocking.
     private let launchProblem: String?
     private weak var window: NSWindow?
-    /// Held for the life of the process; see `lockProfile`.
-    private static var profileLock: Int32 = -1
     // At most one invite claim from an associated-domain link, held in memory only and never
     // logged. It is bound to the pinned coordinator and slot and never invokes a wallet method.
     private var claim: (code: String, coordinator: String, slot: Int)?
@@ -30,14 +28,15 @@ final class WalletChannel {
         #else
         let args = Self.launchArguments(CommandLine.arguments.dropFirst())
         #endif
-        let signerArgs = nativeSignerArguments(args ?? [])
+        var signerArgs = nativeSignerArguments(args ?? [])
         if args == nil {
             launchProblem = "Invalid LokiSigner launch arguments."
-        } else if let index = signerArgs.firstIndex(of: "--data"), index + 1 < signerArgs.count,
-                  !Self.lockProfile(signerArgs[index + 1]) {
-            launchProblem = "This profile is already open in another LokiSigner window. Use that window, or quit it first."
         } else {
-            launchProblem = nil
+            // The same process-lifetime profile lock the standalone LokiSigner takes (in Rust).
+            // The session then uses only the canonical profile path the lock holds.
+            let locked = lockSignerProfile(signerArgs)
+            signerArgs = locked.args
+            launchProblem = locked.problem
         }
         validLaunch = launchProblem == nil
         self.window = window
@@ -106,19 +105,6 @@ final class WalletChannel {
         claim = nil
         guard let target = signer.pairedTarget, target.coordinator == held.coordinator, target.slot == held.slot else { return nil }
         return held.code
-    }
-
-    /// One process per profile folder: two LokiSigners on one profile would run two signers on the
-    /// same nonce and payment state. The lock file sits beside the folder, so a fresh folder stays
-    /// fresh. Returns false only when another process holds the lock.
-    private static func lockProfile(_ data: String) -> Bool {
-        let path = (data as NSString).standardizingPath + ".lock"
-        let fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0o600)
-        // A folder whose parent can't hold a lock file fails later with its own error.
-        guard fd >= 0 else { return true }
-        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { close(fd); return false }
-        profileLock = fd
-        return true
     }
 
     private static func launchArguments(_ arguments: ArraySlice<String>) -> [String]? {

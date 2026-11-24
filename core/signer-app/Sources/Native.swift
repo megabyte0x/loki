@@ -1,4 +1,5 @@
 import AppKit
+import LocalAuthentication
 import UserNotifications
 
 typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
@@ -25,6 +26,15 @@ func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMuta
 
 @_silgen_name("loki_member_app_profile")
 func loki_member_app_profile(_ launch: UnsafePointer<CChar>, _ action: UInt32) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_trust_witnesses")
+func loki_member_app_trust_witnesses(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_keep_witnesses")
+func loki_member_app_keep_witnesses()
+
+@_silgen_name("loki_member_app_lock_profile")
+func loki_member_app_lock_profile(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
 
 @_silgen_name("loki_member_app_stop")
 func loki_member_app_stop() -> Int32
@@ -91,10 +101,12 @@ func loki_signer_approval_selftest(_ approve: ApprovalDecision) -> Int32
 
 /// Presents a decision requested by the wallet, without accepting input carried over from
 /// another window. Keep native buttons so assistive technology can still press them.
+/// `activate: false` is for unsolicited prompts: the alert waits for the member to focus it.
 func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
                       escape: NSApplication.ModalResponse,
                       fields: [NSTextField] = [], cancelled: (() -> Bool)? = nil,
-                      timeoutResponse: NSApplication.ModalResponse = .abort) -> NSApplication.ModalResponse {
+                      timeoutResponse: NSApplication.ModalResponse = .abort,
+                      activate: Bool = true) -> NSApplication.ModalResponse {
     guard (NSApp.delegate as? NativeSigner)?.lockingForAbsence != true else { return escape }
     alert.layout()
     let window = alert.window
@@ -162,7 +174,7 @@ func runDecisionAlert(_ alert: NSAlert, timeout: TimeInterval? = nil,
         }
     }
 
-    NSApp.activate(ignoringOtherApps: true)
+    if activate { NSApp.activate(ignoringOtherApps: true) }
     let deadline = timeout.map { ProcessInfo.processInfo.systemUptime + $0 }
     let interval = cancelled == nil ? timeout : 0.1
     let expiry = interval.map { seconds in
@@ -256,6 +268,11 @@ private func showApprovalEnded(_ state: Int32) {
     if approvalEndedWindow == nil { panel.center() }
     approvalEndedWindow = panel
     panel.orderFront(nil)
+}
+
+/// A 64-character pair fingerprint's first and last 8 characters.
+private func shortFingerprint(_ value: String) -> String {
+    value.count > 16 ? "\(value.prefix(8))…\(value.suffix(8))" : value
 }
 
 private func zec(_ zat: UInt64) -> String {
@@ -660,6 +677,11 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         DispatchQueue.main.async { NativeSigner.current?.warnRegistration(event, message: text) }
         return 0
     }
+    if event == "witness-change" {
+        // Rust sends two fingerprints it computed itself. Never block its task on a dialog.
+        DispatchQueue.main.async { NativeSigner.current?.noticeWitnessChange(text) }
+        return 0
+    }
     if event == "startup-key" || event == "startup-key-gone" {
         DispatchQueue.main.async { NativeSigner.current?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return 0
@@ -753,9 +775,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var prompting = false {
         didSet {
             if !prompting && !registrationWarnings.isEmpty { DispatchQueue.main.async { self.showNextRegistrationWarning() } }
+            if !prompting && pendingWitnessChange != nil { DispatchQueue.main.async { self.showPendingWitnessChange() } }
         }
     }
     private var registrationWarnings: [(event: String, message: String)] = []
+    /// A coordinator witness change noticed after this unlock, waiting for a moment it can be shown.
+    private var pendingWitnessChange: (saved: String?, offered: String)?
+    private var witnessChangeOpen = false
+    private var witnessChangeTimer: Timer?
     fileprivate var startupKeyFailure: SignerStartFailure?
     private var opened = false
     private var cleanupNeeded = true
@@ -1144,6 +1171,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     fileprivate func didLock() {
         if ready { sessionEnded?() }
         ready = false
+        pendingWitnessChange = nil
+        witnessChangeTimer?.invalidate()
+        witnessChangeTimer = nil
         vaultAddresses.setUnlocked(false)
     }
 
@@ -1335,9 +1365,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             Nonce witnesses:
               \(witnesses)
 
-            The coordinator above chose these endpoints, except any you set with launch flags \
-            (those apply to this launch only, and then nothing is saved).
-            """
+            The coordinator above chose these endpoints, except any you set with launch flags.
+            """ + (launchOverrideText(config).map { "\n\n" + $0 } ?? "")
     }
 
     private func endpointRows(_ config: [String: Any]) -> [NSView] {
@@ -1349,45 +1378,160 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         }
     }
 
-    private var launchOverrideNotice: [NSView] {
+    /// What launch flags change, and which witness pair this launch and the next one without
+    /// flags sign with. Flags are never saved; the saved pin is always the coordinator's pair.
+    private func launchOverrideText(_ config: [String: Any]) -> String? {
         let flags = ["--network", "--frostd-url", "--lightwalletd-url", "--nonce-witnesses"].filter { args.contains($0) }
-        return flags.isEmpty ? [] : [SignerReview.info("Launch-only settings", "Overrides: \(flags.joined(separator: ", ")). The configuration shown is not saved.", warning: true)]
+        guard !flags.isEmpty else { return nil }
+        var text = "Overrides: \(flags.joined(separator: ", ")). They apply to this launch only and are never saved."
+        let next = config["next_witness_fingerprint"] as? String
+        if args.contains("--nonce-witnesses") {
+            let running = (config["witness_fingerprint"] as? String).map(shortFingerprint) ?? "unknown"
+            text += " This launch signs with the nonce witnesses from your file (pair \(running))."
+            text += next.map { " The next launch without that flag signs with the coordinator’s saved pair (\(shortFingerprint($0)))." }
+                ?? " The next launch without that flag asks you to approve the coordinator’s pair first."
+        } else if let next {
+            text += " The nonce witness pair shown (\(shortFingerprint(next))) is saved for future launches."
+        }
+        return text
     }
 
-    private func confirmWitnesses(_ config: [String: Any], mismatch: Bool = false,
-                                  then: @escaping (String?) -> Void) {
-        guard let expected = config["witness_fingerprint"] as? String else { then(nil); return }
-        let instruction = "Paste the 64-character pair fingerprint from the witness operators through a channel you trust, not from the wallet. An old signing attempt cannot use replacement witnesses."
-        let warning = "That fingerprint does not match. Check it independently before approving."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
-        field.placeholderString = "Witness fingerprint"
-        field.setAccessibilityLabel("Witness fingerprint")
+    private func launchOverrideNotice(_ config: [String: Any]) -> [NSView] {
+        launchOverrideText(config).map { [SignerReview.info("Launch-only settings", $0, warning: true)] } ?? []
+    }
+
+    /// A witness pair this paired profile has not approved, if any. `saved` is nil when the
+    /// profile has no saved pair.
+    private func witnessChange(_ config: [String: Any]) -> (saved: String?, offered: String)? {
+        guard let change = config["witness_change"] as? [String: Any],
+              let offered = change["offered"] as? String else { return nil }
+        return (change["saved"] as? String, offered)
+    }
+
+    /// Asks the member whether to trust a coordinator's new nonce witnesses. Keeping them is the
+    /// default and the escape action; trusting them also needs Touch ID. `then` gets true only
+    /// after Touch ID succeeded. An `unsolicited` prompt (the background check) never activates the app.
+    private func confirmWitnessChange(saved: String?, offered: String, coordinator: String, unsolicited: Bool = false,
+                                      then: @escaping (Bool) -> Void) {
+        let none = "None saved on this Mac"
+        let title = "The coordinator changed its nonce witnesses"
+        let warning = "Only trust the new witnesses if the coordinator’s operator told you they changed. If you weren’t expecting this, the coordinator may be compromised: keep the current witnesses and contact the operator."
+        let decided: (Bool) -> Void = { trust in
+            guard trust else { loki_member_app_keep_witnesses(); then(false); return }
+            let context = LAContext()
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                                   localizedReason: "Trust the new nonce witnesses for \(coordinator)") { success, _ in
+                DispatchQueue.main.async {
+                    if !success { loki_member_app_keep_witnesses() }
+                    then(success)
+                }
+            }
+        }
         if embedded {
             let r = SignerReview.self
-            let error = mismatch ? [r.info("Fingerprint mismatch", warning, warning: true)] : []
-            presentPrompt(SignerReview(section: "Signer configuration", title: "Verify the nonce witnesses",
-                intro: instruction, content: error + [r.card("Witness fingerprint", [field])],
-                hint: "Cancel leaves your configuration unchanged.", actions: ["Approve witnesses", "Cancel"], primary: 0),
-                fields: [field], completion: { answer in
-                    guard answer == .alertFirstButtonReturn else { then(nil); return }
-                    let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    if code == expected { then(code) }
-                    else { self.confirmWitnesses(config, mismatch: true, then: then) }
-                })
+            let pair = { (name: String, value: String?) -> NSView in
+                guard let value else { return r.row(name, none) }
+                return r.column([r.row(name, shortFingerprint(value)),
+                                 r.label(value, size: 11, tone: r.muted, mono: true, selectable: true)], spacing: 4)
+            }
+            presentPrompt(SignerReview(section: "Signer configuration", title: title,
+                intro: "LokiSigner keeps signing with the current witnesses unless you trust the new ones with Touch ID.", content: [
+                    r.origin("Coordinator", coordinator, "It now serves a different nonce witness pair."),
+                    r.card("Witness pair fingerprints", [pair("Current", saved), pair("New", offered)]),
+                    r.info("Check with the operator first", warning, warning: true),
+                ], hint: "Keeping the current witnesses changes nothing.",
+                actions: ["Keep current witnesses", "Trust new witnesses"], primary: 0),
+                escape: .alertFirstButtonReturn) { decided($0 == .alertSecondButtonReturn) }
             return
         }
         let alert = NSAlert()
-        alert.messageText = "Verify the nonce witnesses"
-        alert.informativeText = instruction
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Approve witnesses")
-        alert.addButton(withTitle: "Cancel")
-        while runDecisionAlert(alert, escape: .alertSecondButtonReturn, fields: [field]) == .alertFirstButtonReturn {
-            let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if code == expected { then(code); return }
-            alert.informativeText = warning
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = "Coordinator: \(coordinator)\nCurrent: \(saved.map(shortFingerprint) ?? none)\nNew: \(shortFingerprint(offered))\n\n\(warning)"
+        let full = NSTextField(wrappingLabelWithString: "Current: \(saved ?? none)\nNew: \(offered)")
+        full.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        full.isSelectable = true
+        full.frame = NSRect(x: 0, y: 0, width: 420, height: 56)
+        alert.accessoryView = full
+        alert.addButton(withTitle: "Keep current witnesses")
+        alert.addButton(withTitle: "Trust new witnesses")
+        var attention: Int?
+        if unsolicited && !NSApp.isActive { attention = NSApp.requestUserAttention(.informationalRequest) }
+        let answer = runDecisionAlert(alert, escape: .alertFirstButtonReturn, activate: !unsolicited)
+        if let attention { NSApp.cancelUserAttentionRequest(attention) }
+        decided(answer == .alertSecondButtonReturn)
+    }
+
+    /// The running signer noticed that the coordinator serves a different witness pair.
+    fileprivate func noticeWitnessChange(_ message: String) {
+        guard running, !startingOver, !lockingForAbsence, !stopping,
+              let data = message.data(using: .utf8),
+              let change = (try? JSONSerialization.jsonObject(with: data)) as? [String: String],
+              let offered = change["offered"] else { return }
+        let saved = change["saved"]
+        pendingWitnessChange = (saved, offered)
+        showPendingWitnessChange()
+    }
+
+    /// Shows a pending witness change once nothing else is on screen. Like a payment request,
+    /// it never activates the app: the prompt waits for the member to focus its window.
+    private func showPendingWitnessChange() {
+        guard let change = pendingWitnessChange, ready, running, !startingOver, !lockingForAbsence, !stopping,
+              !witnessChangeOpen else { return }
+        guard !prompting, NSApp.modalWindow == nil, !embedded || canShowWalletDecision else {
+            if witnessChangeTimer == nil {
+                witnessChangeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in
+                    self?.witnessChangeTimer = nil
+                    self?.showPendingWitnessChange()
+                }
+            }
+            return
         }
-        then(nil)
+        pendingWitnessChange = nil
+        witnessChangeOpen = true
+        if !embedded { prompting = true }
+        let coordinator = pairedTarget?.coordinator ?? "the coordinator"
+        let finish = { (result: String?) in
+            self.witnessChangeOpen = false
+            if !self.embedded { self.prompting = false }
+            if let result { self.reportWitnessChange(result) }
+        }
+        confirmWitnessChange(saved: change.saved, offered: change.offered, coordinator: coordinator, unsolicited: true) { trusted in
+            guard trusted else { finish(nil); return }
+            // Approve only for the profile that is still running. Lock and set-aside drain
+            // `walletWork` first, and Rust refuses the save once this member stops.
+            guard self.ready, self.running, !self.stopping, !self.startingOver, !self.lockingForAbsence else {
+                finish("LokiSigner was locked, so it kept the current nonce witnesses.")
+                return
+            }
+            let launch: [String: Any] = ["args": self.args, "offered_fingerprint": change.offered]
+            self.walletWork.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                let reply = nativeQuery(loki_member_app_trust_witnesses, launch)
+                DispatchQueue.main.async {
+                    defer { self.walletWork.leave() }
+                    if reply["trusted"] as? Bool == true, reply["unsynced"] as? Bool == true {
+                        finish("LokiSigner replaced the saved nonce witnesses, but couldn’t confirm the save finished. The next unlock will most likely use the new witnesses. If LokiSigner asks about them again, review them again.")
+                    } else if reply["trusted"] as? Bool == true {
+                        finish("LokiSigner saved the new nonce witnesses. Signing uses them after you lock and unlock LokiSigner again.")
+                    } else {
+                        let reason = reply["error"] as? String ?? "LokiSigner couldn’t save them."
+                        finish("LokiSigner kept the current nonce witnesses: \(reason)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func reportWitnessChange(_ message: String) {
+        if embedded { walletNotice = message; return }
+        let alert = NSAlert()
+        alert.messageText = "Nonce witnesses"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        prompting = true
+        alert.runModal()
+        prompting = false
     }
 
     /// Shows the configuration before anything is saved; the member continues with exactly it.
@@ -1398,11 +1542,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             return
         }
         if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: link); return }
-        if config["confirm_witness_fingerprint"] as? Bool == true, launch["witness_confirmation"] == nil {
-            confirmWitnesses(config) { code in
-                guard let code else { self.retry(.cancelled, link: link); return }
+        if let change = witnessChange(config), launch["witness_confirmation"] == nil {
+            confirmWitnessChange(saved: change.saved, offered: change.offered,
+                                 coordinator: config["coordinator"] as? String ?? "the coordinator") { trusted in
+                guard trusted else { self.retry(.cancelled, link: link); return }
                 var verified = launch
-                verified["witness_confirmation"] = code
+                verified["witness_confirmation"] = change.offered
                 self.confirm(link: link, launch: verified, reply: reply, fresh: fresh)
             }
             return
@@ -1446,7 +1591,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 title: pairing ? "Review configuration" : "Unlock signer",
                 intro: pairing ? "Check the endpoints chosen by the coordinator before pairing this Mac."
                     : "Unlocking opens the local profile. It never approves a payment.",
-                content: [origin] + content + launchOverrideNotice,
+                content: [origin] + content + launchOverrideNotice(config),
                 hint: pairing ? "Pairing is not a payment approval." : "The coordinator address is read-only.",
                 actions: [pairing ? "Pair" : "Unlock", "Cancel"], primary: 0), fields: fields,
                 escape: .alertSecondButtonReturn, completion: confirmed)
@@ -1508,6 +1653,8 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 case 8: failure = .registrationRosterUnavailable
                 case 9: failure = .invalidProfileName
                 case 10: failure = .cancelled
+                case 11: failure = .witnessesNotSaved
+                case 13: failure = .witnessesSaveUncertain
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil
@@ -1566,11 +1713,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             return
         }
         if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: retryLink); return }
-        if config["confirm_witness_fingerprint"] as? Bool == true, launch["witness_confirmation"] == nil {
-            confirmWitnesses(config) { code in
-                guard let code else { self.retry(.cancelled, link: self.retryLink); return }
+        if let change = witnessChange(config), launch["witness_confirmation"] == nil {
+            confirmWitnessChange(saved: change.saved, offered: change.offered,
+                                 coordinator: config["coordinator"] as? String ?? "the coordinator") { trusted in
+                guard trusted else { self.retry(.cancelled, link: self.retryLink); return }
                 var verified = launch
-                verified["witness_confirmation"] = code
+                verified["witness_confirmation"] = change.offered
                 self.confirmRecovery(launch: verified, reply: reply)
             }
             return
@@ -1585,7 +1733,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 intro: "Confirm the network and endpoints before choosing the encrypted backup.", content: [
                     r.origin("Original coordinator", config["coordinator"] as? String ?? "", "Testnet · Member slot is resolved from the backup and roster."),
                     r.card("Signer endpoints", endpointRows(config)),
-                ] + launchOverrideNotice, hint: "Continue opens the macOS file picker.", actions: ["Continue", "Cancel"], primary: 0), completion: next)
+                ] + launchOverrideNotice(config), hint: "Continue opens the macOS file picker.", actions: ["Continue", "Cancel"], primary: 0), completion: next)
             return
         }
         let alert = NSAlert()
@@ -1739,13 +1887,42 @@ func nativeSignerArguments(_ arguments: [String]) -> [String] {
     return args
 }
 
+/// One process per profile: two LokiSigners on one profile would run two signers on the same
+/// nonce, payment and witness state. Rust takes an exclusive lock beside the profile folder,
+/// keyed on its resolved path, and holds it for the life of the process. Returns the launch
+/// arguments with `--data` set to that canonical path, which the whole session must use, and
+/// why this launch can't open the profile (nil once the lock is held).
+func lockSignerProfile(_ args: [String]) -> (args: [String], problem: String?) {
+    let reply = nativeQuery(loki_member_app_lock_profile, ["args": args])
+    if reply["locked"] as? Bool == true, let data = reply["data"] as? String,
+       let index = args.firstIndex(of: "--data"), index + 1 < args.count {
+        var locked = args
+        locked[index + 1] = data
+        return (locked, nil)
+    }
+    if reply["error"] as? String == "profile-in-use" {
+        return (args, "This profile is already open in another LokiSigner window. Use that window, or quit it first.")
+    }
+    return (args, "LokiSigner couldn’t lock its profile folder. Check that the folder is available, then open LokiSigner again.")
+}
+
 func runNativeSigner(arguments: [String], link: String?) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
+    let locked = lockSignerProfile(nativeSignerArguments(arguments))
+    if let problem = locked.problem {
+        let alert = NSAlert()
+        alert.messageText = "LokiSigner can’t open this profile"
+        alert.informativeText = problem
+        alert.addButton(withTitle: "Quit")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        exit(1)
+    }
     let menu = NSMenu()
     let item = NSMenuItem()
     let actions = NSMenu(title: "LokiSigner")
-    let delegate = NativeSigner(args: nativeSignerArguments(arguments), link: link)
+    let delegate = NativeSigner(args: locked.args, link: link)
     let status = actions.addItem(withTitle: "Status…", action: #selector(NativeSigner.showStatus(_:)), keyEquivalent: "")
     status.target = delegate
     let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")

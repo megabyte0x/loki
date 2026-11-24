@@ -88,6 +88,18 @@ pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
 #[no_mangle]
 pub extern "C" fn loki_member_app_serve() -> i32 {
     let args: Vec<String> = std::env::args().skip(2).collect();
+    if let Err(e) = crate::host::config_from_args(&args) {
+        eprintln!("serve config: {e}");
+        return 2;
+    }
+    // One process per profile, shared with every other native launch; then use only its path.
+    let args = match crate::host::native_locked_args(&args) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("serve: {e}");
+            return 2;
+        }
+    };
     let mut config = match crate::host::config_from_args(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -252,6 +264,15 @@ unsafe fn native_query(
     launch: *const std::ffi::c_char,
     query: impl FnOnce(NativeLaunch) -> Result<serde_json::Value, String>,
 ) -> *mut std::ffi::c_char {
+    native_query_as(launch, query)
+}
+
+/// [`native_query`] for a launch JSON of another shape.
+#[cfg(feature = "relay-communication")]
+unsafe fn native_query_as<T: serde::de::DeserializeOwned>(
+    launch: *const std::ffi::c_char,
+    query: impl FnOnce(T) -> Result<serde_json::Value, String>,
+) -> *mut std::ffi::c_char {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if launch.is_null() { return Err("missing native launch".to_string()); }
         let launch = std::ffi::CStr::from_ptr(launch).to_str().map_err(|_| "invalid native launch")?;
@@ -275,7 +296,9 @@ unsafe fn native_query(
 #[no_mangle]
 pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char, action: u32) -> *mut std::ffi::c_char {
     native_query(launch, |launch| {
-        let config = crate::host::config_from_args(&launch.args)?;
+        // Changes go through the locked profile's canonical path.
+        let args = if action != 0 { crate::host::native_locked_args(&launch.args)? } else { launch.args };
+        let config = crate::host::config_from_args(&args)?;
         let data = config.data;
         match action {
             0 => {},
@@ -308,6 +331,25 @@ pub extern "C" fn loki_member_app_stop() -> i32 {
 #[no_mangle]
 pub extern "C" fn loki_member_app_set_log_sink(sink: extern "C" fn(*const std::ffi::c_char)) {
     crate::host::native_set_log_sink(sink);
+}
+
+/// Take this process's exclusive, process-lifetime lock on the launch's profile (`{"args": [...]}`),
+/// shared by the Runner and the standalone app. Call it once at launch, before anything else
+/// touches the profile. Returns `{"locked": true, "data": "<canonical path>"}`: use that path as
+/// `--data` for the rest of the session. Returns `{"error": "profile-in-use"}` when another
+/// process holds it. Free it with [`loki_member_app_free`].
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 launch JSON string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_lock_profile(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    native_query(launch, |launch| {
+        crate::host::config_from_args(&launch.args)?;
+        let args = crate::host::native_locked_args(&launch.args)?;
+        let data = crate::host::config_from_args(&args)?.data;
+        Ok(serde_json::json!({ "locked": true, "data": data }))
+    })
 }
 
 /// Native status is local only. Call from a worker and free the JSON with `loki_member_app_free`.
@@ -385,6 +427,40 @@ pub unsafe extern "C" fn loki_member_app_configuration(launch: *const std::ffi::
         };
         Ok(serde_json::json!({ "config": config }))
     })
+}
+
+/// The member approved, with Touch ID, the nonce-witness pair a `witness-change` notice offered.
+/// `launch` is `{"args": [...], "offered_fingerprint": "<hex>"}`. LokiSigner asks the paired
+/// coordinator again and saves its pair only if it is still the offered one; the next unlock
+/// uses it. Returns `{"trusted": true}`, `{"trusted": true, "unsynced": true}` when the new
+/// pair is in place but its save couldn't be confirmed durable, or `{"error": "..."}`; free it with
+/// [`loki_member_app_free`]. Call from a worker: it contacts the coordinator.
+///
+/// # Safety
+/// `launch` must be a live NUL-terminated UTF-8 string for this call.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub unsafe extern "C" fn loki_member_app_trust_witnesses(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Trust { args: Vec<String>, offered_fingerprint: String }
+    native_query_as(launch, |trust: Trust| {
+        crate::host::config_from_args(&trust.args)?;
+        let args = crate::host::native_locked_args(&trust.args)?;
+        match crate::host::NativeConfig::trust_witnesses(&args, &trust.offered_fingerprint) {
+            Ok(()) => Ok(serde_json::json!({ "trusted": true })),
+            // The new pair is in place, but its save may not survive a crash.
+            Err(e) if e == crate::host::NATIVE_SAVED_UNSYNCED => Ok(serde_json::json!({ "trusted": true, "unsynced": true })),
+            Err(e) => Err(e),
+        }
+    })
+}
+
+/// The member kept the current nonce witnesses after a change. Nothing changes; it is logged.
+#[cfg(feature = "relay-communication")]
+#[no_mangle]
+pub extern "C" fn loki_member_app_keep_witnesses() {
+    crate::host::NativeConfig::keep_witnesses();
 }
 
 /// Lists active vault receive addresses for the running native member, as `{"vaults": [...]}`
@@ -501,14 +577,19 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
             witness_confirmation: Option<String>,
             #[serde(default)] embedded: bool,
         }
-        let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
+        let mut launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
         let fingerprint = std::ffi::CStr::from_ptr(fingerprint).to_str().map_err(|_| error)?;
+        crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
+        // Held for the life of the process, so through publish and the member that follows.
+        // Every profile read and write from here uses the locked canonical path.
+        launch.args = crate::host::native_locked_args(&launch.args).map_err(|_| error)?;
         let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref()).map_err(|_| error)?;
-        let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
+        let mut fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         if launch.embedded { crate::host::NativeConfig::validate_wallet(&config).map_err(|_| error)?; }
         crate::host::native_restore_new(&mut config, &pass, words, std::path::Path::new(file), fingerprint, &launch.restore_origin, fetched.as_ref())?;
+        if let Some(fetched) = fetched.as_mut() { fetched.mark_staged(); }
         published = true;
         let notice = native_notice(notify);
         crate::host::run_native(config, pass, notice, native_approval(approve),
@@ -571,7 +652,10 @@ pub unsafe extern "C" fn loki_member_app_pair(
             witness_confirmation: Option<String>,
             #[serde(default)] embedded: bool,
         }
-        let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let mut launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        crate::host::native_config_from_args(&launch.args)?;
+        // Every profile read and write from here uses the locked canonical path.
+        launch.args = crate::host::native_locked_args(&launch.args)?;
         let mut config = crate::host::native_config_from_args(&launch.args)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
         config.validate_secure_element()?;
@@ -607,6 +691,9 @@ pub unsafe extern "C" fn loki_member_app_pair(
             "coordinator-roster-unreachable" => 8,
             "invalid-profile-name" => 9,
             "recovery-not-confirmed" => 10,
+            "signer-config-not-saved" => 11,
+            "profile-in-use" => 12,
+            "signer-config-unsynced" => 13,
             _ => 1,
         },
         Err(_) => 2,

@@ -322,7 +322,8 @@ pub(crate) fn restore_new(
             .map_err(|e| super::state::member_key_message(&e.to_string()).unwrap_or(REFUSED))?;
     }
     registration::save_coordinator(&staged.path, &origin, slot).map_err(|_| REFUSED)?;
-    if let Some(fetched) = fetched { fetched.save_unlocked(&staged.path).map_err(|_| REFUSED)?; }
+    // A fresh restore trusts the coordinator's witness pair on first use, so its pin must be saved.
+    if let Some(fetched) = fetched { fetched.save_first_use_in(&staged.path).map_err(|_| REFUSED)?; }
     fs::write(staged.path.join(RESTORE_PENDING), []).map_err(|_| REFUSED)?;
     staged.publish(&dest, &signer, || {
         if profile_state(&dest)? != "fresh" { return Err(NOT_FRESH); }

@@ -31,6 +31,12 @@ pub(super) enum Event {
     PaymentRefused,
     PaymentFailed(PaymentFailure),
     PaymentSigned,
+    /// The coordinator serves a nonce-witness pair other than the saved one.
+    WitnessChangeNoticed,
+    /// The member kept the saved pair.
+    WitnessChangeKept,
+    /// The member approved the new pair with Touch ID.
+    WitnessChangeTrusted,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -78,6 +84,9 @@ impl Event {
                 PaymentFailure::Other => "LokiSigner couldn’t complete the payment. Check the wallet for details.",
             }, Kind::Error),
             Event::PaymentSigned => ("LokiSigner signed a payment.", Kind::Info),
+            Event::WitnessChangeNoticed => ("The coordinator changed its nonce witnesses. LokiSigner keeps using the saved ones until you approve the change.", Kind::Info),
+            Event::WitnessChangeKept => ("You kept the current nonce witnesses.", Kind::Info),
+            Event::WitnessChangeTrusted => ("You approved the coordinator's new nonce witnesses with Touch ID.", Kind::Info),
         }
     }
 
