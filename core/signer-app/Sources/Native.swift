@@ -1,4 +1,5 @@
 import AppKit
+import LocalAuthentication
 import UserNotifications
 
 typealias ConnectCancellation = @convention(c) (UnsafeRawPointer?) -> Int32
@@ -25,6 +26,12 @@ func loki_member_app_configuration(_ launch: UnsafePointer<CChar>) -> UnsafeMuta
 
 @_silgen_name("loki_member_app_profile")
 func loki_member_app_profile(_ launch: UnsafePointer<CChar>, _ action: UInt32) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_trust_witnesses")
+func loki_member_app_trust_witnesses(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("loki_member_app_keep_witnesses")
+func loki_member_app_keep_witnesses()
 
 @_silgen_name("loki_member_app_stop")
 func loki_member_app_stop() -> Int32
@@ -256,6 +263,11 @@ private func showApprovalEnded(_ state: Int32) {
     if approvalEndedWindow == nil { panel.center() }
     approvalEndedWindow = panel
     panel.orderFront(nil)
+}
+
+/// A 64-character pair fingerprint's first and last 8 characters.
+private func shortFingerprint(_ value: String) -> String {
+    value.count > 16 ? "\(value.prefix(8))…\(value.suffix(8))" : value
 }
 
 private func zec(_ zat: UInt64) -> String {
@@ -660,6 +672,11 @@ private func nativeNotice(_ kind: UnsafePointer<CChar>?, _ message: UnsafePointe
         DispatchQueue.main.async { NativeSigner.current?.warnRegistration(event, message: text) }
         return 0
     }
+    if event == "witness-change" {
+        // Rust sends two fingerprints it computed itself. Never block its task on a dialog.
+        DispatchQueue.main.async { NativeSigner.current?.noticeWitnessChange(text) }
+        return 0
+    }
     if event == "startup-key" || event == "startup-key-gone" {
         DispatchQueue.main.async { NativeSigner.current?.startupKeyFailure = event == "startup-key-gone" ? .keyGone(text) : .key(text) }
         return 0
@@ -753,9 +770,14 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     private var prompting = false {
         didSet {
             if !prompting && !registrationWarnings.isEmpty { DispatchQueue.main.async { self.showNextRegistrationWarning() } }
+            if !prompting && pendingWitnessChange != nil { DispatchQueue.main.async { self.showPendingWitnessChange() } }
         }
     }
     private var registrationWarnings: [(event: String, message: String)] = []
+    /// A coordinator witness change noticed after this unlock, waiting for a moment it can be shown.
+    private var pendingWitnessChange: (saved: String, offered: String)?
+    private var witnessChangeOpen = false
+    private var witnessChangeTimer: Timer?
     fileprivate var startupKeyFailure: SignerStartFailure?
     private var opened = false
     private var cleanupNeeded = true
@@ -1144,6 +1166,9 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     fileprivate func didLock() {
         if ready { sessionEnded?() }
         ready = false
+        pendingWitnessChange = nil
+        witnessChangeTimer?.invalidate()
+        witnessChangeTimer = nil
         vaultAddresses.setUnlocked(false)
     }
 
@@ -1354,40 +1379,120 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         return flags.isEmpty ? [] : [SignerReview.info("Launch-only settings", "Overrides: \(flags.joined(separator: ", ")). The configuration shown is not saved.", warning: true)]
     }
 
-    private func confirmWitnesses(_ config: [String: Any], mismatch: Bool = false,
-                                  then: @escaping (String?) -> Void) {
-        guard let expected = config["witness_fingerprint"] as? String else { then(nil); return }
-        let instruction = "Paste the 64-character pair fingerprint from the witness operators through a channel you trust, not from the wallet. An old signing attempt cannot use replacement witnesses."
-        let warning = "That fingerprint does not match. Check it independently before approving."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 420, height: 26))
-        field.placeholderString = "Witness fingerprint"
-        field.setAccessibilityLabel("Witness fingerprint")
+    /// A saved witness pair that differs from the one in this configuration, if any.
+    private func witnessChange(_ config: [String: Any]) -> (saved: String, offered: String)? {
+        guard let change = config["witness_change"] as? [String: Any], let saved = change["saved"] as? String,
+              let offered = change["offered"] as? String else { return nil }
+        return (saved, offered)
+    }
+
+    /// Asks the member whether to trust a coordinator's new nonce witnesses. Keeping them is the
+    /// default and the escape action; trusting them also needs Touch ID. `then` gets true only
+    /// after Touch ID succeeded.
+    private func confirmWitnessChange(saved: String, offered: String, coordinator: String,
+                                      then: @escaping (Bool) -> Void) {
+        let title = "The coordinator changed its nonce witnesses"
+        let warning = "Only trust the new witnesses if the coordinator’s operator told you they changed. If you weren’t expecting this, the coordinator may be compromised: keep the current witnesses and contact the operator."
+        let decided: (Bool) -> Void = { trust in
+            guard trust else { loki_member_app_keep_witnesses(); then(false); return }
+            let context = LAContext()
+            context.evaluatePolicy(.deviceOwnerAuthenticationWithBiometrics,
+                                   localizedReason: "Trust the new nonce witnesses for \(coordinator)") { success, _ in
+                DispatchQueue.main.async {
+                    if !success { loki_member_app_keep_witnesses() }
+                    then(success)
+                }
+            }
+        }
         if embedded {
             let r = SignerReview.self
-            let error = mismatch ? [r.info("Fingerprint mismatch", warning, warning: true)] : []
-            presentPrompt(SignerReview(section: "Signer configuration", title: "Verify the nonce witnesses",
-                intro: instruction, content: error + [r.card("Witness fingerprint", [field])],
-                hint: "Cancel leaves your configuration unchanged.", actions: ["Approve witnesses", "Cancel"], primary: 0),
-                fields: [field], completion: { answer in
-                    guard answer == .alertFirstButtonReturn else { then(nil); return }
-                    let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                    if code == expected { then(code) }
-                    else { self.confirmWitnesses(config, mismatch: true, then: then) }
-                })
+            let pair = { (name: String, value: String) -> NSView in
+                r.column([r.row(name, shortFingerprint(value)),
+                          r.label(value, size: 11, tone: r.muted, mono: true, selectable: true)], spacing: 4)
+            }
+            presentPrompt(SignerReview(section: "Signer configuration", title: title,
+                intro: "LokiSigner keeps signing with the current witnesses unless you trust the new ones with Touch ID.", content: [
+                    r.origin("Coordinator", coordinator, "It now serves a different nonce witness pair."),
+                    r.card("Witness pair fingerprints", [pair("Current", saved), pair("New", offered)]),
+                    r.info("Check with the operator first", warning, warning: true),
+                ], hint: "Keeping the current witnesses changes nothing.",
+                actions: ["Keep current witnesses", "Trust new witnesses"], primary: 0),
+                escape: .alertFirstButtonReturn) { decided($0 == .alertSecondButtonReturn) }
             return
         }
         let alert = NSAlert()
-        alert.messageText = "Verify the nonce witnesses"
-        alert.informativeText = instruction
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Approve witnesses")
-        alert.addButton(withTitle: "Cancel")
-        while runDecisionAlert(alert, escape: .alertSecondButtonReturn, fields: [field]) == .alertFirstButtonReturn {
-            let code = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-            if code == expected { then(code); return }
-            alert.informativeText = warning
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = "Coordinator: \(coordinator)\nCurrent: \(shortFingerprint(saved))\nNew: \(shortFingerprint(offered))\n\n\(warning)"
+        let full = NSTextField(wrappingLabelWithString: "Current: \(saved)\nNew: \(offered)")
+        full.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        full.isSelectable = true
+        full.frame = NSRect(x: 0, y: 0, width: 420, height: 56)
+        alert.accessoryView = full
+        alert.addButton(withTitle: "Keep current witnesses")
+        alert.addButton(withTitle: "Trust new witnesses")
+        decided(runDecisionAlert(alert, escape: .alertFirstButtonReturn) == .alertSecondButtonReturn)
+    }
+
+    /// The running signer noticed that the coordinator serves a different witness pair.
+    fileprivate func noticeWitnessChange(_ message: String) {
+        guard running, !startingOver, !lockingForAbsence, !stopping,
+              let data = message.data(using: .utf8),
+              let change = (try? JSONSerialization.jsonObject(with: data)) as? [String: String],
+              let saved = change["saved"], let offered = change["offered"] else { return }
+        pendingWitnessChange = (saved, offered)
+        showPendingWitnessChange()
+    }
+
+    /// Shows a pending witness change once nothing else is on screen. Like a payment request,
+    /// it never activates the app: the prompt waits for the member to focus its window.
+    private func showPendingWitnessChange() {
+        guard let change = pendingWitnessChange, ready, running, !startingOver, !lockingForAbsence, !stopping,
+              !witnessChangeOpen else { return }
+        guard !prompting, NSApp.modalWindow == nil, !embedded || canShowWalletDecision else {
+            if witnessChangeTimer == nil {
+                witnessChangeTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: false) { [weak self] _ in
+                    self?.witnessChangeTimer = nil
+                    self?.showPendingWitnessChange()
+                }
+            }
+            return
         }
-        then(nil)
+        pendingWitnessChange = nil
+        witnessChangeOpen = true
+        if !embedded { prompting = true }
+        let coordinator = pairedTarget?.coordinator ?? "the coordinator"
+        let finish = { (result: String?) in
+            self.witnessChangeOpen = false
+            if !self.embedded { self.prompting = false }
+            if let result { self.reportWitnessChange(result) }
+        }
+        confirmWitnessChange(saved: change.saved, offered: change.offered, coordinator: coordinator) { trusted in
+            guard trusted else { finish(nil); return }
+            let launch: [String: Any] = ["args": self.args, "offered_fingerprint": change.offered]
+            DispatchQueue.global(qos: .userInitiated).async {
+                let reply = nativeQuery(loki_member_app_trust_witnesses, launch)
+                DispatchQueue.main.async {
+                    if reply["trusted"] as? Bool == true {
+                        finish("LokiSigner saved the new nonce witnesses. Signing uses them after you lock and unlock LokiSigner again.")
+                    } else {
+                        let reason = reply["error"] as? String ?? "LokiSigner couldn’t save them."
+                        finish("LokiSigner kept the current nonce witnesses: \(reason)")
+                    }
+                }
+            }
+        }
+    }
+
+    private func reportWitnessChange(_ message: String) {
+        if embedded { walletNotice = message; return }
+        let alert = NSAlert()
+        alert.messageText = "Nonce witnesses"
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        prompting = true
+        alert.runModal()
+        prompting = false
     }
 
     /// Shows the configuration before anything is saved; the member continues with exactly it.
@@ -1398,11 +1503,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             return
         }
         if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: link); return }
-        if config["confirm_witness_fingerprint"] as? Bool == true, launch["witness_confirmation"] == nil {
-            confirmWitnesses(config) { code in
-                guard let code else { self.retry(.cancelled, link: link); return }
+        if let change = witnessChange(config), launch["witness_confirmation"] == nil {
+            confirmWitnessChange(saved: change.saved, offered: change.offered,
+                                 coordinator: config["coordinator"] as? String ?? "the coordinator") { trusted in
+                guard trusted else { self.retry(.cancelled, link: link); return }
                 var verified = launch
-                verified["witness_confirmation"] = code
+                verified["witness_confirmation"] = change.offered
                 self.confirm(link: link, launch: verified, reply: reply, fresh: fresh)
             }
             return
@@ -1566,11 +1672,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             return
         }
         if embedded, config["network"] as? String != "testnet" { retry(.testnetOnly, link: retryLink); return }
-        if config["confirm_witness_fingerprint"] as? Bool == true, launch["witness_confirmation"] == nil {
-            confirmWitnesses(config) { code in
-                guard let code else { self.retry(.cancelled, link: self.retryLink); return }
+        if let change = witnessChange(config), launch["witness_confirmation"] == nil {
+            confirmWitnessChange(saved: change.saved, offered: change.offered,
+                                 coordinator: config["coordinator"] as? String ?? "the coordinator") { trusted in
+                guard trusted else { self.retry(.cancelled, link: self.retryLink); return }
                 var verified = launch
-                verified["witness_confirmation"] = code
+                verified["witness_confirmation"] = change.offered
                 self.confirmRecovery(launch: verified, reply: reply)
             }
             return
