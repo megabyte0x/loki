@@ -357,17 +357,20 @@ zeroed. `serve` retains S4a's local-file unlock for development automation only.
 
 Members never type a witness fingerprint. LokiSigner trusts the coordinator's witness pair
 only while the profile has no paired coordinator yet: a first pairing or a fresh restore. That
-pin is saved before the profile can sign, with the full witness pair (keys, run IDs, mailboxes
-and URLs), even when launch-only endpoint flags keep the endpoints themselves unsaved; if the
-save fails, pairing or restore stops. Unlocks run with the saved pair, so keeping it never
+pin is saved before the profile can sign, with the coordinator's full witness pair (keys, run
+IDs, mailboxes and URLs), even when launch-only flags keep the endpoints themselves unsaved; if
+the save fails, pairing or restore stops. A `--nonce-witnesses` file is launch-only too: that
+launch signs with it, but the pin is always the coordinator's pair. Unlocks run with the saved pair, so keeping it never
 depends on the coordinator. A paired profile with no saved pin treats any pair as a change.
-A pin is never overwritten if it changed after the configuration was shown; startup stops instead.
+A pin is never overwritten if it changed after the configuration was shown, and a witness
+change the member approved must be saved: either failure stops startup and LokiSigner says so.
 
 Every native launch (the wallet app, and the standalone app's native and serve modes, pairing,
 restore and witness approval) holds an exclusive lock on `<profile>.lock`, beside the profile
 folder, for its whole life. The lock is keyed on the folder's resolved absolute path, so a
 symlink, `.` or relative path to the same profile shares it. While one process holds it, no
-other can pair, restore, unlock or write that profile. Later:
+other can pair, restore, unlock or write that profile. After locking, the session reads and
+writes the profile only through the resolved path, so moving a symlink can't redirect it. Later:
 
 - **After each unlock** LokiSigner asks the paired coordinator once, in the background, for its
   current `/api/signer-config`. A failed request is only logged; signing continues.
