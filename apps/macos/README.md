@@ -32,7 +32,7 @@ For a provisioned Release build, prepare with `flutter build macos --release --c
 
 Pair with the one-use `loki://pair` link the coordinator's wallet issues for your member slot. Paste it in **Pair this Mac**; LokiSigner checks the whole link without a network request and shows its coordinator origin and slot before it contacts anything. A bare origin admits no one. The coordinator must serve a **testnet** `/api/signer-config` with HTTPS endpoints for frostd, lightwalletd and both nonce witnesses. The embedded app rejects loopback HTTP even on the same Mac. Real pairing, restore and signing use the existing Secure Enclave/Touch ID policy. A valid signature and matching provisioning profile are needed for the existing profile's Keychain items. An existing profile unlocks and reconnects without a new link.
 
-When asked to verify the witness pair, obtain its fingerprint from the witness operators through a trusted channel, not from the wallet.
+Pairing never asks for a witness fingerprint. LokiSigner trusts the coordinator's nonce witness pair the first time and saves it. After each unlock it checks the coordinator once in the background; if the coordinator now serves a different pair, LokiSigner shows **The coordinator changed its nonce witnesses** with both fingerprints. Signing keeps the saved pair until you choose **Trust new witnesses** and confirm with Touch ID; the new pair applies from the next unlock. Only trust it if the coordinator's operator told you the witnesses changed. Otherwise choose **Keep current witnesses** and contact the operator.
 
 The workspace footer shows the active signer's pinned origin as **Paired coordinator**. It is read-only and does not indicate whether the coordinator is reachable.
 

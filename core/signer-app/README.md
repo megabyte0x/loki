@@ -23,8 +23,6 @@ On the wallet's sign-in screen open **Use a native member app instead**. It has 
      signer** (or see restore below if this is a replacement Mac).
    - "Pair this device with slot N?" with the coordinator origin. Choose **Continue** only if
      it is the wallet's address.
-   - "Verify the nonce witnesses". Paste the pair fingerprint you received through a trusted
-     channel from the witness operators, not from the wallet.
    - "Pair this device with slot N?" again, with the network and endpoints that coordinator
      chose (see below). Enter a local profile passphrase and choose **Pair**. Approve the
      Enclave prompt if macOS shows one.
@@ -291,9 +289,8 @@ values its signer origin gives the browser signer (`LOKI_NETWORK`, `LOKI_FROSTD_
   signing would refuse. The request follows no redirect and times out. The app shows a fixed
   message on failure, not the coordinator’s reply or HTTP status.
 - **Saved once unlocked, and pinned.** The configuration is saved only after the local profile
-  unlocks. The coordinator origin, network, endpoints, witness pair and verified fingerprint are
-  atomically saved together in the owner-only (0600) `signer-config.json`. Older configurations
-  without a fingerprint require confirmation before the upgrade. A legacy `nonce-witnesses.json`
+  unlocks. The coordinator origin, network, endpoints, witness pair and its fingerprint are
+  atomically saved together in the owner-only (0600) `signer-config.json`. A legacy `nonce-witnesses.json`
   is never used with the new configuration. A wrong passphrase saves nothing. LokiSigner refuses
   configuration from another coordinator without changing the saved configuration. A new pairing
   link for the same coordinator and slot refreshes it once the member confirms and unlocks.
@@ -356,11 +353,27 @@ the configuration comes from that origin, as described above.
 The native passphrase is passed to Rust in memory and the Swift byte buffer is immediately
 zeroed. `serve` retains S4a's local-file unlock for development automation only.
 
-### Verify the witness pair
+### Nonce witness changes
 
-Members must independently verify the first witness pair and any replacement. After upgrading
-an older profile, verify the saved pair even if its endpoints did not change. Operators can
-compute the fingerprint from their trusted `--nonce-witnesses` JSON file:
+Members never type a witness fingerprint. LokiSigner trusts the coordinator's first witness
+pair (trust on first use) and saves its fingerprint with the configuration. Later:
+
+- **After each unlock** LokiSigner asks the paired coordinator once, in the background, for its
+  current `/api/signer-config`. A failed request is only logged; signing continues.
+- **A different pair** opens "The coordinator changed its nonce witnesses" with the saved and
+  new fingerprints (short form, full value selectable). **Keep current witnesses** is the
+  default and the Escape action and changes nothing; the screen may appear again after a later
+  unlock. Like a payment request, it never activates the app and waits for the member to focus it.
+- **Trust new witnesses** needs Touch ID. LokiSigner then fetches the configuration again and
+  saves the new pair only if the coordinator still serves exactly that pair. The running signer
+  keeps the saved pair until the member locks and unlocks again. Nothing switches silently.
+- **A pairing link or refresh** that brings a different pair for the same coordinator shows
+  the same screen before the configuration review; pairing continues only after Touch ID.
+- A `--nonce-witnesses` launch flag overrides the pair for that launch and never prompts.
+
+Payments already in progress keep the pair they started with: their nonce records are bound to
+it. Operators can compute a pair's fingerprint from their trusted `--nonce-witnesses` JSON file,
+for members who want to compare it with the screen:
 
 ```sh
 node -e '
@@ -374,8 +387,8 @@ console.log(hash.digest("hex"));
 ' /path/to/witnesses.json
 ```
 
-Share only the 64-character fingerprint with members, through a channel they trust independently
-of the wallet. It covers both witnesses' relay keys, run IDs and mailbox IDs in file order, not
+Tell members before you rotate witnesses, through a channel they trust independently of the
+wallet. The fingerprint covers both witnesses' relay keys, run IDs and mailbox IDs in file order, not
 their URLs or credentials. An explicit local `--nonce-witnesses` file is itself trusted operator
 configuration. Outstanding attempts using legacy nonce records or a different pair need a fresh
 signing attempt, even after the replacement is approved. Do not delete existing burn records or
