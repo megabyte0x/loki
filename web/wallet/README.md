@@ -165,8 +165,15 @@ and direct enrollment of an identity the registry doesn't know (claiming a pairi
 spends the reservation its link was counted for). A registered member's roster refresh at
 unlock, recovery and device replacement are exempt, but only because the request's
 `authorization`, that identity's own signature over its device key, verifies first;
-registering then still needs the device signature and the relay proof. They keep the
-coordinator's general registration budget.
+registering then still needs the device signature and the relay proof.
+
+Registry writes come from two separate budgets. New-identity work (pairing links, enrolling,
+resuming or claiming for an identity the registry doesn't know) uses one. A registered
+member's refresh or replacement, completing an issued proof and operator tools use the other,
+so new-identity traffic can never make an existing member wait for "registration is busy". The
+per-address check and every cheap refusal (a malformed request, a full roster, no pending
+slot, the sign-up cap, a taken slot, an unknown proof) happen before either budget or the
+registry lock is spent.
 
 The coordinator reads these settings from its own process environment. Changing a service's
 environment file or exporting a variable in a shell doesn't reach a running coordinator:
@@ -179,7 +186,10 @@ restart it to apply a change.
 | `LOKI_IP_PAIRING_PER_DAY` | 30 | The same requests per client address per rolling day. |
 | `LOKI_CLIENT_IP_HEADER` | unset | The one header your proxy sets to the client address, for example `cf-connecting-ip` behind a Cloudflare tunnel. |
 
-The per-address counts live in memory and reset when the coordinator restarts. They track at
+The per-address counts live in memory, use the process's monotonic clock (a wall-clock
+step changes nothing) and reset when the coordinator restarts. The hourly sign-up times are
+wall-clock and stored in the registry; a time later than the current clock still counts
+until the clock passes it. They track at
 most 10,000 addresses. When that's full, addresses idle for a day are dropped oldest first,
 and if none are, new addresses share one overflow bucket with the same limits, so they're
 still admitted. The coordinator reads only the header named by `LOKI_CLIENT_IP_HEADER`,

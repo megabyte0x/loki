@@ -40,9 +40,11 @@ export function logRefusal(reason: "sign-up limit" | "ip minute limit" | "ip day
 const secondsUntil = (oldest: number, span: number, now: number) => Math.max(1, Math.ceil((oldest + span - now) / 1000));
 
 /** Drops sign-up times older than an hour and refuses when the hourly cap is reached. The caller
- *  holds the registry lock and records a new identity with `state.signups.push(now)`. */
+ *  holds the registry lock and records a new identity with `state.signups.push(now)`. These
+ *  times are wall-clock and persisted: one later than `now` (the clock stepped back) still
+ *  counts until the clock passes it, so a clock step can't reopen the hour. */
 export function checkSignups(signups: number[], now: number): number[] {
-  const recent = signups.filter((at) => at > now - HOUR && at <= now).sort((a, b) => a - b);
+  const recent = signups.filter((at) => at > now - HOUR).sort((a, b) => a - b);
   const limit = signupsPerHour();
   if (recent.length >= limit) {
     logRefusal("sign-up limit");
@@ -75,14 +77,15 @@ export function clientAddress(req: Request): string {
 }
 
 // Shared across the route bundles in the coordinator's Node process. The table's insertion
-// order is the order of each address's latest admitted request, oldest first.
+// order is the order of each address's latest admitted request, oldest first. Its times are
+// monotonic milliseconds (`performance.now()`), so a wall-clock step changes no window.
 const shared = globalThis as typeof globalThis & { lokiPairingRequests?: Map<string, number[]>; lokiPairingOverflow?: number[] };
 
 /** Counts one request that could admit a new identity (a pairing link, or enrollment of an
  *  identity the registry doesn't know) from `client`, or refuses it. A full table first drops
  *  addresses idle for a day, oldest first, stopping at the first live one; new addresses then
  *  share one overflow bucket with the same limits, so they are still admitted. */
-export function admitClient(client: string, now = Date.now()) {
+export function admitClient(client: string, now = performance.now()) {
   const perMinute = setting("LOKI_IP_PAIRING_PER_MINUTE", 5);
   const perDay = setting("LOKI_IP_PAIRING_PER_DAY", 30);
   const table = shared.lokiPairingRequests ??= new Map<string, number[]>();
@@ -93,7 +96,7 @@ export function admitClient(client: string, now = Date.now()) {
     }
   }
   const overflow = !table.has(client) && table.size >= MAX_CLIENTS;
-  const times = (overflow ? shared.lokiPairingOverflow ?? [] : table.get(client) ?? []).filter((at) => at > now - DAY && at <= now);
+  const times = (overflow ? shared.lokiPairingOverflow ?? [] : table.get(client) ?? []).filter((at) => at > now - DAY);
   const save = (value: number[], latest: boolean) => {
     if (overflow) { shared.lokiPairingOverflow = value; return; }
     if (latest) table.delete(client); // move to the end: most recently admitted

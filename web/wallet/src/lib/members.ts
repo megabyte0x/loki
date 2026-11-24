@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
 import { admitClient, checkSignups, logRefusal } from "./admission-limits.ts";
 import { freeSlot, MAX_SLOT, registrationSlot } from "./member-admission.ts";
-import { registrationLock } from "./registration-lock.ts";
+import { registrationLock, type RegistrationPool } from "./registration-lock.ts";
 import { newRelayChallenge, verifyRelayProof } from "./relay-registration.ts";
 
 export type Member = { slot: number; signing_pubkey: string; relay_pubkey: string; advertise_url: string; lokisigner_url?: string };
@@ -129,15 +129,28 @@ function write(file: string, value: unknown) {
   } finally { rmSync(temp, { force: true }); }
 }
 
-/** One durable snapshot for nonce consumption, device bindings and roster writes. */
-async function changeRegistry<T>(change: (state: Registry, now: number) => T | Error): Promise<T> {
+function liveChallenges(state: Registry, now: number) {
+  state.challenges = state.challenges.filter((c) => c.expires > now && (c.enrollment ? !!c.relay : c.pairing_slot !== undefined));
+}
+
+/** The registry as last written, read without the lock or a budget token. Only for cheap
+ *  refusals and choosing a budget pool before `changeRegistry`, which decides again. */
+function peekRegistry(now: number): Registry {
+  const state = loadRegistry(registryPath());
+  liveChallenges(state, now);
+  return state;
+}
+
+/** One durable snapshot for nonce consumption, device bindings and roster writes. `pool` pays
+ *  for it (see registration-lock.ts). */
+async function changeRegistry<T>(pool: RegistrationPool, change: (state: Registry, now: number) => T | Error): Promise<T> {
   const file = registryPath();
-  const unlock = await registrationLock(file);
+  const unlock = await registrationLock(file, pool);
   try {
     const state = loadRegistry(file);
     const before = JSON.stringify(state);
     const now = Date.now();
-    state.challenges = state.challenges.filter((c) => c.expires > now && (c.enrollment ? !!c.relay : c.pairing_slot !== undefined));
+    liveChallenges(state, now);
     const result = change(state, now);
     // An explicit Error result commits consumption of a rejected proof, then reports it.
     if (JSON.stringify(state) !== before) write(file, state);
@@ -205,7 +218,7 @@ function existingMember(e: Enrollment, state: Registry): Member | undefined {
 
 export async function retireMember(signing: string): Promise<void> {
   hex(signing, 32);
-  await changeRegistry((state) => {
+  await changeRegistry("member", (state) => {
     if (state.retired.includes(signing)) return;
     if (!state.access.some((m) => m.signing_pubkey === signing) && !state.devices.some((d) => d.signing_pubkey === signing)) throw new Error("unknown member identity");
     state.retired.push(signing);
@@ -237,6 +250,24 @@ function replacementTag(key: string, prefix: Buffer, e: Enrollment, origin: stri
     .update(JSON.stringify([origin, generation, e])).digest().subarray(0, 16);
 }
 
+/** A replacement challenge is not stored: its MAC carries the enrollment, origin and generation. */
+function replacementChallengeValid(key: string, challenge: string, e: Enrollment, origin: string, generation: number, now: number) {
+  const wire = Buffer.from(challenge, "hex");
+  const timestamp = wire.readBigUInt64BE();
+  return timestamp <= BigInt(now) && timestamp > BigInt(now - CHALLENGE_TTL)
+    && timingSafeEqual(wire.subarray(16), replacementTag(key, wire.subarray(0, 16), e, origin, generation));
+}
+
+/** New-identity admission checks that need no lock: the roster isn't full, the shared pending
+ *  slots and the hourly sign-up cap have room, and the wanted slot is free. `changeRegistry`
+ *  repeats them authoritatively. */
+function checkNewcomer(state: Registry, now: number, desired: number | undefined, signing?: string) {
+  if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
+  checkPendingSlots(state);
+  checkSignups(state.signups, now);
+  freeSlot(occupied(state, signing), desired);
+}
+
 function replacementRelay(key: string, challenge: string) {
   const seed = createHmac("sha256", Buffer.from(key, "hex")).update("replacement-relay/v1\0").update(challenge).digest();
   try { return newRelayChallenge(seed); } finally { seed.fill(0); }
@@ -245,18 +276,21 @@ function replacementRelay(key: string, challenge: string) {
 /** Reserves a slot for one `loki://pair` link. Anyone may ask: the hourly sign-up cap, the shared
  *  pending-slot cap and, when the route passes `client`, its per-address limits bound it. `slot`
  *  asks for that slot again, to re-pair a profile whose registration never finished; it is
- *  refused while any reservation or member holds it. Without it the lowest free slot is reserved. */
+ *  refused while any reservation or member holds it. Without it the lowest free slot is reserved.
+ *  Every request counts against `client`, and every cheap refusal happens before the registry
+ *  lock, so retried refusals can't drain the registration budget. Writes use the newcomer pool. */
 export async function issuePairingChallenge(raw: unknown, origin: string, client?: string) {
   const body = object(raw);
   fields(body, ["slot"]);
   publicOrigin(origin);
   const requested = body.slot === undefined ? undefined : registrationSlot(body.slot);
-  return changeRegistry((state, now) => {
+  if (client !== undefined) admitClient(client);
+  checkNewcomer(peekRegistry(Date.now()), Date.now(), requested);
+  return changeRegistry("newcomer", (state, now) => {
     if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
     checkPendingSlots(state);
     state.signups = checkSignups(state.signups, now);
     const id = freeSlot(occupied(state), requested);
-    if (client !== undefined) admitClient(client, now);
     const expires = now + CHALLENGE_TTL;
     const challenge = randomBytes(32).toString("hex");
     state.challenges.push({ challenge, origin, pairing_slot: id, expires });
@@ -268,15 +302,30 @@ export async function issuePairingChallenge(raw: unknown, origin: string, client
 /** A one-use registration challenge. Only enrollment of an identity the registry doesn't know,
  *  without a claimed pairing link (whose issuance was already counted), counts toward `client`'s
  *  per-address limits, the hourly sign-up cap and the pending-slot cap. A registered identity
- *  (roster refresh, recovery, device replacement) is exempt only because `enrollment()` first
- *  verified `authorization`: that identity's own Ed25519 signature over the device key. Naming
- *  an identity is not enough, and registering still needs the device signature and relay proof. */
+ *  (roster refresh, recovery, device replacement) is exempt, and uses the member budget pool,
+ *  only because `enrollment()` first verified `authorization`: that identity's own Ed25519
+ *  signature over the device key. Naming an identity is not enough, and registering still
+ *  needs the device signature and relay proof. Everything else uses the newcomer pool. Cheap
+ *  refusals and the per-address check come before the registry lock. */
 export async function issueRegistrationChallenge(raw: unknown, origin: string, client?: string) {
   const { pairing_challenge, ...identity } = object(raw);
   const e = enrollment(identity);
   publicOrigin(origin);
   const nonce = pairing_challenge === undefined ? undefined : hex(pairing_challenge, 32);
-  return changeRegistry((state, now) => {
+  const seen = peekRegistry(Date.now());
+  if (seen.retired.includes(e.signing_pubkey)) throw new Error("registration identity retired");
+  const registered = seen.access.some((m) => m.signing_pubkey === e.signing_pubkey) || seen.devices.some((d) => d.signing_pubkey === e.signing_pubkey);
+  const resuming = seen.challenges.some((c) => c.enrollment?.signing_pubkey === e.signing_pubkey);
+  let charged = false;
+  if (nonce !== undefined) {
+    if (!seen.challenges.some((c) => c.challenge === nonce && !c.enrollment)) throw new Error("unknown, expired or changed pairing challenge");
+  } else if (!registered && !resuming) {
+    if (client !== undefined) admitClient(client);
+    charged = true;
+    checkNewcomer(seen, Date.now(), e.slot, e.signing_pubkey);
+  }
+  const pool: RegistrationPool = nonce === undefined && registered ? "member" : "newcomer";
+  return changeRegistry(pool, (state, now) => {
     let claimed: Challenge | undefined;
     if (nonce !== undefined) {
       claimed = state.challenges.find((c) => c.challenge === nonce && !c.enrollment);
@@ -325,11 +374,14 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string, c
         // for this identity only: the claim matched `e.slot` above.
         reserved = freeSlot(occupied(state, e.signing_pubkey), claimed.pairing_slot);
       } else {
-        // A brand-new identity without a pairing link: it holds a slot until it registers.
+        // A brand-new identity without a pairing link: it holds a slot until it registers. The
+        // member pool never pays for one (identities are never unregistered, only retired).
+        if (pool === "member") throw new Error("registration changed; request a new challenge");
         checkPendingSlots(state);
         state.signups = checkSignups(state.signups, now);
         reserved = freeSlot(occupied(state, e.signing_pubkey), e.slot);
-        if (client !== undefined) admitClient(client, now);
+        // Rare: a pending registration expired between the first read and the lock.
+        if (!charged && client !== undefined) admitClient(client);
       }
       const challenge = randomBytes(32).toString("hex");
       const relay = newRelayChallenge();
@@ -350,7 +402,18 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
   const challenge = hex(rawChallenge, 32);
   const signature = typeof rawSignature === "string" && /^[0-9a-f]{128,144}$/.test(rawSignature) ? Buffer.from(rawSignature, "hex") : null;
   if (!signature) throw new Error("invalid device signature");
-  return changeRegistry((state, now) => {
+  // Only a request holding a live issued challenge (or a valid replacement MAC) spends the
+  // member budget; anything else is refused before the lock.
+  const now = Date.now();
+  const seen = peekRegistry(now);
+  if (!seen.challenges.some((c) => c.challenge === challenge && c.enrollment)) {
+    let next: number | undefined;
+    try { next = replacementGeneration(e, seen, seen.devices.find((d) => d.signing_pubkey === e.signing_pubkey)); } catch { next = undefined; }
+    if (next === undefined || !seen.replacement_key || !replacementChallengeValid(seen.replacement_key, challenge, e, origin, next, now)) {
+      throw new Error("unknown, expired or changed registration challenge");
+    }
+  }
+  return changeRegistry("member", (state, now) => {
     const issued = state.challenges.find((c) => c.challenge === challenge && c.enrollment);
     if (issued) state.challenges = state.challenges.filter((c) => c !== issued);
     try {
@@ -360,10 +423,7 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
       let relay = issued?.relay;
       if (next !== undefined) {
         const key = state.replacement_key;
-        const wire = Buffer.from(challenge, "hex");
-        const timestamp = wire.readBigUInt64BE();
-        if (issued || !key || timestamp > BigInt(now) || timestamp <= BigInt(now - CHALLENGE_TTL) ||
-            !timingSafeEqual(wire.subarray(16), replacementTag(key, wire.subarray(0, 16), e, origin, next))) {
+        if (issued || !key || !replacementChallengeValid(key, challenge, e, origin, next, now)) {
           throw new Error("unknown, expired or changed registration challenge");
         }
         if (replacement_authorization === undefined) throw new Error("replacement authorization is required");
