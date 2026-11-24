@@ -97,6 +97,10 @@ pub struct NativeConfig {
     /// The saved pin this configuration was resolved against. The pin is written only if it is
     /// still this one (or already the new one), checked under the profile's witness lock.
     saved_witness_fingerprint: Option<String>,
+    /// The pair to pin for this profile: the coordinator's (or the already saved) pair, never
+    /// a launch-only `--nonce-witnesses` file. `None` only when a flag sets the witnesses and
+    /// neither the coordinator nor the profile supplied a pair.
+    pin_witnesses: Option<[WitnessConfig; 2]>,
     /// Fetched from `coordinator` for this launch.
     pub fetched: Option<Deployment>,
     /// Whether the approved configuration is saved once the profile unlocks: not when a launch
@@ -124,6 +128,8 @@ pub struct FetchedConfig {
     snapshot: Option<String>,
     /// The member approved a witness change (with Touch ID) for this launch.
     changed: bool,
+    /// See [`NativeConfig`]'s field: the coordinator's pair, kept apart from this launch's.
+    pin_witnesses: Option<[WitnessConfig; 2]>,
     /// No launch flag overrides this configuration, so a later witness change on the
     /// coordinator is worth telling the member about, and approving it can be saved.
     #[cfg_attr(not(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")), allow(dead_code))]
@@ -133,24 +139,33 @@ pub struct FetchedConfig {
 impl FetchedConfig {
     pub(super) fn witnesses(&self) -> [WitnessConfig; 2] { self.deployment.nonce_witnesses.clone() }
 
+    /// The member approved a witness change for this launch, so its save must not fail silently.
+    pub(super) fn approved_change(&self) -> bool { self.changed }
+
     /// Called once the profile has unlocked. Saves the whole configuration when no launch flag
     /// overrides it; with overrides, only a witness pair the member approved for this launch.
     pub(super) fn save_unlocked(&self, data: &Path) -> Result<(), String> {
         if self.save { return commit(data, &self.origin, self.snapshot.as_deref(), Pin::Full(&self.deployment)); }
-        if self.changed { return commit(data, &self.origin, self.snapshot.as_deref(), Pin::Witnesses(&self.deployment.nonce_witnesses)); }
-        Ok(())
+        match (&self.pin_witnesses, self.changed) {
+            (Some(pin), true) => commit(data, &self.origin, self.snapshot.as_deref(), Pin::Witnesses(pin)),
+            _ => Ok(()),
+        }
     }
 
     /// For a first pairing: the trusted witness pin must be durable before the profile can
-    /// sign, so a failed save is an error. Launch-only endpoint overrides stay unsaved; the pin
-    /// of the pair this launch runs with is saved regardless.
+    /// sign, so a failed save is an error. Launch-only overrides stay unsaved, including a
+    /// `--nonce-witnesses` file: the pin is always the coordinator's pair.
     pub(super) fn save_first_use(&self, data: &Path) -> Result<(), String> {
         self.save_first_use_in(data)
     }
 
     /// [`Self::save_first_use`] into `dir`, such as a staged restore.
     pub(super) fn save_first_use_in(&self, dir: &Path) -> Result<(), String> {
-        let pin = if self.save { Pin::Full(&self.deployment) } else { Pin::Witnesses(&self.deployment.nonce_witnesses) };
+        let pin = match &self.pin_witnesses {
+            _ if self.save => Pin::Full(&self.deployment),
+            Some(pin) => Pin::Witnesses(pin),
+            None => return Err("the coordinator supplied no nonce witness pair to pin".into()),
+        };
         commit(dir, &self.origin, self.snapshot.as_deref(), pin)
     }
 }
@@ -222,7 +237,7 @@ impl NativeConfig {
         if resolved != self {
             return Err("the configuration changed after it was shown; open LokiSigner again".into());
         }
-        let (snapshot, changed) = (self.saved_witness_fingerprint, self.witness_change.is_some());
+        let (snapshot, changed, pin_witnesses) = (self.saved_witness_fingerprint, self.witness_change.is_some(), self.pin_witnesses);
         let deployment = Deployment {
             network: self.network, frostd_url: self.frostd_url, lightwalletd_url: self.lightwalletd_url,
             nonce_witnesses: self.witness_config,
@@ -232,7 +247,7 @@ impl NativeConfig {
         config.frostd_url = deployment.frostd_url.clone();
         config.lightwalletd = deployment.lightwalletd_url.clone();
         let watch = OVERRIDES.iter().all(|name| value(args, name).is_none());
-        Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save, snapshot, changed, watch }))
+        Ok(Some(FetchedConfig { origin: self.coordinator, deployment, save: self.save, snapshot, changed, pin_witnesses, watch }))
     }
 
     /// A first pairing, an unchanged pair or a `--nonce-witnesses` override needs nothing. A
@@ -366,7 +381,12 @@ impl NativeConfig {
                 nonce_witness::check(&witnesses, development_http)?;
                 Some(witnesses)
             }
-            None => pinned.or_else(|| deployment.as_ref().map(|d| d.nonce_witnesses.clone())),
+            None => pinned.clone().or_else(|| deployment.as_ref().map(|d| d.nonce_witnesses.clone())),
+        };
+        // The pin comes from the profile or the coordinator, never from a launch-only file.
+        let pin_witnesses = match flag("--nonce-witnesses") {
+            Some(_) => pinned.or_else(|| deployment.as_ref().map(|d| d.nonce_witnesses.clone())),
+            None => witness_config.clone(),
         };
         let mut missing = Vec::new();
         if network.is_none() { missing.push("network"); }
@@ -384,8 +404,6 @@ impl NativeConfig {
         let (coordinator, slot) = target.ok_or("this signer is not paired yet: open a pairing link from the wallet")?;
         let witness_config = witness_config.expect("missing configuration fields were checked");
         let witness_fingerprint = nonce_witness::fingerprint(&witness_config);
-        // Trust on first use: with nothing approved yet, the coordinator's pair is saved as is.
-        // An explicit `--nonce-witnesses` file is the member's own choice and never prompts.
         // Trust on first use only while the profile has no paired coordinator: a first pairing
         // or a fresh restore, whose save then fails closed. A paired profile without a saved
         // pin never accepts a pair silently. An explicit `--nonce-witnesses` file is the
@@ -405,6 +423,7 @@ impl NativeConfig {
             witness_fingerprint,
             witness_change,
             saved_witness_fingerprint: approved_fingerprint.map(str::to_owned),
+            pin_witnesses,
             save: (fetched.is_some() || unsaved) && OVERRIDES.iter().all(|name| flag(name).is_none()),
             fetched,
         })
@@ -870,9 +889,16 @@ mod tests {
         let args = args(&data, &[]);
         let pass = "local unlock for unsaved configuration";
         crate::profile::create(&data, pass, "Member").unwrap();
+        // The same pair is pinned, with an obsolete endpoint path: the unlock only refreshes the
+        // endpoints, with no witness change, so a failed save is logged and startup continues.
+        let mut obsolete = deployment(served());
+        obsolete.frostd_url = "https://frostd.example/rpc".into();
+        std::fs::write(data.join(SAVED), serde_json::to_vec(&Saved::Generation { origin: origin.into(),
+            witness_fingerprint: Some(nonce_witness::fingerprint(&obsolete.nonce_witnesses)), deployment: obsolete }).unwrap()).unwrap();
         let shown = NativeConfig::resolve(&args, None, |_| Ok(deployment(served()))).unwrap();
         let mut config = super::super::native_config_from_args(&args).unwrap();
         let fetched_config = shown.apply(&mut config, &args, None).unwrap();
+        std::fs::remove_file(data.join(SAVED)).unwrap();
         std::fs::create_dir(data.join(SAVED)).unwrap(); // Block the atomic rename.
         assert!(fetched_config.as_ref().unwrap().save_unlocked(&data).is_err());
         config.registration = Some(RegistrationConfig::resume(&data, false).unwrap());
