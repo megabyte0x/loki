@@ -511,8 +511,10 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
                 })?;
             } else {
                 match fetched.save_unlocked(&st.config.data) {
-                    // Never sign with a pair whose pin another launch replaced: stop instead.
-                    Err(e) if e == super::native_config::PIN_CONFLICT => {
+                    // Never sign with a pair whose pin another launch replaced, nor with an
+                    // approved change that didn't persist (the next unlock would silently
+                    // return to the old pair): stop and tell the member instead.
+                    Err(e) if e == super::native_config::PIN_CONFLICT || fetched.approved_change() => {
                         eprintln!("signer configuration not saved: {e}");
                         return Err("signer-config-not-saved".into());
                     }
