@@ -20,8 +20,9 @@ pub struct RegistrationConfig {
     pub passphrase_file: Option<PathBuf>,
     pub name: String,
     pub pairing_challenge: Option<String>,
-    /// The member typed the coordinator address, so LokiSigner fetched the pairing link itself.
-    /// If that link expires before registration finishes, ask for a new one for the same slot once.
+    /// The member typed the coordinator address: LokiSigner fetched the pairing link itself, or
+    /// is finishing a pending profile's registration without a link. If that expires before
+    /// registration finishes, ask for a new reservation for the same slot once.
     pub renew_pairing: bool,
 }
 
@@ -549,9 +550,18 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         // not to an expiring claim.
         let mut registered = register_once(st, pass.clone(), launch.pairing_challenge.clone(), notice.cloned()).await;
         if let (true, Some(slot), Err(RegistrationFailure::Refused(_, Refusal::ExpiredChallenge))) = (launch.renew_pairing, launch.slot, &registered) {
-            // The link the address gave expired before the member finished. Ask the same
-            // coordinator for the same slot once more, without asking the member again.
-            if let Ok(link) = request_pairing_link(&launch.coordinator, Some(slot), st.config.development_http).await {
+            // The reservation expired before the member finished, possibly while Touch ID was
+            // open: that signature answered the old challenge, and a new one needs its own. Say
+            // so before asking again; the member may stop here instead. The passphrase stays here.
+            let go_on = notice.is_none_or(|notice| notice("pairing-renew", RENEW_NOTICE));
+            if go_on {
+                // A fresh reservation for the same slot, once. Its own refusal (the slot went to
+                // someone else, a limit, an outage) is what the member sees, not the expiry.
+                let link = request_pairing_link(&launch.coordinator, Some(slot), st.config.development_http).await.map_err(|reason| {
+                    native_event!(st, Event::PairingRefused(reason));
+                    eprintln!("native pairing renewal refused: {reason:?}");
+                    reason.native_code().to_owned()
+                })?;
                 native_event!(st, Event::ChallengeRenewed);
                 let renewed = RegistrationConfig::pairing(&link, st.config.development_http)?;
                 registered = register_once(st, pass.clone(), renewed.pairing_challenge, notice.cloned()).await;
@@ -596,6 +606,7 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
 }
 
 const PAIRING_PENDING: &str = "pairing-registration-pending";
+const RENEW_NOTICE: &str = "The coordinator’s reservation for this Mac ran out before registration finished. LokiSigner can ask for the same slot again. Touch ID will then ask once more, because the new reservation needs its own approval.";
 
 /// True while a native pairing has written its profile but the coordinator never accepted the
 /// registration (for example, the pairing link expired). Such a profile has no recovery words yet.
@@ -753,8 +764,17 @@ pub(super) fn coordinator_address(typed: &str, development_http: bool) -> Result
     if typed.is_empty() || typed.len() > 253 + 16 || typed.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(ADDRESS_INVALID.into());
     }
-    let candidate = if typed.contains("://") { typed.to_owned() } else { format!("https://{typed}") };
-    let url = reqwest::Url::parse(&candidate).map_err(|_| ADDRESS_INVALID)?;
+    // Check the authority as typed, before URL parsing normalises a path like `/x/..` to `/`.
+    let (scheme, rest) = match typed.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http") => (scheme, rest),
+        Some(_) => return Err(ADDRESS_INVALID.into()),
+        None => ("https", typed),
+    };
+    let authority = rest.strip_suffix('/').unwrap_or(rest);
+    if authority.is_empty() || authority.contains(['/', '\\', '?', '#', '@', '%']) {
+        return Err(ADDRESS_INVALID.into());
+    }
+    let url = reqwest::Url::parse(&format!("{}://{authority}", scheme.to_ascii_lowercase())).map_err(|_| ADDRESS_INVALID)?;
     if url.path() != "/" || url.query().is_some() || url.fragment().is_some()
         || !url.username().is_empty() || url.password().is_some() || url.host_str().is_none_or(str::is_empty) {
         return Err(ADDRESS_INVALID.into());
@@ -796,23 +816,33 @@ pub(super) async fn request_pairing_link(origin: &str, slot: Option<u32>, develo
     Ok(reply.url)
 }
 
-/// The native app's "pair by address": a `loki://pair` link from the typed coordinator, for the
-/// saved slot of a profile already pinned to it. `args` carry the locked canonical `--data`.
+/// What pairing by address should do next.
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) fn request_pairing(args: &[String], typed: &str) -> Result<String, String> {
+pub(crate) enum AddressPairing {
+    /// A fresh profile: run the usual review with this `loki://pair` link.
+    Link(String),
+    /// The profile is already pinned to this coordinator (for example its registration never
+    /// finished, or finished but the reply was lost): unlock it and register without a claim,
+    /// proving the identity's keys. Only if that expires is a new reservation requested.
+    Resume,
+}
+
+/// The native app's "pair by address". A pinned profile never asks for a reservation up front:
+/// its own slot may already be registered to it, which a new reservation could never free.
+/// `args` carry the locked canonical `--data`.
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) fn request_pairing(args: &[String], typed: &str) -> Result<AddressPairing, String> {
     use super::{diagnostics::Event, native_member::emit};
     let config = super::native_config_from_args(args)?;
     let development_http = config.development_http;
     let origin = coordinator_address(typed, development_http)?;
-    let pinned = config.data.join("paired-coordinator.json").try_exists().map_err(|_| "LokiSigner could not access its profile.")?;
-    let slot = if pinned {
+    if config.data.join("paired-coordinator.json").try_exists().map_err(|_| "LokiSigner could not access its profile.")? {
         let saved = RegistrationConfig::resume(&config.data, development_http).map_err(|_| "LokiSigner could not open its existing profile.")?;
-        if saved.coordinator != origin { return Err("different-pairing".into()); }
-        saved.slot
-    } else { None };
+        return if saved.coordinator == origin { Ok(AddressPairing::Resume) } else { Err("different-pairing".into()) };
+    }
     emit(Event::PairingRequested);
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
-    runtime.block_on(request_pairing_link(&origin, slot, development_http)).map_err(|reason| {
+    runtime.block_on(request_pairing_link(&origin, None, development_http)).map(AddressPairing::Link).map_err(|reason| {
         emit(Event::PairingRefused(reason));
         reason.message().to_owned()
     })

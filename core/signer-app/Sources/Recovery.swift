@@ -12,6 +12,18 @@ enum SignerStartFailure: Error, Equatable {
     case key(String), keyGone(String), registrationRosterUnavailable, testnetOnly
     case registrationExpired, pairingRefused(String)
 
+    /// What the member sees when renewing an expired reservation was refused (pairing codes
+    /// 15–19). Same wording as Rust's `PairingRefusal::message`.
+    static func renewalRefusal(_ code: Int32) -> String {
+        switch code {
+        case 15: return "The coordinator is limiting new pairings right now. Try again later."
+        case 16: return "The coordinator has no free member slot right now. Try again later, or ask whoever runs it."
+        case 17: return "This Mac’s member slot went to someone else while it was reserved. Remove this profile and pair again with the coordinator address."
+        case 18: return "LokiSigner couldn’t reach the coordinator to renew this Mac’s reservation. Check your connection, then pair again with the coordinator address."
+        default: return "The coordinator didn’t renew this Mac’s reservation. Try again, or ask whoever runs it."
+        }
+    }
+
     var keyIsGone: Bool {
         if case .keyGone = self { return true }
         return false

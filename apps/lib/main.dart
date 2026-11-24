@@ -1193,7 +1193,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
     spacing: 10,
     children: [
       const Notice(
-        'This Mac’s registration with the coordinator didn’t finish. Enter the coordinator address again to ask for the same slot.',
+        'This Mac’s registration with the coordinator didn’t finish. Enter the coordinator address again, then your passphrase: LokiSigner first tries to finish with this profile, and asks for its slot again only if that has expired.',
       ),
       if (enteringLink) coordinatorAddressField(),
       Wrap(

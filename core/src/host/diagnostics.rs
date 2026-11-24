@@ -14,6 +14,17 @@ pub(super) enum DraftRefusal { WaitingForConfirmations, NoSingleNote, Insufficie
 pub(crate) enum PairingRefusal { RateLimited, SlotsFull, SlotTaken, Unreachable, Other }
 
 impl PairingRefusal {
+    /// The native pairing result when renewing an expired reservation was refused.
+    pub(crate) fn native_code(self) -> &'static str {
+        match self {
+            Self::RateLimited => "renewal-rate-limited",
+            Self::SlotsFull => "renewal-slots-full",
+            Self::SlotTaken => "renewal-slot-taken",
+            Self::Unreachable => "renewal-unreachable",
+            Self::Other => "renewal-refused",
+        }
+    }
+
     /// What the member sees. Fixed wording; never the coordinator's.
     pub(crate) fn message(self) -> &'static str {
         match self {
