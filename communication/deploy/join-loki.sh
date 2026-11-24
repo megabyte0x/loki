@@ -10,7 +10,6 @@
 # (NO_TUNNEL=1) — no per-member tunnel.
 #
 # Env:
-#   LOKI_ONBOARDING_GRANT  one-use grant from the coordinator operator (required)
 #   FROSTD_URL   frostd loopback url     (default http://127.0.0.1:2744)
 #   FROSTD_HOST  ssh host for the tunnel (default omarchy)
 # Plus anything run-member.sh honours (DATA, PORT, LWD_URL, NETWORK, MEMBER_BIN).
@@ -23,9 +22,6 @@ fi
 coordinator=${1%/}
 slot=${2:-}
 [[ -z $slot || $slot =~ ^([1-9]|1[0-6])$ ]] || { echo "slot must be in 1..16" >&2; exit 2; }
-[[ ${LOKI_ONBOARDING_GRANT:-} =~ ^[0-9a-f]{64}$ ]] || { echo "an onboarding grant from the coordinator operator is required" >&2; exit 2; }
-grant=$LOKI_ONBOARDING_GRANT
-unset LOKI_ONBOARDING_GRANT
 
 deploy=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$deploy/../.." && pwd -P)
@@ -51,10 +47,11 @@ else
   echo "frostd reachable via tunnel"
 fi
 
-# 3. Let the coordinator choose and reserve a slot, or reserve the grant's explicit slot.
-requested_slot=
-if [[ -n $slot ]]; then requested_slot=",\"slot\":$slot"; fi
-if ! reservation=$(printf '{"onboarding_grant":"%s"%s}' "$grant" "$requested_slot" |
+# 3. Let the coordinator choose and reserve the lowest free slot, or ask for an explicit one.
+#    The coordinator admits anyone, rate-limited per client and by its hourly sign-up cap.
+body='{}'
+if [[ -n $slot ]]; then body="{\"slot\":$slot}"; fi
+if ! reservation=$(printf '%s' "$body" |
     curl -qfsS --globoff --proto '=https' --max-time 10 --max-filesize 4096 --data-binary @- -H 'Content-Type: application/json' "$coordinator/api/members/pairing" |
     python3 -c '
 import json, re, sys

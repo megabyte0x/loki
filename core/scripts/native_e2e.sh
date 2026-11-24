@@ -110,12 +110,9 @@ for pid in "${relay_pids[@]}"; do wait "$pid"; done
 awk -v a="${relay_pids[0]}" -v b="${relay_pids[1]}" '$0 != a && $0 != b' "$root/pids" >"$root/pids.next"
 mv "$root/pids.next" "$root/pids"
 [[ -d $repo/web/wallet/node_modules ]] || ( cd "$repo/web/wallet" && { npm ci || npm ci --legacy-peer-deps; } )
-for n in 1 2 3; do
-  onboarding[n]=$(openssl rand -hex 32)
-  digest=$(printf '%s' "${onboarding[n]}" | openssl dgst -sha256 -r)
-  ( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" node scripts/grants.ts register "${digest%% *}" --slot "$n" )
-done
+# All three members pair from this machine within a minute: raise the admission limits locally.
 ( cd "$repo/web/wallet" && LOKI_REGISTRY="$root/registry.json" LOKI_DEV_FAUCET=1 \
+    LOKI_SIGNUPS_PER_HOUR=16 LOKI_IP_PAIRING_PER_MINUTE=100 LOKI_IP_PAIRING_PER_DAY=1000 \
     exec nohup npx next dev --hostname 127.0.0.1 --port "$web_port" ) >"$root/coordinator.log" 2>&1 &
 echo $! >>"$root/pids"
 wait_for 180 "coordinator did not start; see $root/coordinator.log" curl -sf -m 5 "$coord/api/members" -o /dev/null
@@ -133,10 +130,9 @@ registered() { curl -sf -m 5 "$coord/api/members" | jq -e --argjson s "$1" 'any(
 for n in 1 2 3; do
   port=$((base_port+n))
   say "pair member $n (slot $n, local API :$port)"
-  link=$(printf '{"slot":%d,"onboarding_grant":"%s"}' "$n" "${onboarding[n]}" |
+  link=$(printf '{"slot":%d}' "$n" |
     curl -qsf -m 10 -H 'Content-Type: application/json' --data-binary @- "$coord/api/members/pairing" | jq -er .url) \
     || fail "the coordinator issued no pairing link for slot $n"
-  unset 'onboarding[n]'
   printf '' | pbcopy
   printf '%s\n' "$link" | "$app/Contents/MacOS/LokiSigner" native --pairing-stdin --development-http --data "$root/m$n" --port "$port" \
     --network "$network" --lightwalletd-url "$lwd" --frostd-url "$frostd_url" \
