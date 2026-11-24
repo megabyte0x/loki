@@ -919,7 +919,7 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
     // receiver takes after this lock.
     let Ok(_receiving) = lock.try_lock() else { return Ok(()) };
     let (batches, fetch_error) = fetch_control(st, vault, v, target, &BTreeSet::new());
-    apply_control(st, data, pass, vault, v, batches)?;
+    apply_received(st, data, pass, vault, v, batches)?;
     fetch_error.map_or(Ok(()), Err)
 }
 
@@ -959,7 +959,78 @@ fn control_receiver(st: &AppState, vault: &str) -> Result<Arc<std::sync::Mutex<(
 struct ControlBatch {
     session: Uuid,
     proposer: u16,
-    messages: Vec<crate::transport::Incoming>,
+    messages: Vec<Pending>,
+}
+
+/// One drained control message, with the vaults that already failed to open it.
+pub(super) struct Pending {
+    message: crate::transport::Incoming,
+    tried: BTreeSet<String>,
+    at: std::time::Instant,
+}
+
+impl Pending {
+    fn new(message: crate::transport::Incoming) -> Self {
+        Self { message, tried: BTreeSet::new(), at: std::time::Instant::now() }
+    }
+}
+
+/// A control message set aside for another vault. One device's identity serves all its vaults, so
+/// vaults with the same roster share control sessions and either vault's receive can drain the
+/// other's messages. Opening is bound to the vault (`control_context`), so only the vault a message
+/// belongs to can apply it; until that vault takes it, it waits here instead of being lost.
+pub(super) struct Stashed {
+    session: Uuid,
+    pending: Pending,
+}
+
+const STASH_TTL: Duration = Duration::from_secs(600);
+const STASH_MAX: usize = 1024;
+
+/// Sets aside messages this vault couldn't open.
+fn stash(st: &AppState, vault: &str, session: Uuid, unopened: Vec<Pending>) {
+    let Ok(mut stash) = st.control_stash.lock() else { return };
+    for mut pending in unopened {
+        pending.tried.insert(vault.to_owned());
+        if stash.len() >= STASH_MAX { stash.remove(0); }
+        stash.push(Stashed { session, pending });
+    }
+}
+
+/// The set-aside messages of sessions this vault knows as its own control mailbox and hasn't
+/// tried yet, oldest first, ahead of anything newly drained.
+fn take_stashed(st: &AppState, vault: &str) -> Vec<ControlBatch> {
+    let Ok(mut stash) = st.control_stash.lock() else { return Vec::new() };
+    stash.retain(|s| s.pending.at.elapsed() < STASH_TTL);
+    let owners: Vec<Option<u16>> = {
+        let Ok(known) = st.control_sessions.lock() else { return Vec::new() };
+        stash.iter().map(|s| known.get(&(vault.to_owned(), s.session)).copied().flatten()).collect()
+    };
+    let mut batches: Vec<ControlBatch> = Vec::new();
+    let mut keep = Vec::new();
+    for (s, owner) in stash.drain(..).zip(owners) {
+        match owner {
+            Some(proposer) if !s.pending.tried.contains(vault) => {
+                match batches.iter_mut().find(|b| b.session == s.session) {
+                    Some(batch) => batch.messages.push(s.pending),
+                    None => batches.push(ControlBatch { session: s.session, proposer, messages: vec![s.pending] }),
+                }
+            }
+            _ => keep.push(s),
+        }
+    }
+    *stash = keep;
+    batches
+}
+
+/// Applies set-aside and newly drained messages, then sets aside what this vault couldn't open.
+fn apply_received(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault, batches: Vec<ControlBatch>) -> Result<(), String> {
+    let mut all = take_stashed(st, vault);
+    all.extend(batches);
+    let mut unopened = Vec::new();
+    let result = apply_control(st, data, pass, vault, v, all, &mut unopened);
+    for (session, pending) in unopened { stash(st, vault, session, vec![pending]); }
+    result
 }
 
 /// The network half of a control sync: lists this member's sessions and drains the roster-owned
@@ -1011,7 +1082,7 @@ fn fetch_control(st: &AppState, vault: &str, v: &Vault, target: Option<(&FrostdT
             (proposer, Duration::from_secs(30))
         };
         match tx.recv_control_bounded(session, timeout) {
-            Ok(messages) => batches.push(ControlBatch { session, proposer, messages }),
+            Ok(messages) => batches.push(ControlBatch { session, proposer, messages: messages.into_iter().map(Pending::new).collect() }),
             Err(e) => return (batches, Some(e.to_string())),
         }
     }
@@ -1020,10 +1091,14 @@ fn fetch_control(st: &AppState, vault: &str, v: &Vault, target: Option<(&FrostdT
 }
 
 /// Applies drained control messages to this member's payment records. Runs under `st.payment`.
-fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault, batches: Vec<ControlBatch>) -> Result<(), String> {
+/// Messages this vault can't open go to `unopened`: they may belong to another vault (`Stashed`).
+fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault, batches: Vec<ControlBatch>,
+    unopened: &mut Vec<(Uuid, Pending)>,
+) -> Result<(), String> {
     for ControlBatch { session, proposer, messages } in batches {
         if st.is_stopping() { return Err("profile is locked".into()); }
-        for msg in messages {
+        for pending in messages {
+            let msg = &pending.message;
             let Some(peer) = v
                 .peers
                 .values()
@@ -1033,6 +1108,7 @@ fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
             };
             let context = control_context(vault, session, v.slot, peer.id)?;
             let Ok(opened) = v.identity.open_session(peer, &context, &msg.message) else {
+                unopened.push((session, pending));
                 continue;
             };
             if opened.kind() != MessageKind::PeerReply {
@@ -2790,7 +2866,7 @@ fn control_round(st: &Shared, data: &Path, pass: &str, vault: &str) {
             };
             let (batches, fetch_error) = fetch_control(st, vault, &v, None, &skip);
             let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-            apply_control(st, data, pass, vault, &v, batches)?;
+            apply_received(st, data, pass, vault, &v, batches)?;
             fetch_error
         };
         restore_workers(st, data, pass, vault, v.slot)?;

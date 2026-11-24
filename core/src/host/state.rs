@@ -450,6 +450,9 @@ pub struct AppState {
     /// Per (vault, frostd session): the roster member who owns it, or `None` for a session that
     /// isn't this vault's control mailbox. A session's owner and members never change.
     pub(super) control_sessions: std::sync::Mutex<BTreeMap<(String, uuid::Uuid), Option<u16>>>,
+    /// Control messages a vault drained but couldn't open: vaults with the same roster share
+    /// control sessions, so the vault each belongs to takes it from here (`payment::take_stashed`).
+    pub(super) control_stash: std::sync::Mutex<Vec<super::payment::Stashed>>,
     pub active_dkgs: std::sync::Mutex<BTreeSet<String>>,
     /// The creator's frostd loop answering joiners is running (`ceremony::spawn_join_relay`).
     pub(super) join_relay: std::sync::atomic::AtomicBool,
@@ -510,6 +513,7 @@ impl AppState {
             control_receivers: std::sync::Mutex::new(BTreeMap::new()),
             control_status: std::sync::Mutex::new(BTreeMap::new()),
             control_sessions: std::sync::Mutex::new(BTreeMap::new()),
+            control_stash: std::sync::Mutex::new(Vec::new()),
             active_dkgs: std::sync::Mutex::new(BTreeSet::new()),
             join_relay: std::sync::atomic::AtomicBool::new(false),
             device_auth: std::sync::Mutex::new(None),
