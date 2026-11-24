@@ -362,8 +362,13 @@ IDs, mailboxes and URLs), even when launch-only flags keep the endpoints themsel
 the save fails, pairing or restore stops. A `--nonce-witnesses` file is launch-only too: that
 launch signs with it, but the pin is always the coordinator's pair. Unlocks run with the saved pair, so keeping it never
 depends on the coordinator. A paired profile with no saved pin treats any pair as a change.
-A pin is never overwritten if it changed after the configuration was shown, and a witness
-change the member approved must be saved: either failure stops startup and LokiSigner says so.
+An existing pin is replaced only by a change the member approved with Touch ID, never by a
+retry, a refresh or a `--nonce-witnesses` launch (which keeps the saved pin). First use applies
+only when no pin exists. A pin that changed after the configuration was shown, or an approved
+change that can't be saved, stops startup and LokiSigner says so. If the new record is in place
+but its save can't be confirmed durable, LokiSigner says that the next unlock will most likely
+use it. With launch flags, the review shows which pair this launch signs with and which pair the
+next launch without flags uses.
 
 Every native launch (the wallet app, and the standalone app's native and serve modes, pairing,
 restore and witness approval) holds an exclusive lock on `<profile>.lock`, beside the profile
