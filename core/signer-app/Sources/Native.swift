@@ -1729,7 +1729,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 case 11: failure = .witnessesNotSaved
                 case 13: failure = .witnessesSaveUncertain
                 case 14: failure = .registrationExpired
-                case 15...19: failure = .pairingRefused(SignerStartFailure.renewalRefusal(code))
+                case 15...20: failure = .pairingRefused(SignerStartFailure.renewalRefusal(code))
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil

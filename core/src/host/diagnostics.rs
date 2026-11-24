@@ -11,7 +11,14 @@ pub(super) enum DraftRefusal { WaitingForConfirmations, NoSingleNote, Insufficie
 
 /// Why the coordinator gave no pairing link for a typed address, without its text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PairingRefusal { RateLimited, SlotsFull, SlotTaken, Unreachable, Other }
+pub(crate) enum PairingRefusal {
+    RateLimited, SlotsFull,
+    /// The coordinator holds the slot: a reservation that may expire, or a registration.
+    SlotHeld,
+    /// The public roster confirms another identity registered the slot.
+    SlotRegistered,
+    Unreachable, Other,
+}
 
 impl PairingRefusal {
     /// The native pairing result when renewing an expired reservation was refused.
@@ -19,7 +26,8 @@ impl PairingRefusal {
         match self {
             Self::RateLimited => "renewal-rate-limited",
             Self::SlotsFull => "renewal-slots-full",
-            Self::SlotTaken => "renewal-slot-taken",
+            Self::SlotHeld => "renewal-slot-held",
+            Self::SlotRegistered => "renewal-slot-registered",
             Self::Unreachable => "renewal-unreachable",
             Self::Other => "renewal-refused",
         }
@@ -30,7 +38,8 @@ impl PairingRefusal {
         match self {
             Self::RateLimited => "The coordinator is limiting new pairings right now. Try again later.",
             Self::SlotsFull => "The coordinator has no free member slot right now. Try again later, or ask whoever runs it.",
-            Self::SlotTaken => "This Mac’s member slot is still reserved or already taken. Wait two minutes and try again, or remove this profile and pair again.",
+            Self::SlotHeld => "The coordinator is holding this member slot right now. Wait two minutes for the hold to expire, then try again.",
+            Self::SlotRegistered => "Another member registered this slot. Remove this profile and pair again with the coordinator address.",
             Self::Unreachable => "LokiSigner couldn’t reach the coordinator. Check the address and your connection, then try again.",
             Self::Other => "The coordinator didn’t give this Mac a pairing link. Try again, or ask whoever runs it.",
         }
@@ -90,6 +99,7 @@ impl Event {
             Event::RegistrationFailed => ("LokiSigner couldn’t register with the coordinator.", Kind::Error),
             Event::CoordinatorUnavailable => ("LokiSigner couldn’t reach the coordinator. Check your connection.", Kind::Error),
             Event::RegistrationRefused(reason) => (match reason {
+                Refusal::ExpiredClaim => "The coordinator refused this pairing before this Mac signed: the reservation expired or changed.",
                 Refusal::ExpiredChallenge => "The coordinator refused to register this device: the pairing link expired, was already used or changed. Pair again with the coordinator address.",
                 Refusal::RateLimited => "The coordinator refused to register this device: it has reached its sign-up or request limit. Try again later.",
                 Refusal::SlotTaken => "The coordinator refused to register this device: that member slot is already registered or reserved.",
@@ -123,7 +133,8 @@ impl Event {
             Event::PairingRefused(reason) => (match reason {
                 PairingRefusal::RateLimited => "Pairing refused: the coordinator is rate limiting new pairings.",
                 PairingRefusal::SlotsFull => "Pairing refused: the coordinator has no free member slot.",
-                PairingRefusal::SlotTaken => "Pairing refused: this profile’s member slot is reserved or taken.",
+                PairingRefusal::SlotHeld => "Pairing refused: the coordinator is holding this member slot.",
+                PairingRefusal::SlotRegistered => "Pairing refused: another member registered this slot.",
                 PairingRefusal::Unreachable => "Pairing failed: LokiSigner couldn’t reach the coordinator.",
                 PairingRefusal::Other => "Pairing refused by the coordinator.",
             }, Kind::Error),
@@ -153,13 +164,13 @@ mod tests {
             Event::PaymentApproved, Event::PaymentRefused, Event::PaymentSigned,
             Event::PairingRequested, Event::ChallengeRenewed,
         ];
-        for reason in [Refusal::ExpiredChallenge, Refusal::RateLimited, Refusal::SlotTaken, Refusal::WrongSlot, Refusal::Other] {
+        for reason in [Refusal::ExpiredClaim, Refusal::ExpiredChallenge, Refusal::RateLimited, Refusal::SlotTaken, Refusal::WrongSlot, Refusal::Other] {
             events.push(Event::RegistrationRefused(reason));
         }
         for reason in [DraftRefusal::WaitingForConfirmations, DraftRefusal::NoSingleNote, DraftRefusal::InsufficientFunds, DraftRefusal::Other] {
             events.push(Event::DraftRefused(reason));
         }
-        for reason in [PairingRefusal::RateLimited, PairingRefusal::SlotsFull, PairingRefusal::SlotTaken, PairingRefusal::Unreachable, PairingRefusal::Other] {
+        for reason in [PairingRefusal::RateLimited, PairingRefusal::SlotsFull, PairingRefusal::SlotHeld, PairingRefusal::SlotRegistered, PairingRefusal::Unreachable, PairingRefusal::Other] {
             events.push(Event::PairingRefused(reason));
         }
         for reason in [PaymentFailure::ApprovalTimeout, PaymentFailure::Refused, PaymentFailure::ShareDeadline, PaymentFailure::Other] {

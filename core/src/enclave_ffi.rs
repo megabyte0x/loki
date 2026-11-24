@@ -735,7 +735,10 @@ pub unsafe extern "C" fn loki_member_app_pair(
             // Renewing an expired reservation was refused; these replace the expiry.
             "renewal-rate-limited" => 15,
             "renewal-slots-full" => 16,
-            "renewal-slot-taken" => 17,
+            "renewal-slot-registered" => 17,
+            "renewal-slot-held" => 20,
+            // The member chose Cancel before a renewal's second Touch ID: like other setup dialogs.
+            "renewal-cancelled" => 10,
             "renewal-unreachable" => 18,
             "renewal-refused" => 19,
             _ => 1,

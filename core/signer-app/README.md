@@ -18,9 +18,11 @@ by address: choose **Pair this Mac**, type the coordinator address (for example
 `loki.megabyte.sh`), then review the coordinator and slot, the configuration, your passphrase
 and Touch ID. LokiSigner asks `POST /api/members/pairing` for the link itself and checks that it
 names the typed origin and the reserved slot. If the reservation expires before registration
-finishes, LokiSigner explains that Touch ID will ask once more and, if you continue, requests
-the same slot again without asking for your passphrase; a refusal of that request is shown
-as its own reason. A profile whose registration never finished asks for the address again,
+finishes, LokiSigner requests the same slot again without asking for your passphrase. If the
+reservation ran out before anything was signed, that happens by itself; if it ran out after
+Touch ID, LokiSigner first explains that Touch ID will ask once more. A refusal of that
+request is shown as its own reason, and only a slot registered to another member suggests
+removing the profile. A profile whose registration never finished asks for the address again,
 then unlocks and registers without a claim first, which also recovers a registration whose
 reply was lost; it requests its slot again only if that has expired.
 
@@ -327,8 +329,8 @@ Pairing reserves a slot for 120 seconds. Both claim and registration are consume
 including failed proofs; claiming does not extend the deadline. If it expires while saving
 recovery words, enter the coordinator address again in LokiSigner (or choose **Get a new link**
 in the wallet), which asks for the same slot (or, from the wallet, a new one if another member
-took it meanwhile). A pairing started from an address renews an expired reservation once,
-after telling you Touch ID will ask again. After
+took it meanwhile). A pairing started from an address renews an expired reservation once
+(after telling you Touch ID will ask again, if you had already approved). After
 a lost response, choose **Try again** and unlock; an outstanding reservation may need to expire before
 retry. Public device bindings prevent a different identity or slot from reusing the enrolled
 key.

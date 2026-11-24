@@ -182,12 +182,20 @@ const IP_LIMIT: &str = "Too many pairing requests from this network. Try again l
 /// Why the coordinator refused a registration. It is recognised only from the coordinator's exact
 /// error text, so none of that text reaches logs or the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Refusal { ExpiredChallenge, RateLimited, SlotTaken, WrongSlot, Other }
+pub(super) enum Refusal {
+    /// The pairing claim was refused before this device signed anything (the reservation ran out
+    /// during review, or the link changed).
+    ExpiredClaim,
+    /// The signed proof was refused: its challenge ran out (possibly while Touch ID was open).
+    ExpiredChallenge,
+    RateLimited, SlotTaken, WrongSlot, Other,
+}
 
 impl Refusal {
     fn from_coordinator(error: Option<&str>) -> Self {
         match error {
-            Some("unknown, expired or changed pairing challenge" | "unknown, expired or changed registration challenge"
+            Some("unknown, expired or changed pairing challenge") => Self::ExpiredClaim,
+            Some("unknown, expired or changed registration challenge"
                 | "registration generation changed; request a new challenge") => Self::ExpiredChallenge,
             Some(SIGNUP_LIMIT | IP_LIMIT) => Self::RateLimited,
             Some("slot already registered or reserved") => Self::SlotTaken,
@@ -213,7 +221,7 @@ impl RegistrationFailure {
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
             Self::Device(DeviceKeyError::CoordinatorUnavailable(_)) => "coordinator-roster-unreachable",
             Self::Device(_) => "device-key",
-            Self::Refused(_, Refusal::ExpiredChallenge) => "registration-expired",
+            Self::Refused(_, Refusal::ExpiredClaim | Refusal::ExpiredChallenge) => "registration-expired",
             Self::WrongSlot | Self::Refused(..) => "registration-refused",
             Self::Connection(_) => "registration-failed",
             Self::Other(_) => "native registration stopped",
@@ -549,23 +557,32 @@ async fn start_with(st: &Shared, pass: Option<Zeroizing<String>>, notice: Option
         // Complete enrollment before minting words: the slot then belongs to this identity,
         // not to an expiring claim.
         let mut registered = register_once(st, pass.clone(), launch.pairing_challenge.clone(), notice.cloned()).await;
-        if let (true, Some(slot), Err(RegistrationFailure::Refused(_, Refusal::ExpiredChallenge))) = (launch.renew_pairing, launch.slot, &registered) {
-            // The reservation expired before the member finished, possibly while Touch ID was
-            // open: that signature answered the old challenge, and a new one needs its own. Say
-            // so before asking again; the member may stop here instead. The passphrase stays here.
-            let go_on = notice.is_none_or(|notice| notice("pairing-renew", RENEW_NOTICE));
-            if go_on {
-                // A fresh reservation for the same slot, once. Its own refusal (the slot went to
-                // someone else, a limit, an outage) is what the member sees, not the expiry.
-                let link = request_pairing_link(&launch.coordinator, Some(slot), st.config.development_http).await.map_err(|reason| {
+        let expired = match &registered {
+            Err(RegistrationFailure::Refused(_, reason @ (Refusal::ExpiredClaim | Refusal::ExpiredChallenge))) => Some(*reason),
+            _ => None,
+        };
+        if let (true, Some(slot), Some(expired)) = (launch.renew_pairing, launch.slot, expired) {
+            // The reservation ran out. Before signing (during review), renew silently: the member
+            // already approved this origin and slot. After signing (possibly while Touch ID was
+            // open), that approval answered the old challenge and the new one needs its own, so
+            // say so first; Cancel stops like any other setup dialog. The passphrase stays here.
+            if expired == Refusal::ExpiredChallenge && notice.is_some_and(|notice| !notice("pairing-renew", RENEW_NOTICE)) {
+                return Err("renewal-cancelled".into());
+            }
+            // A fresh reservation for the same slot, once. Its own refusal (the slot is held or
+            // registered, a limit, an outage) is what the member sees, not the expiry.
+            let link = match request_pairing_link(&launch.coordinator, Some(slot), st.config.development_http).await {
+                Ok(link) => link,
+                Err(reason) => {
+                    let reason = if reason == PairingRefusal::SlotHeld { slot_conflict(st, &pass, &launch.coordinator, slot).await } else { reason };
                     native_event!(st, Event::PairingRefused(reason));
                     eprintln!("native pairing renewal refused: {reason:?}");
-                    reason.native_code().to_owned()
-                })?;
-                native_event!(st, Event::ChallengeRenewed);
-                let renewed = RegistrationConfig::pairing(&link, st.config.development_http)?;
-                registered = register_once(st, pass.clone(), renewed.pairing_challenge, notice.cloned()).await;
-            }
+                    return Err(reason.native_code().into());
+                }
+            };
+            native_event!(st, Event::ChallengeRenewed);
+            let renewed = RegistrationConfig::pairing(&link, st.config.development_http)?;
+            registered = register_once(st, pass.clone(), renewed.pairing_challenge, notice.cloned()).await;
         }
         registered.map_err(|e| {
             eprintln!("native coordinator registration failed: {e}");
@@ -796,24 +813,50 @@ pub(super) async fn request_pairing_link(origin: &str, slot: Option<u32>, develo
     let mut response = client.post(format!("{origin}/api/members/pairing")).json(&body).send().await
         .map_err(|_| PairingRefusal::Unreachable)?;
     let status = response.status();
-    let body = read_bounded(&mut response, 2048).await.map_err(|_| PairingRefusal::Unreachable)?;
     if !status.is_success() {
-        let json = serde_json::from_slice::<serde_json::Value>(&body).ok();
+        // The body only refines the reason; a large or unreadable one (a proxy's error page)
+        // still leaves the status, so a proxy's 429 reads as a rate limit, not an outage.
+        let body = read_bounded(&mut response, 2048).await.ok();
+        let json = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
         return Err(match json.as_ref().and_then(|json| json["error"].as_str()) {
             Some(SIGNUP_LIMIT | IP_LIMIT) => PairingRefusal::RateLimited,
             Some("no free slot (1..16)" | "too many pending registrations") => PairingRefusal::SlotsFull,
-            Some("slot already registered or reserved") => PairingRefusal::SlotTaken,
+            Some("slot already registered or reserved") => PairingRefusal::SlotHeld,
             _ if status == reqwest::StatusCode::TOO_MANY_REQUESTS => PairingRefusal::RateLimited,
             _ if status.is_server_error() => PairingRefusal::Unreachable,
             _ => PairingRefusal::Other,
         });
     }
+    let body = read_bounded(&mut response, 2048).await.map_err(|_| PairingRefusal::Unreachable)?;
     let reply: Reply = serde_json::from_slice(&body).map_err(|_| PairingRefusal::Other)?;
     let link = RegistrationConfig::pairing(&reply.url, development_http).map_err(|_| PairingRefusal::Other)?;
     if link.coordinator != origin || link.slot != Some(reply.slot) || slot.is_some_and(|slot| slot != reply.slot) {
         return Err(PairingRefusal::Other);
     }
     Ok(reply.url)
+}
+
+/// Whether a held `slot` is confirmed registered to another identity on the public roster
+/// (`SlotRegistered`), or may be a temporary reservation that will expire (`SlotHeld`). Only a
+/// confirmed conflict justifies telling the member to remove this profile.
+async fn slot_conflict(st: &Shared, pass: &Zeroizing<String>, origin: &str, slot: u32) -> PairingRefusal {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Roster { slots: Vec<PublicMember> }
+    let (data, secret) = (st.config.data.clone(), pass.clone());
+    let own = tokio::task::spawn_blocking(move || super::ceremony::identity(&data, &secret, 1).map(|identity| hex::encode(identity.public().signing))).await;
+    let Ok(Ok(own)) = own else { return PairingRefusal::SlotHeld };
+    let roster = async {
+        let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(15)).build().ok()?;
+        let mut response = client.get(format!("{origin}/api/members")).send().await.ok()?;
+        if !response.status().is_success() { return None; }
+        serde_json::from_slice::<Roster>(&read_bounded(&mut response, 32 * 1024).await.ok()?).ok()
+    }.await;
+    match roster {
+        Some(roster) if roster.slots.iter().any(|m| m.slot == slot && !m.signing_pubkey.eq_ignore_ascii_case(&own)) => PairingRefusal::SlotRegistered,
+        _ => PairingRefusal::SlotHeld,
+    }
 }
 
 /// What pairing by address should do next.
@@ -871,7 +914,7 @@ mod tests {
     #[test]
     fn coordinator_refusals_map_only_exact_text_to_fixed_reasons() {
         for (text, reason) in [
-            ("unknown, expired or changed pairing challenge", Refusal::ExpiredChallenge),
+            ("unknown, expired or changed pairing challenge", Refusal::ExpiredClaim),
             ("unknown, expired or changed registration challenge", Refusal::ExpiredChallenge),
             (SIGNUP_LIMIT, Refusal::RateLimited),
             (IP_LIMIT, Refusal::RateLimited),
