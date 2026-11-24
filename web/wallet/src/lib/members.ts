@@ -2,7 +2,7 @@ import { createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } fro
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
-import { checkSignups } from "./admission-limits.ts";
+import { admitClient, checkSignups, logRefusal } from "./admission-limits.ts";
 import { freeSlot, MAX_SLOT, registrationSlot } from "./member-admission.ts";
 import { registrationLock } from "./registration-lock.ts";
 import { newRelayChallenge, verifyRelayProof } from "./relay-registration.ts";
@@ -14,6 +14,9 @@ type Device = { slot: number; signing_pubkey: string; device_pubkey: string; gen
 // `signups`: when each new identity registered, kept for the last hour (LOKI_SIGNUPS_PER_HOUR).
 type Registry = { version: 1; access: Member[]; devices: Device[]; challenges: Challenge[]; signups: number[]; retired: string[]; replacement_key?: string };
 const CHALLENGE_TTL = 120_000;
+// Slots held by unfinished new-identity reservations (pairing links and direct enrollments
+// together), counted as distinct slots. Well under 16, so pending holds never fill the roster.
+const MAX_PENDING_SLOTS = MAX_SLOT / 2;
 const publicFields = ["slot", "signing_pubkey", "relay_pubkey", "advertise_url", "lokisigner_url"];
 const enrollmentFields = [...publicFields, "device_pubkey", "authorization"];
 
@@ -182,6 +185,15 @@ function occupied(state: Registry, signing?: string): Set<number> {
   ]);
 }
 
+/** Refuses a new hold once unfinished new-identity reservations hold MAX_PENDING_SLOTS slots. */
+function checkPendingSlots(state: Registry) {
+  const held = new Set(state.challenges.flatMap((c) => c.pairing_slot === undefined ? [] : [c.pairing_slot]));
+  if (held.size >= MAX_PENDING_SLOTS) {
+    logRefusal("pending slots");
+    throw new Error("too many pending registrations");
+  }
+}
+
 function existingMember(e: Enrollment, state: Registry): Member | undefined {
   if (state.retired.includes(e.signing_pubkey)) throw new Error("registration identity retired");
   const existing = state.access.find((m) => m.signing_pubkey === e.signing_pubkey);
@@ -230,21 +242,21 @@ function replacementRelay(key: string, challenge: string) {
   try { return newRelayChallenge(seed); } finally { seed.fill(0); }
 }
 
-/** Reserves a slot for one `loki://pair` link. Anyone may ask: the routes rate-limit each
- *  client, and the hourly sign-up cap bounds new identities. `slot` asks for that slot again, to
- *  re-pair a profile whose registration never finished; it is refused while any reservation or
- *  member holds it. Without it the lowest free slot is reserved. */
-export async function issuePairingChallenge(raw: unknown, origin: string) {
+/** Reserves a slot for one `loki://pair` link. Anyone may ask: the hourly sign-up cap, the shared
+ *  pending-slot cap and, when the route passes `client`, its per-address limits bound it. `slot`
+ *  asks for that slot again, to re-pair a profile whose registration never finished; it is
+ *  refused while any reservation or member holds it. Without it the lowest free slot is reserved. */
+export async function issuePairingChallenge(raw: unknown, origin: string, client?: string) {
   const body = object(raw);
   fields(body, ["slot"]);
   publicOrigin(origin);
   const requested = body.slot === undefined ? undefined : registrationSlot(body.slot);
   return changeRegistry((state, now) => {
     if (state.access.length >= MAX_SLOT) throw new Error("no free slot (1..16)");
-    // Pairing alone cannot reserve the entire supported slot range.
-    if (state.challenges.filter((c) => !c.enrollment).length >= MAX_SLOT / 2) throw new Error("too many pending registrations");
+    checkPendingSlots(state);
     state.signups = checkSignups(state.signups, now);
     const id = freeSlot(occupied(state), requested);
+    if (client !== undefined) admitClient(client, now);
     const expires = now + CHALLENGE_TTL;
     const challenge = randomBytes(32).toString("hex");
     state.challenges.push({ challenge, origin, pairing_slot: id, expires });
@@ -253,7 +265,13 @@ export async function issuePairingChallenge(raw: unknown, origin: string) {
   });
 }
 
-export async function issueRegistrationChallenge(raw: unknown, origin: string) {
+/** A one-use registration challenge. Only enrollment of an identity the registry doesn't know,
+ *  without a claimed pairing link (whose issuance was already counted), counts toward `client`'s
+ *  per-address limits, the hourly sign-up cap and the pending-slot cap. A registered identity
+ *  (roster refresh, recovery, device replacement) is exempt only because `enrollment()` first
+ *  verified `authorization`: that identity's own Ed25519 signature over the device key. Naming
+ *  an identity is not enough, and registering still needs the device signature and relay proof. */
+export async function issueRegistrationChallenge(raw: unknown, origin: string, client?: string) {
   const { pairing_challenge, ...identity } = object(raw);
   const e = enrollment(identity);
   publicOrigin(origin);
@@ -307,9 +325,11 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string) {
         // for this identity only: the claim matched `e.slot` above.
         reserved = freeSlot(occupied(state, e.signing_pubkey), claimed.pairing_slot);
       } else {
-        // A brand-new identity: refuse early once the hourly sign-up cap is reached.
+        // A brand-new identity without a pairing link: it holds a slot until it registers.
+        checkPendingSlots(state);
         state.signups = checkSignups(state.signups, now);
         reserved = freeSlot(occupied(state, e.signing_pubkey), e.slot);
+        if (client !== undefined) admitClient(client, now);
       }
       const challenge = randomBytes(32).toString("hex");
       const relay = newRelayChallenge();

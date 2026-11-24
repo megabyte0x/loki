@@ -153,27 +153,44 @@ passphrase and Touch ID. The wallet's own pairing-link step still works the same
 
 The coordinator admits at most 16 active members in slots 1–16. A pairing link reserves the
 lowest free slot (or the slot it names, to finish a pairing that never registered) for two
-minutes. At most eight pairing reservations and 32 registration challenges can be pending.
+minutes, and so does a new identity that enrolls directly (the in-browser signer). Together
+these unfinished new-identity reservations can hold at most eight distinct slots, so they
+never fill the roster; a further request gets "too many pending registrations". At most 32
+registration challenges can be pending in all.
 Funds stay protected without an admission gate: joining a vault still needs the creator's
 private invite and the roster-code comparison.
 
-Limits, read from the environment on every request (no restart needed):
+The limits below apply only to requests that could admit a **new** identity: a pairing link,
+and direct enrollment of an identity the registry doesn't know (claiming a pairing link
+spends the reservation its link was counted for). A registered member's roster refresh at
+unlock, recovery and device replacement are exempt, but only because the request's
+`authorization`, that identity's own signature over its device key, verifies first;
+registering then still needs the device signature and the relay proof. They keep the
+coordinator's general registration budget.
+
+The coordinator reads these settings from its own process environment. Changing a service's
+environment file or exporting a variable in a shell doesn't reach a running coordinator:
+restart it to apply a change.
 
 | Setting | Default | Limits |
 | --- | --- | --- |
 | `LOKI_SIGNUPS_PER_HOUR` | 6 | New identities registered in a rolling hour, across the coordinator. Stored in the registry. Refreshing or replacing a registered member's device and resuming a pending registration don't count. |
-| `LOKI_IP_PAIRING_PER_MINUTE` | 5 | Pairing and registration-challenge requests per client address per minute. |
+| `LOKI_IP_PAIRING_PER_MINUTE` | 5 | New-identity requests (above) per client address per minute. |
 | `LOKI_IP_PAIRING_PER_DAY` | 30 | The same requests per client address per rolling day. |
 | `LOKI_CLIENT_IP_HEADER` | unset | The one header your proxy sets to the client address, for example `cf-connecting-ip` behind a Cloudflare tunnel. |
 
-The per-address counts live in memory and reset when the coordinator restarts. The
-coordinator reads only the header named by `LOKI_CLIENT_IP_HEADER`, takes its first value
-and accepts it only if it's an IP address. It never trusts `X-Forwarded-For` or any other
+The per-address counts live in memory and reset when the coordinator restarts. They track at
+most 10,000 addresses. When that's full, addresses idle for a day are dropped oldest first,
+and if none are, new addresses share one overflow bucket with the same limits, so they're
+still admitted. The coordinator reads only the header named by `LOKI_CLIENT_IP_HEADER`,
+takes its first value and accepts it only if it's an IP address. IPv6 addresses are counted
+in one canonical spelling, and an IPv4-mapped IPv6 address counts as its IPv4 address. It never trusts `X-Forwarded-For` or any other
 client header on its own. Without the setting, or when the header is missing or invalid,
 every request shares one bucket, so the limits still apply to everyone together. Set it
 only when a proxy you run always overwrites that header.
 
-A refused request gets HTTP 429 with a short plain message. The coordinator logs one fixed
+A refused request gets HTTP 429 with a short plain message and a `Retry-After` header: the
+seconds until the exhausted window admits again (up to a day for the daily limit). The coordinator logs one fixed
 line per refusal reason, never the client address. A value that isn't a whole number stops
 admission until it's fixed. These limits slow spam but don't stop it: the 16 slots can
 still fill up.
