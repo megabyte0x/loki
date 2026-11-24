@@ -9,11 +9,12 @@ export class RateLimited extends Error {
 
 export const SIGNUP_LIMIT_MESSAGE = "This coordinator has reached its sign-up limit for this hour. Try again later.";
 export const IP_LIMIT_MESSAGE = "Too many pairing requests from this network. Try again later.";
+export const ATTEMPT_LIMIT_MESSAGE = "Too many registration attempts. Try again in a minute.";
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
-// Bounds the in-memory table. Past it, new addresses share one overflow bucket (see `admitClient`).
+// Bounds each in-memory table. Past it, new keys share one overflow bucket (see `charge`).
 const MAX_CLIENTS = 10_000;
 
 /** A non-negative whole number from the coordinator process's environment. A value the operator
@@ -32,7 +33,7 @@ function setting(name: string, fallback: number): number {
 export const signupsPerHour = () => setting("LOKI_SIGNUPS_PER_HOUR", 6);
 
 /** Refusals are logged by reason only: never an address. */
-export function logRefusal(reason: "sign-up limit" | "ip minute limit" | "ip day limit" | "pending slots") {
+export function logRefusal(reason: "sign-up limit" | "ip minute limit" | "ip day limit" | "pending slots" | "attempt minute limit" | "resume limit") {
   console.warn(`loki admission: refused (${reason})`);
 }
 
@@ -76,44 +77,67 @@ export function clientAddress(req: Request): string {
   return canonicalAddress(req.headers.get(header)?.split(",")[0]?.trim() ?? "") ?? "unknown";
 }
 
-// Shared across the route bundles in the coordinator's Node process. The table's insertion
-// order is the order of each address's latest admitted request, oldest first. Its times are
-// monotonic milliseconds (`performance.now()`), so a wall-clock step changes no window.
-const shared = globalThis as typeof globalThis & { lokiPairingRequests?: Map<string, number[]>; lokiPairingOverflow?: number[] };
+type Bucket = { table: Map<string, number[]>; overflow: number[] };
+// Shared across the route bundles in the coordinator's Node process, one per kind of limit. A
+// table's insertion order is the order of each key's latest admitted request, oldest first.
+// Times are monotonic milliseconds (`performance.now()`), so a wall-clock step changes no window.
+const shared = globalThis as typeof globalThis & { lokiAdmissionBuckets?: Record<string, Bucket> };
 
-/** Counts one request that could admit a new identity (a pairing link, or enrollment of an
- *  identity the registry doesn't know) from `client`, or refuses it. A full table first drops
- *  addresses idle for a day, oldest first, stopping at the first live one; new addresses then
- *  share one overflow bucket with the same limits, so they are still admitted. */
-export function admitClient(client: string, now = performance.now()) {
-  const perMinute = setting("LOKI_IP_PAIRING_PER_MINUTE", 5);
-  const perDay = setting("LOKI_IP_PAIRING_PER_DAY", 30);
-  const table = shared.lokiPairingRequests ??= new Map<string, number[]>();
-  if (!table.has(client)) {
+/** Counts one request for `key` in the named bucket, or throws `RateLimited(message)`. A full
+ *  table first drops keys idle for a day, oldest first, stopping at the first live one; new keys
+ *  then share one overflow bucket with the same limits, so they're still admitted. No request
+ *  scans the whole table. */
+function charge(name: string, key: string, limits: { perMinute: number; perDay: number }, message: string,
+                reasons: [Parameters<typeof logRefusal>[0], Parameters<typeof logRefusal>[0]], now: number) {
+  const buckets = shared.lokiAdmissionBuckets ??= {};
+  const bucket = buckets[name] ??= { table: new Map(), overflow: [] };
+  const { table } = bucket;
+  if (!table.has(key)) {
     for (const [oldest, seen] of table) {
       if (table.size < MAX_CLIENTS || seen.some((at) => at > now - DAY)) break;
       table.delete(oldest);
     }
   }
-  const overflow = !table.has(client) && table.size >= MAX_CLIENTS;
-  const times = (overflow ? shared.lokiPairingOverflow ?? [] : table.get(client) ?? []).filter((at) => at > now - DAY);
+  const overflow = !table.has(key) && table.size >= MAX_CLIENTS;
+  const times = (overflow ? bucket.overflow : table.get(key) ?? []).filter((at) => at > now - DAY);
   const save = (value: number[], latest: boolean) => {
-    if (overflow) { shared.lokiPairingOverflow = value; return; }
-    if (latest) table.delete(client); // move to the end: most recently admitted
-    if (value.length || table.has(client)) table.set(client, value);
+    if (overflow) { bucket.overflow = value; return; }
+    if (latest) table.delete(key); // move to the end: most recently admitted
+    if (value.length || table.has(key)) table.set(key, value);
   };
-  if (times.length >= perDay) {
+  if (times.length >= limits.perDay) {
     save(times, false);
-    logRefusal("ip day limit");
-    throw new RateLimited(IP_LIMIT_MESSAGE, secondsUntil(times[times.length - perDay] ?? now, DAY, now));
+    logRefusal(reasons[1]);
+    throw new RateLimited(message, secondsUntil(times[times.length - limits.perDay] ?? now, DAY, now));
   }
   const minute = times.filter((at) => at > now - MINUTE);
-  if (minute.length >= perMinute) {
+  if (minute.length >= limits.perMinute) {
     save(times, false);
-    logRefusal("ip minute limit");
-    throw new RateLimited(IP_LIMIT_MESSAGE, secondsUntil(minute[minute.length - perMinute] ?? now, MINUTE, now));
+    logRefusal(reasons[0]);
+    throw new RateLimited(message, secondsUntil(minute[minute.length - limits.perMinute] ?? now, MINUTE, now));
   }
   save([...times, now], true);
+}
+
+/** Counts one request that could admit a new identity (a pairing link, or enrollment of an
+ *  identity the registry doesn't know) from `client`, or refuses it. */
+export function admitClient(client: string, now = performance.now()) {
+  const limits = { perMinute: setting("LOKI_IP_PAIRING_PER_MINUTE", 5), perDay: setting("LOKI_IP_PAIRING_PER_DAY", 30) };
+  charge("pairing", client, limits, IP_LIMIT_MESSAGE, ["ip minute limit", "ip day limit"], now);
+}
+
+/** Counts every direct registration-challenge or proof request from `client`, members included,
+ *  before any registry access. Generous: an unlock is two requests, and a member's background
+ *  retries back off from five seconds, so only a client hammering the routes reaches it. */
+export function admitAttempt(client: string, now = performance.now()) {
+  const limits = { perMinute: setting("LOKI_IP_REGISTRATION_PER_MINUTE", 60), perDay: Number.MAX_SAFE_INTEGER };
+  charge("registration", client, limits, ATTEMPT_LIMIT_MESSAGE, ["attempt minute limit", "attempt minute limit"], now);
+}
+
+/** Bounds retries of one pending enrollment that need the registry lock (identical retries are
+ *  answered from the snapshot without one): per pending signing key, not per address. */
+export function admitResume(signing: string, now = performance.now()) {
+  charge("resume", signing, { perMinute: 6, perDay: Number.MAX_SAFE_INTEGER }, ATTEMPT_LIMIT_MESSAGE, ["resume limit", "resume limit"], now);
 }
 
 /** The JSON error reply for a member route: 429 with `Retry-After` for a rate limit, 400 otherwise. */

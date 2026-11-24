@@ -1,5 +1,5 @@
 import { connection } from "next/server";
-import { refusal } from "@/lib/admission-limits";
+import { admitAttempt, clientAddress, refusal } from "@/lib/admission-limits";
 import { readRegistrationBody, registerMember, slots } from "@/lib/members";
 
 export async function GET(req: Request) {
@@ -13,6 +13,8 @@ export async function GET(req: Request) {
 
 export async function POST(req: Request) {
   try {
+    // Every proof attempt counts here, before any registry access.
+    admitAttempt(clientAddress(req));
     const body = await readRegistrationBody(req);
     return Response.json({ member: await registerMember(body, new URL(req.url).origin) });
   } catch (error) {

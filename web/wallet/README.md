@@ -173,7 +173,15 @@ member's refresh or replacement, completing an issued proof and operator tools u
 so new-identity traffic can never make an existing member wait for "registration is busy". The
 per-address check and every cheap refusal (a malformed request, a full roster, no pending
 slot, the sign-up cap, a taken slot, an unknown proof) happen before either budget or the
-registry lock is spent.
+registry lock is spent. Those checks use a parsed copy of the registry kept in memory and
+re-read only when the file changes; the locked write checks everything again.
+
+Every request to the direct registration routes (`POST /api/members/challenge` and
+`POST /api/members`), members' included, also counts in a generous per-address attempt limit
+before any registry access. An unlock is two requests and background retries back off from
+five seconds, so only a client hammering the routes reaches it. An identical retry of a
+pending registration gets the same challenge without touching the registry lock; other
+retries of one pending registration are limited to six a minute for that identity.
 
 The coordinator reads these settings from its own process environment. Changing a service's
 environment file or exporting a variable in a shell doesn't reach a running coordinator:
@@ -184,6 +192,7 @@ restart it to apply a change.
 | `LOKI_SIGNUPS_PER_HOUR` | 6 | New identities registered in a rolling hour, across the coordinator. Stored in the registry. Refreshing or replacing a registered member's device and resuming a pending registration don't count. |
 | `LOKI_IP_PAIRING_PER_MINUTE` | 5 | New-identity requests (above) per client address per minute. |
 | `LOKI_IP_PAIRING_PER_DAY` | 30 | The same requests per client address per rolling day. |
+| `LOKI_IP_REGISTRATION_PER_MINUTE` | 60 | Any direct registration-challenge or proof request per client address per minute, members included. |
 | `LOKI_CLIENT_IP_HEADER` | unset | The one header your proxy sets to the client address, for example `cf-connecting-ip` behind a Cloudflare tunnel. |
 
 The per-address counts live in memory, use the process's monotonic clock (a wall-clock

@@ -1,8 +1,8 @@
 import { createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } from "node:crypto";
-import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
-import { admitClient, checkSignups, logRefusal } from "./admission-limits.ts";
+import { admitClient, admitResume, checkSignups, logRefusal } from "./admission-limits.ts";
 import { freeSlot, MAX_SLOT, registrationSlot } from "./member-admission.ts";
 import { registrationLock, type RegistrationPool } from "./registration-lock.ts";
 import { newRelayChallenge, verifyRelayProof } from "./relay-registration.ts";
@@ -133,12 +133,38 @@ function liveChallenges(state: Registry, now: number) {
   state.challenges = state.challenges.filter((c) => c.expires > now && (c.enrollment ? !!c.relay : c.pairing_slot !== undefined));
 }
 
-/** The registry as last written, read without the lock or a budget token. Only for cheap
- *  refusals and choosing a budget pool before `changeRegistry`, which decides again. */
+// The parsed registry, shared across the route bundles in this process, keyed by the files' identity.
+const cache = globalThis as typeof globalThis & { lokiRegistrySnapshot?: { key: string; state: Registry } };
+
+/** The registry files' identity: path, inode, size and change times (and the legacy sidecar's). */
+function fileKey(file: string): string {
+  const stamp = (path: string) => {
+    try {
+      const s = statSync(path, { bigint: true });
+      return `${s.ino}:${s.size}:${s.mtimeNs}:${s.ctimeNs}`;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return "-";
+      throw error;
+    }
+  };
+  return `${file}\0${stamp(file)}\0${stamp(`${file}.devices`)}`;
+}
+
+/** The registry as last written, without the lock or a budget token: a parsed in-memory
+ *  snapshot, re-read only when the files' identity changes and replaced after every write here.
+ *  Only for preliminary classification and cheap refusals; `changeRegistry` decides again.
+ *  Callers must not modify it. */
 function peekRegistry(now: number): Registry {
-  const state = loadRegistry(registryPath());
-  liveChallenges(state, now);
-  return state;
+  const file = registryPath();
+  const key = fileKey(file);
+  let snapshot = cache.lokiRegistrySnapshot;
+  if (snapshot?.key !== key) {
+    // Stat before reading: a write in between only makes the next request read again.
+    snapshot = cache.lokiRegistrySnapshot = { key, state: loadRegistry(file) };
+  }
+  const live = { ...snapshot.state };
+  liveChallenges(live, now);
+  return live;
 }
 
 /** One durable snapshot for nonce consumption, device bindings and roster writes. `pool` pays
@@ -153,7 +179,10 @@ async function changeRegistry<T>(pool: RegistrationPool, change: (state: Registr
     liveChallenges(state, now);
     const result = change(state, now);
     // An explicit Error result commits consumption of a rejected proof, then reports it.
-    if (JSON.stringify(state) !== before) write(file, state);
+    if (JSON.stringify(state) !== before) {
+      write(file, state);
+      cache.lokiRegistrySnapshot = { key: fileKey(file), state: structuredClone(state) };
+    }
     if (result instanceof Error) throw result;
     return result;
   } finally { unlock(); }
@@ -315,7 +344,17 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string, c
   const seen = peekRegistry(Date.now());
   if (seen.retired.includes(e.signing_pubkey)) throw new Error("registration identity retired");
   const registered = seen.access.some((m) => m.signing_pubkey === e.signing_pubkey) || seen.devices.some((d) => d.signing_pubkey === e.signing_pubkey);
-  const resuming = seen.challenges.some((c) => c.enrollment?.signing_pubkey === e.signing_pubkey);
+  const pending = seen.challenges.find((c) => c.enrollment?.signing_pubkey === e.signing_pubkey);
+  const resuming = pending !== undefined;
+  if (nonce === undefined && pending) {
+    // An identical retry gets the same challenge with no lock or write. Any other retry of a
+    // pending enrollment is bounded per signing key before it may take the lock.
+    const generation = seen.devices.find((d) => d.signing_pubkey === e.signing_pubkey)?.generation ?? 0;
+    if (pending.relay && pending.origin === origin && pending.generation === generation && JSON.stringify(pending.enrollment) === JSON.stringify(e)) {
+      return { challenge: pending.challenge, relay_challenge_pubkey: pending.relay.publicKey };
+    }
+    admitResume(e.signing_pubkey);
+  }
   let charged = false;
   if (nonce !== undefined) {
     if (!seen.challenges.some((c) => c.challenge === nonce && !c.enrollment)) throw new Error("unknown, expired or changed pairing challenge");
