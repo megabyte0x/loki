@@ -355,8 +355,11 @@ zeroed. `serve` retains S4a's local-file unlock for development automation only.
 
 ### Nonce witness changes
 
-Members never type a witness fingerprint. LokiSigner trusts the coordinator's first witness
-pair (trust on first use) and saves its fingerprint with the configuration. Later:
+Members never type a witness fingerprint. LokiSigner trusts the coordinator's witness pair
+only while the profile has no paired coordinator yet: a first pairing or a fresh restore. That
+pin is saved before the profile can sign; if a launch flag would skip the save, or the save
+fails, pairing or restore stops. A paired profile with no saved pin treats any pair as a change.
+Later:
 
 - **After each unlock** LokiSigner asks the paired coordinator once, in the background, for its
   current `/api/signer-config`. A failed request is only logged; signing continues.
@@ -369,7 +372,10 @@ pair (trust on first use) and saves its fingerprint with the configuration. Late
   keeps the saved pair until the member locks and unlocks again. Nothing switches silently.
 - **A pairing link or refresh** that brings a different pair for the same coordinator shows
   the same screen before the configuration review; pairing continues only after Touch ID.
-- A `--nonce-witnesses` launch flag overrides the pair for that launch and never prompts.
+- A `--nonce-witnesses` launch flag overrides the pair for that launch and never prompts. With
+  any launch flag override, the background check is skipped, because nothing would be saved.
+- An approval applies only to the profile that is still running. If LokiSigner locks or the
+  profile is set aside before the save, nothing is written.
 
 Payments already in progress keep the pair they started with: their nonce records are bound to
 it. Operators can compute a pair's fingerprint from their trusted `--nonce-witnesses` JSON file,
