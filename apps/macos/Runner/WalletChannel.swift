@@ -28,12 +28,15 @@ final class WalletChannel {
         #else
         let args = Self.launchArguments(CommandLine.arguments.dropFirst())
         #endif
-        let signerArgs = nativeSignerArguments(args ?? [])
+        var signerArgs = nativeSignerArguments(args ?? [])
         if args == nil {
             launchProblem = "Invalid LokiSigner launch arguments."
         } else {
             // The same process-lifetime profile lock the standalone LokiSigner takes (in Rust).
-            launchProblem = lockSignerProfile(signerArgs)
+            // The session then uses only the canonical profile path the lock holds.
+            let locked = lockSignerProfile(signerArgs)
+            signerArgs = locked.args
+            launchProblem = locked.problem
         }
         validLaunch = launchProblem == nil
         self.window = window

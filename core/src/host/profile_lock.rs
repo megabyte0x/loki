@@ -4,6 +4,8 @@
 //! process can pair, restore, unlock or write that profile's configuration. The lock file sits
 //! beside the folder, so a fresh folder stays fresh, and it is keyed on the resolved absolute
 //! path, so a symlink, `.` or a relative spelling of one profile all contend on the same lock.
+//! Once locked, the session reads and writes the profile only through that canonical path
+//! ([`locked_args`]), so moving a symlink afterwards can't redirect it to another profile.
 
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -16,13 +18,14 @@ const O_NOFOLLOW: i32 = 0x0100;
 
 static HELD: Mutex<Option<(PathBuf, File)>> = Mutex::new(None);
 
-/// Take this process's lock on the profile at `data`, or confirm it already holds it. A process
-/// holds at most one profile; asking for another is refused.
-pub(crate) fn lock(data: &Path) -> Result<(), String> {
+/// Take this process's lock on the profile at `data`, or confirm it already holds it, and return
+/// the canonical path it holds. A process holds at most one profile; asking for another,
+/// including through a symlink that now points elsewhere, is refused.
+pub(crate) fn lock(data: &Path) -> Result<PathBuf, String> {
     let profile = canonical(data)?;
     let mut held = HELD.lock().map_err(|_| "LokiSigner could not lock its profile")?;
     match held.as_ref() {
-        Some((path, _)) if *path == profile => return Ok(()),
+        Some((path, _)) if *path == profile => return Ok(profile),
         Some(_) => return Err("this LokiSigner process already opened a different profile".into()),
         None => {},
     }
@@ -44,8 +47,19 @@ pub(crate) fn lock(data: &Path) -> Result<(), String> {
         Err(std::fs::TryLockError::WouldBlock) => return Err(PROFILE_IN_USE.into()),
         Err(std::fs::TryLockError::Error(e)) => return Err(failed(e)),
     }
-    *held = Some((profile, file));
-    Ok(())
+    *held = Some((profile.clone(), file));
+    Ok(profile)
+}
+
+/// Lock the profile a launch's `--data` names and return the launch arguments with `--data`
+/// replaced by the locked canonical path, for every profile read and write that follows.
+pub(crate) fn locked_args(args: &[String]) -> Result<Vec<String>, String> {
+    let index = args.iter().position(|arg| arg == "--data").map(|i| i + 1)
+        .filter(|&i| i < args.len()).ok_or("--data <dir> is required")?;
+    let profile = lock(Path::new(&args[index]))?;
+    let mut args = args.to_vec();
+    args[index] = profile.into_os_string().into_string().map_err(|_| "LokiSigner's profile path is not valid UTF-8")?;
+    Ok(args)
 }
 
 /// The profile's absolute location with every symlink resolved. A folder that doesn't exist

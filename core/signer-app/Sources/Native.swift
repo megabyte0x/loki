@@ -1635,7 +1635,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
                 case 8: failure = .registrationRosterUnavailable
                 case 9: failure = .invalidProfileName
                 case 10: failure = .cancelled
-                case 11: failure = .configuration
+                case 11: failure = .witnessesNotSaved
                 default: failure = .unexpected
                 }
                 self.startupKeyFailure = nil
@@ -1870,21 +1870,28 @@ func nativeSignerArguments(_ arguments: [String]) -> [String] {
 
 /// One process per profile: two LokiSigners on one profile would run two signers on the same
 /// nonce, payment and witness state. Rust takes an exclusive lock beside the profile folder,
-/// keyed on its resolved path, and holds it for the life of the process. Returns why this
-/// launch can't open the profile, or nil once the lock is held.
-func lockSignerProfile(_ args: [String]) -> String? {
+/// keyed on its resolved path, and holds it for the life of the process. Returns the launch
+/// arguments with `--data` set to that canonical path, which the whole session must use, and
+/// why this launch can't open the profile (nil once the lock is held).
+func lockSignerProfile(_ args: [String]) -> (args: [String], problem: String?) {
     let reply = nativeQuery(loki_member_app_lock_profile, ["args": args])
-    if reply["locked"] as? Bool == true { return nil }
-    if reply["error"] as? String == "profile-in-use" {
-        return "This profile is already open in another LokiSigner window. Use that window, or quit it first."
+    if reply["locked"] as? Bool == true, let data = reply["data"] as? String,
+       let index = args.firstIndex(of: "--data"), index + 1 < args.count {
+        var locked = args
+        locked[index + 1] = data
+        return (locked, nil)
     }
-    return "LokiSigner couldn’t lock its profile folder. Check that the folder is available, then open LokiSigner again."
+    if reply["error"] as? String == "profile-in-use" {
+        return (args, "This profile is already open in another LokiSigner window. Use that window, or quit it first.")
+    }
+    return (args, "LokiSigner couldn’t lock its profile folder. Check that the folder is available, then open LokiSigner again.")
 }
 
 func runNativeSigner(arguments: [String], link: String?) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
-    if let problem = lockSignerProfile(nativeSignerArguments(arguments)) {
+    let locked = lockSignerProfile(nativeSignerArguments(arguments))
+    if let problem = locked.problem {
         let alert = NSAlert()
         alert.messageText = "LokiSigner can’t open this profile"
         alert.informativeText = problem
@@ -1896,7 +1903,7 @@ func runNativeSigner(arguments: [String], link: String?) -> Never {
     let menu = NSMenu()
     let item = NSMenuItem()
     let actions = NSMenu(title: "LokiSigner")
-    let delegate = NativeSigner(args: nativeSignerArguments(arguments), link: link)
+    let delegate = NativeSigner(args: locked.args, link: link)
     let status = actions.addItem(withTitle: "Status…", action: #selector(NativeSigner.showStatus(_:)), keyEquivalent: "")
     status.target = delegate
     let showAddresses = actions.addItem(withTitle: "Vault addresses…", action: #selector(VaultAddressesWindow.show(_:)), keyEquivalent: "")

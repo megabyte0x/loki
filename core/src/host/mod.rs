@@ -53,7 +53,7 @@ pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop 
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::can_view_addresses as native_can_view_addresses;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
-pub(crate) use profile_lock::lock as native_lock_profile;
+pub(crate) use profile_lock::locked_args as native_locked_args;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]

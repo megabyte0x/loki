@@ -88,6 +88,18 @@ pub extern "C" fn loki_signer_enclave_dkg_member_selftest() -> i32 {
 #[no_mangle]
 pub extern "C" fn loki_member_app_serve() -> i32 {
     let args: Vec<String> = std::env::args().skip(2).collect();
+    if let Err(e) = crate::host::config_from_args(&args) {
+        eprintln!("serve config: {e}");
+        return 2;
+    }
+    // One process per profile, shared with every other native launch; then use only its path.
+    let args = match crate::host::native_locked_args(&args) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("serve: {e}");
+            return 2;
+        }
+    };
     let mut config = match crate::host::config_from_args(&args) {
         Ok(c) => c,
         Err(e) => {
@@ -95,11 +107,6 @@ pub extern "C" fn loki_member_app_serve() -> i32 {
             return 2;
         }
     };
-    // One process per profile, shared with every other native launch.
-    if let Err(e) = crate::host::native_lock_profile(&config.data) {
-        eprintln!("serve: {e}");
-        return 2;
-    }
     // The whole point of the native signer: the share lives in the Secure Enclave.
     config.secure_element = "apple".into();
     if let Err(e) = config.validate_secure_element().and_then(|_| crate::host::run(config)) {
@@ -289,9 +296,10 @@ unsafe fn native_query_as<T: serde::de::DeserializeOwned>(
 #[no_mangle]
 pub unsafe extern "C" fn loki_member_app_profile(launch: *const std::ffi::c_char, action: u32) -> *mut std::ffi::c_char {
     native_query(launch, |launch| {
-        let config = crate::host::config_from_args(&launch.args)?;
+        // Changes go through the locked profile's canonical path.
+        let args = if action != 0 { crate::host::native_locked_args(&launch.args)? } else { launch.args };
+        let config = crate::host::config_from_args(&args)?;
         let data = config.data;
-        if action != 0 { crate::host::native_lock_profile(&data)?; }
         match action {
             0 => {},
             1 => crate::host::native_clean_staging(&data),
@@ -327,8 +335,9 @@ pub extern "C" fn loki_member_app_set_log_sink(sink: extern "C" fn(*const std::f
 
 /// Take this process's exclusive, process-lifetime lock on the launch's profile (`{"args": [...]}`),
 /// shared by the Runner and the standalone app. Call it once at launch, before anything else
-/// touches the profile. Returns `{"locked": true}`, or `{"error": "profile-in-use"}` when another
-/// process holds it; free it with [`loki_member_app_free`].
+/// touches the profile. Returns `{"locked": true, "data": "<canonical path>"}`: use that path as
+/// `--data` for the rest of the session. Returns `{"error": "profile-in-use"}` when another
+/// process holds it. Free it with [`loki_member_app_free`].
 ///
 /// # Safety
 /// `launch` must be a live NUL-terminated UTF-8 launch JSON string for this call.
@@ -336,9 +345,10 @@ pub extern "C" fn loki_member_app_set_log_sink(sink: extern "C" fn(*const std::f
 #[no_mangle]
 pub unsafe extern "C" fn loki_member_app_lock_profile(launch: *const std::ffi::c_char) -> *mut std::ffi::c_char {
     native_query(launch, |launch| {
-        let config = crate::host::config_from_args(&launch.args)?;
-        crate::host::native_lock_profile(&config.data)?;
-        Ok(serde_json::json!({ "locked": true }))
+        crate::host::config_from_args(&launch.args)?;
+        let args = crate::host::native_locked_args(&launch.args)?;
+        let data = crate::host::config_from_args(&args)?.data;
+        Ok(serde_json::json!({ "locked": true, "data": data }))
     })
 }
 
@@ -434,8 +444,9 @@ pub unsafe extern "C" fn loki_member_app_trust_witnesses(launch: *const std::ffi
     #[serde(deny_unknown_fields)]
     struct Trust { args: Vec<String>, offered_fingerprint: String }
     native_query_as(launch, |trust: Trust| {
-        crate::host::native_lock_profile(&crate::host::config_from_args(&trust.args)?.data)?;
-        crate::host::NativeConfig::trust_witnesses(&trust.args, &trust.offered_fingerprint)?;
+        crate::host::config_from_args(&trust.args)?;
+        let args = crate::host::native_locked_args(&trust.args)?;
+        crate::host::NativeConfig::trust_witnesses(&args, &trust.offered_fingerprint)?;
         Ok(serde_json::json!({ "trusted": true }))
     })
 }
@@ -561,12 +572,14 @@ pub unsafe extern "C" fn loki_member_app_restore_profile(
             witness_confirmation: Option<String>,
             #[serde(default)] embedded: bool,
         }
-        let launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
+        let mut launch: Launch = serde_json::from_slice(std::ffi::CStr::from_ptr(launch).to_bytes()).map_err(|_| error)?;
         let file = std::ffi::CStr::from_ptr(file).to_str().map_err(|_| error)?;
         let fingerprint = std::ffi::CStr::from_ptr(fingerprint).to_str().map_err(|_| error)?;
-        let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
+        crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         // Held for the life of the process, so through publish and the member that follows.
-        crate::host::native_lock_profile(&config.data).map_err(|_| error)?;
+        // Every profile read and write from here uses the locked canonical path.
+        launch.args = crate::host::native_locked_args(&launch.args).map_err(|_| error)?;
+        let mut config = crate::host::native_config_from_args(&launch.args).map_err(|_| error)?;
         launch.config.verify_witness_confirmation(launch.witness_confirmation.as_deref()).map_err(|_| error)?;
         let fetched = launch.config.apply_restore(&mut config, &launch.args, &launch.restore_origin).map_err(|_| error)?;
         if launch.embedded { crate::host::NativeConfig::validate_wallet(&config).map_err(|_| error)?; }
@@ -633,9 +646,11 @@ pub unsafe extern "C" fn loki_member_app_pair(
             witness_confirmation: Option<String>,
             #[serde(default)] embedded: bool,
         }
-        let launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        let mut launch: Launch = serde_json::from_str(std::ffi::CStr::from_ptr(launch).to_str().map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        crate::host::native_config_from_args(&launch.args)?;
+        // Every profile read and write from here uses the locked canonical path.
+        launch.args = crate::host::native_locked_args(&launch.args)?;
         let mut config = crate::host::native_config_from_args(&launch.args)?;
-        crate::host::native_lock_profile(&config.data)?;
         if config.registration.is_some() { return Err("native pairing accepts registration only through its pairing link".into()); }
         config.validate_secure_element()?;
         // The values the member reviewed, checked again; never fetched a second time. A fetched
