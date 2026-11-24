@@ -925,11 +925,17 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
 
 /// Control sessions of payments that can't change any more. Their notices no longer matter, so
 /// the background sync stops draining them; frostd drops them 24 hours after their last message.
-/// A failed payment is still read until it expires, since a member may yet report on it.
+/// Retries reuse their original's session, and a cancelled, expired or dismissed payment can still
+/// be retried on it. So a session is final only when every payment on it spent its notes.
 fn final_control_sessions(data: &Path, pass: &str, vault: &str) -> Result<BTreeSet<Uuid>, String> {
-    Ok(all_payments(data, pass, vault)?.iter()
-        .filter(|p| settled(p) && p.phase != "spent_unverified")
+    let payments = all_payments(data, pass, vault)?;
+    let live: BTreeSet<Uuid> = payments.iter()
+        .filter(|p| !(matches!(p.phase.as_str(), "confirmed" | "replaced") && p.tx_verified))
         .filter_map(|p| p.control_session_id)
+        .collect();
+    Ok(payments.iter()
+        .filter_map(|p| p.control_session_id)
+        .filter(|session| !live.contains(session))
         .collect())
 }
 
