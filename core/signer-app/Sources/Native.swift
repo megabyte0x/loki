@@ -825,7 +825,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
     /// The member typed the address of the coordinator this profile is already pinned to: the
     /// next unlock registers without a claim, renewing the reservation once only if that expires.
     private var resumeRenewal = false
-    private static let renewalTouchID = "The coordinator holds this Mac’s slot for two minutes. If that runs out before you approve with Touch ID, LokiSigner asks before requesting the same slot again, and Touch ID then asks once more."
+    private static let renewalTouchID = "The coordinator holds this Mac’s slot for two minutes. If that runs out while you’re still reviewing, LokiSigner asks for the same slot again by itself, and Touch ID asks only once. If it runs out after you approve with Touch ID, LokiSigner asks you before requesting the slot again, and Touch ID then asks once more."
     private var startingOver = false
     private var recoveringKey = false
     private var discardingPending = false
@@ -1646,7 +1646,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         if embedded {
             let r = SignerReview.self
             let pairing = link != nil
-            let renewal = renewable ? [r.info("Touch ID may ask twice", Self.renewalTouchID)] : []
+            let renewal = renewable ? [r.info("If the slot reservation runs out", Self.renewalTouchID)] : []
             let origin = r.origin(pairing ? "Coordinator" : "Paired coordinator", config["coordinator"] as? String ?? "",
                                   "Member slot \(slot) · Testnet")
             let local = (nameField.map { r.field("Profile name (optional)", $0) } ?? []) + r.field("Local profile passphrase", password)

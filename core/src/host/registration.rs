@@ -178,15 +178,17 @@ enum RegistrationFailure {
 // The coordinator's exact rate-limit refusals (web/wallet/src/lib/admission-limits.ts).
 const SIGNUP_LIMIT: &str = "This coordinator has reached its sign-up limit for this hour. Try again later.";
 const IP_LIMIT: &str = "Too many pairing requests from this network. Try again later.";
+const ATTEMPT_LIMIT: &str = "Too many registration attempts. Try again in a minute.";
 
 /// Why the coordinator refused a registration. It is recognised only from the coordinator's exact
 /// error text, so none of that text reaches logs or the UI.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Refusal {
-    /// The pairing claim was refused before this device signed anything (the reservation ran out
-    /// during review, or the link changed).
+    /// An expiry refused while asking for a challenge: nothing was signed yet (the reservation
+    /// ran out during review, or the link changed). Set from the request stage, never the text.
     ExpiredClaim,
-    /// The signed proof was refused: its challenge ran out (possibly while Touch ID was open).
+    /// An expiry refused for a signed proof (possibly while Touch ID was open), or before the
+    /// stage is known.
     ExpiredChallenge,
     RateLimited, SlotTaken, WrongSlot, Other,
 }
@@ -194,10 +196,10 @@ pub(super) enum Refusal {
 impl Refusal {
     fn from_coordinator(error: Option<&str>) -> Self {
         match error {
-            Some("unknown, expired or changed pairing challenge") => Self::ExpiredClaim,
-            Some("unknown, expired or changed registration challenge"
+            // Any expiry wording; `register` decides from its own stage whether anything was signed.
+            Some("unknown, expired or changed pairing challenge" | "unknown, expired or changed registration challenge"
                 | "registration generation changed; request a new challenge") => Self::ExpiredChallenge,
-            Some(SIGNUP_LIMIT | IP_LIMIT) => Self::RateLimited,
+            Some(SIGNUP_LIMIT | IP_LIMIT | ATTEMPT_LIMIT) => Self::RateLimited,
             Some("slot already registered or reserved") => Self::SlotTaken,
             Some("registered identity cannot change slot" | "registered identity cannot change slot or relay key") => Self::WrongSlot,
             _ => Self::Other,
@@ -214,6 +216,15 @@ impl From<&str> for RegistrationFailure {
 }
 
 impl RegistrationFailure {
+    /// An expiry refusal takes the kind of the stage this device was at (before or after
+    /// signing), whatever wording the coordinator used.
+    fn at_stage(self, expired: Refusal) -> Self {
+        match self {
+            Self::Refused(error, Refusal::ExpiredClaim | Refusal::ExpiredChallenge) => Self::Refused(error, expired),
+            other => other,
+        }
+    }
+
     fn native_code(&self) -> &'static str {
         match self {
             #[cfg(all(target_os = "macos", feature = "apple-enclave"))]
@@ -423,7 +434,8 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     if let (Some(notice), Some(claim)) = (notice, pairing_claim) { notice("pairing-claim-attempted", claim); }
     let response = client.execute(request).await.map_err(|e| RegistrationFailure::Connection(format!("registration challenge: {e}")))?;
     let RegistrationChallenge { challenge, replacement_generation, relay_challenge_pubkey } =
-        registration_response(response, "registration challenge", config.native, 1024).await?;
+        registration_response(response, "registration challenge", config.native, 1024).await
+            .map_err(|e| e.at_stage(Refusal::ExpiredClaim))?;
     if !lowercase_key(&challenge) || !lowercase_key(&relay_challenge_pubkey) {
         return Err("invalid coordinator challenge".into());
     }
@@ -444,7 +456,8 @@ async fn register(config: &Config, pass: &str, pairing_claim: Option<&str>, slot
     body["challenge"] = challenge.into();
     let response = client.post(format!("{}/api/members", launch.coordinator))
         .json(&body).send().await.map_err(|e| RegistrationFailure::Connection(format!("self-registration: {e}")))?;
-    let RegistrationReply { member } = registration_response(response, "self-registration", config.native, 8 * 1024).await?;
+    let RegistrationReply { member } = registration_response(response, "self-registration", config.native, 8 * 1024).await
+        .map_err(|e| e.at_stage(Refusal::ExpiredChallenge))?;
     if !valid_slot(member.slot) || slot.is_some_and(|s| s != member.slot) || member.signing_pubkey != enrollment.signing_pubkey
         || member.relay_pubkey != enrollment.relay_pubkey || member.advertise_url != enrollment.advertise_url
         || member.lokisigner_url != enrollment.lokisigner_url {
@@ -853,8 +866,14 @@ async fn slot_conflict(st: &Shared, pass: &Zeroizing<String>, origin: &str, slot
         if !response.status().is_success() { return None; }
         serde_json::from_slice::<Roster>(&read_bounded(&mut response, 32 * 1024).await.ok()?).ok()
     }.await;
-    match roster {
-        Some(roster) if roster.slots.iter().any(|m| m.slot == slot && !m.signing_pubkey.eq_ignore_ascii_case(&own)) => PairingRefusal::SlotRegistered,
+    // Removal advice needs one unambiguous, well-formed row for this slot naming another identity,
+    // and this identity on no row. Anything else may be a hold or a faulty roster: retryable.
+    let Some(roster) = roster else { return PairingRefusal::SlotHeld };
+    let key = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    let rows: Vec<_> = roster.slots.iter().filter(|m| m.slot == slot).collect();
+    let mine = roster.slots.iter().any(|m| m.signing_pubkey.eq_ignore_ascii_case(&own));
+    match rows.as_slice() {
+        [row] if !mine && key(&row.signing_pubkey) && key(&row.relay_pubkey) && row.signing_pubkey != own => PairingRefusal::SlotRegistered,
         _ => PairingRefusal::SlotHeld,
     }
 }
@@ -914,7 +933,7 @@ mod tests {
     #[test]
     fn coordinator_refusals_map_only_exact_text_to_fixed_reasons() {
         for (text, reason) in [
-            ("unknown, expired or changed pairing challenge", Refusal::ExpiredClaim),
+            ("unknown, expired or changed pairing challenge", Refusal::ExpiredChallenge),
             ("unknown, expired or changed registration challenge", Refusal::ExpiredChallenge),
             (SIGNUP_LIMIT, Refusal::RateLimited),
             (IP_LIMIT, Refusal::RateLimited),
