@@ -357,9 +357,11 @@ zeroed. `serve` retains S4a's local-file unlock for development automation only.
 
 Members never type a witness fingerprint. LokiSigner trusts the coordinator's witness pair
 only while the profile has no paired coordinator yet: a first pairing or a fresh restore. That
-pin is saved before the profile can sign; if a launch flag would skip the save, or the save
-fails, pairing or restore stops. A paired profile with no saved pin treats any pair as a change.
-Later:
+pin is saved before the profile can sign, even when launch-only endpoint flags keep the
+endpoints themselves unsaved; if the save fails, pairing or restore stops. A paired profile with
+no saved pin treats any pair as a change. LokiSigner decides and writes the pin while holding an
+exclusive lock on `<data>.witness.lock`, beside the data folder. It refuses to overwrite a pin
+that another launch saved after this one was shown its configuration. Later:
 
 - **After each unlock** LokiSigner asks the paired coordinator once, in the background, for its
   current `/api/signer-config`. A failed request is only logged; signing continues.
@@ -368,7 +370,8 @@ Later:
   default and the Escape action and changes nothing; the screen may appear again after a later
   unlock. Like a payment request, it never activates the app and waits for the member to focus it.
 - **Trust new witnesses** needs Touch ID. LokiSigner then fetches the configuration again and
-  saves the new pair only if the coordinator still serves exactly that pair. The running signer
+  saves the new pair only if the coordinator still serves exactly that pair and the saved
+  configuration is still the one this unlock runs with. Only the pair and its fingerprint change. The running signer
   keeps the saved pair until the member locks and unlocks again. Nothing switches silently.
 - **A pairing link or refresh** that brings a different pair for the same coordinator shows
   the same screen before the configuration review; pairing continues only after Touch ID.
