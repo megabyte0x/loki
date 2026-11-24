@@ -32,6 +32,8 @@ mod native_member;
 #[cfg(any(test, all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication")))]
 mod native_recovery;
 mod nonce_witness;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+mod profile_lock;
 mod recovery;
 mod registration;
 #[cfg(test)]
@@ -50,6 +52,8 @@ pub use native_config::{Deployment, FetchedConfig, NativeConfig};
 pub(crate) use native_member::{disconnect_wallet_tabs, run_native, request_stop as native_request_stop, set_aside as native_set_aside, vault_addresses as native_vault_addresses};
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::can_view_addresses as native_can_view_addresses;
+#[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
+pub(crate) use profile_lock::lock as native_lock_profile;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]
 pub(crate) use native_member::restore_running as native_restore_running;
 #[cfg(all(target_os = "macos", feature = "apple-enclave", feature = "relay-communication"))]

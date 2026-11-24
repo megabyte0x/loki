@@ -33,6 +33,9 @@ func loki_member_app_trust_witnesses(_ launch: UnsafePointer<CChar>) -> UnsafeMu
 @_silgen_name("loki_member_app_keep_witnesses")
 func loki_member_app_keep_witnesses()
 
+@_silgen_name("loki_member_app_lock_profile")
+func loki_member_app_lock_profile(_ launch: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>?
+
 @_silgen_name("loki_member_app_stop")
 func loki_member_app_stop() -> Int32
 
@@ -1865,9 +1868,31 @@ func nativeSignerArguments(_ arguments: [String]) -> [String] {
     return args
 }
 
+/// One process per profile: two LokiSigners on one profile would run two signers on the same
+/// nonce, payment and witness state. Rust takes an exclusive lock beside the profile folder,
+/// keyed on its resolved path, and holds it for the life of the process. Returns why this
+/// launch can't open the profile, or nil once the lock is held.
+func lockSignerProfile(_ args: [String]) -> String? {
+    let reply = nativeQuery(loki_member_app_lock_profile, ["args": args])
+    if reply["locked"] as? Bool == true { return nil }
+    if reply["error"] as? String == "profile-in-use" {
+        return "This profile is already open in another LokiSigner window. Use that window, or quit it first."
+    }
+    return "LokiSigner couldn’t lock its profile folder. Check that the folder is available, then open LokiSigner again."
+}
+
 func runNativeSigner(arguments: [String], link: String?) -> Never {
     let app = NSApplication.shared
     app.setActivationPolicy(.regular)
+    if let problem = lockSignerProfile(nativeSignerArguments(arguments)) {
+        let alert = NSAlert()
+        alert.messageText = "LokiSigner can’t open this profile"
+        alert.informativeText = problem
+        alert.addButton(withTitle: "Quit")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+        exit(1)
+    }
     let menu = NSMenu()
     let item = NSMenuItem()
     let actions = NSMenu(title: "LokiSigner")
