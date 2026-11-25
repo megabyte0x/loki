@@ -15,9 +15,9 @@ enum SignerStartFailure: Error, Equatable {
     static func renewalRefusal(_ code: Int32) -> String {
         switch code {
         case 15: return "The coordinator is limiting new pairings right now. Try again later."
-        case 16: return "The coordinator has no free member slot right now. Try again later, or ask whoever runs it."
-        case 17: return "Another member registered this slot. Remove this profile and pair again with the coordinator address."
-        case 20: return "The coordinator is holding this member slot right now. Wait two minutes for the hold to expire, then pair again with the coordinator address. This profile can still finish."
+        case 16: return "The coordinator is full or has too many pairings waiting right now. Try again in a few minutes, or ask whoever runs it."
+        case 17: return "Another member registered this coordinator slot. Remove this profile and pair again with the coordinator address."
+        case 20: return "The coordinator is holding this slot right now. Wait two minutes for the hold to expire, then pair again with the coordinator address. This profile can still finish."
         case 18: return "LokiSigner couldn’t reach the coordinator to renew this Mac’s reservation. Check your connection, then pair again with the coordinator address."
         default: return "The coordinator didn’t renew this Mac’s reservation. Try again, or ask whoever runs it."
         }
@@ -33,7 +33,7 @@ enum SignerStartFailure: Error, Equatable {
         case .cancelled: return "You cancelled. Try again to continue setting up or unlocking LokiSigner."
         case .pairingLinkNeeded: return "Enter the coordinator address in LokiSigner, or open a pairing link from the wallet, then try again."
         case .invalidLink: return "This pairing link isn’t valid. Get a new link from the wallet and open it in LokiSigner."
-        case .differentPairing: return "This link is for a different coordinator or member slot. Unlock your existing profile or use a link for its slot."
+        case .differentPairing: return "This link is for a different coordinator or slot. Unlock your existing profile or use a link for its slot."
         case .configuration: return "LokiSigner couldn’t load its settings. Check your connection and try again."
         case .witnessesSaveUncertain: return "LokiSigner saved the nonce witnesses, but couldn’t confirm the save finished, so it didn’t start and signed nothing. The next unlock will most likely use those witnesses. If LokiSigner asks about them again, review them again."
         case .witnessesNotSaved: return "LokiSigner couldn’t save the nonce witnesses for this profile, so it didn’t start and signed nothing. If you approved new witnesses, they did not take effect. Check that the profile folder is writable, then try again."

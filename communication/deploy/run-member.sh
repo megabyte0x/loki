@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 2 || $1 != http* || ! $2 =~ ^[0-9]+$ ]]; then
+if [[ $# != 2 || $1 != http* || ! $2 =~ ^[1-9][0-9]{0,9}$ ]] || (( $2 > 4294967295 )); then
   echo 'usage: run-member.sh <coordinator-url> <slot>' >&2
   exit 2
 fi
@@ -18,6 +18,12 @@ fi
 data=${DATA:-$repo/loki-state/member-$slot}
 [[ $data == /* ]] || data=$PWD/$data
 while [[ $data == */ && $data != / ]]; do data=${data%/}; done
+# The default ports (3610 + slot, 4610 + slot) fit and never collide only for slots up to
+# 1000; coordinator slots are unbounded, so a larger slot must name its own ports.
+if (( slot > 1000 )) && [[ -z ${PORT:-} || -z ${PEER_PORT:-} ]]; then
+  echo "slot $slot is above 1000: set PORT and PEER_PORT to free, distinct ports" >&2
+  exit 2
+fi
 port=${PORT:-$((3610 + slot))}
 peer_port=${PEER_PORT:-$((4610 + slot))}
 frostd=${FROSTD_URL:-http://127.0.0.1:2744}
@@ -72,8 +78,8 @@ start_member "$port" "$data/member.log" "$data/pids" \
   --registration-slot "$slot" --profile-name "Member $slot" \
   ${advertise:+--peer-port "$peer_port" --advertise-url "$advertise"}
 
-curl -sf --max-time 10 "$coordinator/api/members" | grep -Eq "\"slot\": *$slot([,} ]|$)" \
-  || { echo "warning: slot $slot not yet visible in $coordinator/api/members; registration retries, see $data/member.log" >&2; }
+curl -sf --max-time 10 "$coordinator/api/members?slot=$slot" | grep -Eq "\"slot\": *$slot([,} ]|$)" \
+  || { echo "warning: slot $slot not yet visible in $coordinator/api/members?slot=$slot; registration retries, see $data/member.log" >&2; }
 
 echo "=============================================================="
 echo "member slot $slot running; registering with $coordinator"

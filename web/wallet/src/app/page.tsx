@@ -15,7 +15,7 @@ import {
   hasSignerHint,
   forgetSession,
   logout,
-  listSlots,
+  findMember,
   hasLokiSignerSession,
   lastLokiSignerSlot,
   requestPairingLink,
@@ -518,24 +518,29 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   };
   const [nativeOpen, setNativeOpen] = useState(false);
   const [nativeBusy, setNativeBusy] = useState(false);
-  const [apps, setApps] = useState<Slot[]>();
+  // The coordinator directory has no member cap, so this tab looks up only the slot the
+  // member names (remembered, just reserved, or typed) instead of listing every member app.
   const [choice, setChoice] = useState<number | "paste">();
+  const [typed, setTyped] = useState("");
+  const [found, setFound] = useState<{ slot: number; member: Slot | null }>();
+  const choose = (slot: number) => { setChoice(slot); setTyped(String(slot)); };
+  const typedSlot = (value: string) => /^[1-9][0-9]{0,9}$/.test(value) && Number(value) <= 0xffffffff ? Number(value) : undefined;
   useEffect(() => {
     const last = lastLokiSignerSlot();
-    if (last !== undefined) { setChoice(last); setNativeOpen(true); }
+    if (last !== undefined) { choose(last); setNativeOpen(true); }
   }, []);
+  const selected = choice;
+  const selectedSlot = typeof selected === "number" ? selected : undefined;
   useEffect(() => {
-    if (!nativeOpen) return;
+    if (!nativeOpen || selectedSlot === undefined) return;
     const loading = new AbortController();
-    listSlots(loading.signal).then(setApps).catch(() => {
-      if (!loading.signal.aborted) setApps([]);
+    findMember({ slot: selectedSlot }, loading.signal).then((member) => setFound({ slot: selectedSlot, member: member ?? null })).catch(() => {
+      if (!loading.signal.aborted) setFound({ slot: selectedSlot, member: null });
     });
     return () => loading.abort();
-  }, [nativeOpen]);
-  const lokiSigners = apps?.filter((m) => m.lokisigner_url !== undefined) ?? [];
-  const selected = choice ?? (lokiSigners.length === 0 && apps ? "paste" : undefined);
-  const selectedSlot = typeof selected === "number" ? selected : undefined;
-  const selectedMember = apps?.find((m) => m.slot === selectedSlot);
+  }, [nativeOpen, selectedSlot]);
+  const looked = found?.slot === selectedSlot ? found : undefined;
+  const selectedMember = looked?.member ?? undefined;
 
   return <FullScreen calm>
     <div className="panel w-full max-w-md px-6 py-8 sm:px-10">
@@ -600,22 +605,25 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
       <details open={nativeOpen} className="mt-4 text-xs text-muted" onToggle={(e) => setNativeOpen(e.currentTarget.open)}>
         <summary className="min-h-11 cursor-pointer hover:text-mint">Use a native member app instead</summary>
         <h2 className="mb-1 mt-3 text-sm font-semibold text-[var(--ink)]">1 · Pair a new native signer</h2>
-        <NativePairingLink open={nativeOpen} onReserved={setChoice} onRegistered={setApps} />
+        <NativePairingLink open={nativeOpen} onReserved={choose} onRegistered={(member) => setFound({ slot: member.slot, member })} />
         <h2 className="mb-1 mt-5 text-sm font-semibold text-[var(--ink)]">2 · Connect this wallet tab</h2>
         {nativeOpen && <>
-          {(lokiSigners.length > 0 || selectedSlot !== undefined) && <label className="my-2 block">
-            Member app
-            <select value={selected ?? ""} disabled={busy || nativeBusy} onChange={(e) => setChoice(e.target.value === "paste" ? "paste" : Number(e.target.value))}
-              className="glass mt-1 w-full rounded-full px-4 py-2.5 text-[var(--ink)]">
-              {selected === undefined && <option value="" disabled>Choose a member app</option>}
-              {lokiSigners.map((m) => <option key={m.slot} value={m.slot}>LokiSigner · Slot {m.slot}</option>)}
-              {selectedSlot !== undefined && !lokiSigners.some((m) => m.slot === selectedSlot) &&
-                <option value={selectedSlot}>Member app · Slot {selectedSlot}</option>}
-              <option value="paste">Headless or older member app</option>
-            </select>
+          {selected !== "paste" && <label className="my-2 block">
+            Your member app&apos;s slot on this coordinator
+            <input value={typed} inputMode="numeric" autoComplete="off" spellCheck={false} placeholder="e.g. 7" disabled={busy || nativeBusy}
+              onChange={(e) => {
+                const value = e.target.value.trim();
+                setTyped(value);
+                setChoice(typedSlot(value));
+              }}
+              className="glass mt-1 w-full rounded-full px-4 py-2.5 font-mono text-[var(--ink)]" />
           </label>}
-          {selected === undefined && lokiSigners.length === 0 && <p role="status" className="my-2">Reading the member roster…</p>}
-          {selected !== undefined && !busy && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={nativeBusy}
+          <button type="button" className="min-h-11 text-mint" disabled={busy || nativeBusy}
+            onClick={() => setChoice(selected === "paste" ? typedSlot(typed) : "paste")}>
+            {selected === "paste" ? "Connect LokiSigner by slot instead" : "Headless or older member app"}
+          </button>
+          {selectedSlot !== undefined && !looked && <p role="status" className="my-2">Looking up slot {selectedSlot}…</p>}
+          {selected !== undefined && (selected === "paste" || looked) && !busy && <NativeTabConnection key={selected} member={selectedMember} slot={selectedSlot} disabled={nativeBusy}
             onBusy={setNativeBusy} onConnected={onLoggedIn} />}
         </>}
       </details>
@@ -626,7 +634,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
 const ROSTER_POLL_MS = 3000;
 const ROSTER_GRACE_MS = 60_000;
 
-function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; onReserved: (slot: number) => void; onRegistered: (roster: Slot[]) => void }) {
+function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; onReserved: (slot: number) => void; onRegistered: (member: Slot) => void }) {
   const [link, setLink] = useState<PairingLink | null>(null);
   const [slot, setSlot] = useState<number>();
   const [registered, setRegistered] = useState<number | null>(null);
@@ -663,8 +671,8 @@ function NativePairingLink({ open, onReserved, onRegistered }: { open: boolean; 
     const poll = setInterval(async () => {
       if (Date.now() > link.expires + ROSTER_GRACE_MS) { clearInterval(poll); return; }
       try {
-        const roster = await listSlots();
-        if (!stopped && roster.some((m) => m.slot === link.slot)) { setRegistered(link.slot); onRegistered(roster); }
+        const member = await findMember({ slot: link.slot });
+        if (!stopped && member) { setRegistered(link.slot); onRegistered(member); }
       } catch {}
     }, ROSTER_POLL_MS);
     return () => { stopped = true; clearInterval(tick); clearInterval(poll); };
@@ -751,7 +759,7 @@ function AccountNumber() {
     } catch (e) { setErr((e as Error).message); }
     finally { setBusy(false); }
   };
-  if (id) return <p className="mb-5 text-xs text-muted">Account number: <span className="select-all font-mono">{id}</span> · Your public roster slot in this vault.</p>;
+  if (id) return <p className="mb-5 text-xs text-muted">Coordinator slot: <span className="select-all font-mono">{id}</span> · Your number in this coordinator&apos;s member directory. Each vault numbers its members separately.</p>;
   return <div className="mb-5">
     <Btn variant="ghost" disabled={busy} onClick={register}>{busy ? "Registering…" : "Register this signer with the coordinator"}</Btn>
     <ErrMsg msg={err} />

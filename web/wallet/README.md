@@ -121,8 +121,12 @@ website can use the port and the open ceremony routes to learn whether LokiSigne
 subject to local network permission.
 Safari may block the wallet's loopback request; this has not been verified.
 
-Native setup and recovery use `GET /api/members?signing_pubkey=<lowercase hex>` to look up
-at most one public row without downloading the roster.
+The directory has no member cap, so it is never served whole.
+`GET /api/members?signing_pubkey=<lowercase hex>` and `GET /api/members?slot=<n>` each look up
+at most one public row; native setup, recovery, the wallet's LokiSigner connection and its
+pairing step use only these lookups. A plain `GET /api/members` returns the first 100 rows in
+slot order with `next` set when more remain; pass it back as `?after=<next>` for the following
+page. A request may carry only one of these parameters.
 
 The coordinator stores the roster, device generations, recent sign-up times, and challenges in one owner-only
 snapshot at `.access.json` (or `LOKI_REGISTRY`). Before upgrading, stop all old coordinator
@@ -151,12 +155,21 @@ A member types the address (for example `loki.megabyte.sh`) in LokiSigner, which
 `POST /api/members/pairing` for a `loki://pair` link and continues with the usual review,
 passphrase and Touch ID. The wallet's own pairing-link step still works the same way.
 
-The coordinator admits at most 16 active members in slots 1–16. A pairing link reserves the
-lowest free slot (or the slot it names, to finish a pairing that never registered) for two
-minutes, and so does a new identity that enrolls directly (the in-browser signer). Together
-these unfinished new-identity reservations can hold at most eight distinct slots, so they
-never fill the roster; a further request gets "too many pending registrations". At most 32
-registration challenges can be pending in all.
+A coordinator slot is a member's number in this directory only. It is not the member's
+number in any vault: each vault numbers its own members 1 to N (at most 16) when it is set
+up, the creator as 1 and each invite carrying its own number, and the roster code every
+member compares covers each vault number together with that member's signing and relay keys.
+So the directory has no member cap by default; slots are positive whole numbers up to
+4294967295. An operator can set `LOKI_MAX_MEMBERS` to cap it: once registered members plus
+slots held by pending new-identity reservations reach the cap, new identities get "no free
+slot" (registered members can still refresh, replace devices and recover).
+
+A pairing link reserves the lowest free slot (or the slot it names, to finish a pairing that
+never registered) for two minutes, and so does a new identity that enrolls directly (the
+in-browser signer). Together these unfinished new-identity reservations can hold at most
+eight distinct slots; a further request gets "too many pending registrations". At most 32
+registration challenges from identities the registry doesn't know can be pending; each
+registered member can hold one more of its own.
 Funds stay protected without an admission gate: joining a vault still needs the creator's
 private invite and the roster-code comparison.
 
@@ -171,7 +184,7 @@ Registry writes come from two separate budgets. New-identity work (pairing links
 resuming or claiming for an identity the registry doesn't know) uses one. A registered
 member's refresh or replacement, completing an issued proof and operator tools use the other,
 so new-identity traffic can never make an existing member wait for "registration is busy". The
-per-address check and every cheap refusal (a malformed request, a full roster, no pending
+per-address check and every cheap refusal (a malformed request, no pending
 slot, the sign-up cap, a taken slot, an unknown proof) happen before either budget or the
 registry lock is spent. Those checks use a parsed copy of the registry kept in memory and
 re-read only when the file changes; the locked write checks everything again.
@@ -189,6 +202,7 @@ restart it to apply a change.
 
 | Setting | Default | Limits |
 | --- | --- | --- |
+| `LOKI_MAX_MEMBERS` | unset | Members in the directory. Unset means no cap. New identities are refused at the cap, counting slots their pending reservations hold; registered members are unaffected. Bounds the registry file, which every registration rewrites whole. |
 | `LOKI_SIGNUPS_PER_HOUR` | 6 | New identities registered in a rolling hour, across the coordinator. Stored in the registry. Refreshing or replacing a registered member's device and resuming a pending registration don't count. |
 | `LOKI_IP_PAIRING_PER_MINUTE` | 5 | New-identity requests (above) per client address per minute. |
 | `LOKI_IP_PAIRING_PER_DAY` | 30 | The same requests per client address per rolling day. |
@@ -212,8 +226,11 @@ only when a proxy you run always overwrites that header.
 A refused request gets HTTP 429 with a short plain message and a `Retry-After` header: the
 seconds until the exhausted window admits again (up to a day for the daily limit). The coordinator logs one fixed
 line per refusal reason, never the client address. A value that isn't a whole number stops
-admission until it's fixed. These limits slow spam but don't stop it: the 16 slots can
-still fill up.
+admission until it's fixed. These limits slow spam but don't stop it: with the default
+sign-up limit the directory can still grow by up to 6 identities an hour (about 52,000 a
+year). The registry file is read and rewritten whole on every registration, which this rate
+keeps affordable; set `LOKI_MAX_MEMBERS` or lower `LOKI_SIGNUPS_PER_HOUR` if the
+coordinator's disk or memory is small.
 
 To permanently retire a roster identity and release its slot, use the same registry path
 as the coordinator: `LOKI_REGISTRY=/path/to/registry.json node scripts/retire-member.ts <signing_pubkey>`.

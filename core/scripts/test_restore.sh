@@ -85,7 +85,7 @@ wait_for() {
   for ((n=0; n<tries; n++)); do "$@" && return; sleep 1; done
   fail "$what"
 }
-roster_entry() { curl -sf -m 10 "$coordinator/api/members" | jq -c --argjson slot "$1" '.slots[] | select(.slot == $slot)'; }
+roster_entry() { curl -sf -m 10 "$coordinator/api/members?slot=$1" | jq -c --argjson slot "$1" '.slots[] | select(.slot == $slot)'; }
 device_of() { jq -r --argjson slot "$1" '.devices[] | select(.slot == $slot) | .device_pubkey' "$LOKI_REGISTRY"; }
 
 echo "== three members register with $coordinator and create a 2-of-3 vault"

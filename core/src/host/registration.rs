@@ -6,7 +6,6 @@ use zeroize::Zeroizing;
 
 use super::diagnostics::PairingRefusal;
 use super::state::{write_native_key_scope, Config, Session, Shared};
-use crate::member_state::MAX_MEMBERS;
 use crate::signer::device_auth::{verify_device_signature, DeviceRegistry};
 use crate::state::MemberDir;
 use crate::transport::read_bounded;
@@ -77,7 +76,10 @@ impl RegistrationConfig {
     }
 }
 
-pub(super) fn valid_slot(slot: u32) -> bool { (1..=u32::from(MAX_MEMBERS)).contains(&slot) }
+/// A coordinator slot is the member's number in the coordinator's directory, which has no
+/// member cap. It is never a vault member id: each vault numbers its own members 1..=N at
+/// setup (see `ceremony::create` and `ceremony::join`).
+pub(super) fn valid_slot(slot: u32) -> bool { slot >= 1 }
 
 fn lowercase_key(hex: &str) -> bool {
     hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -766,7 +768,7 @@ pub(super) async fn request_pairing_link(origin: &str, slot: Option<u32>, develo
         let json = body.and_then(|body| serde_json::from_slice::<serde_json::Value>(&body).ok());
         return Err(match json.as_ref().and_then(|json| json["error"].as_str()) {
             Some(SIGNUP_LIMIT | IP_LIMIT) => PairingRefusal::RateLimited,
-            Some("no free slot (1..16)" | "too many pending registrations") => PairingRefusal::SlotsFull,
+            Some("no free slot" | "too many pending registrations") => PairingRefusal::SlotsFull,
             Some("slot already registered or reserved") => PairingRefusal::SlotHeld,
             _ if status == reqwest::StatusCode::TOO_MANY_REQUESTS => PairingRefusal::RateLimited,
             _ if status.is_server_error() => PairingRefusal::Unreachable,
@@ -789,17 +791,23 @@ async fn slot_conflict(st: &Shared, pass: &Zeroizing<String>, origin: &str, slot
     let (data, secret) = (st.config.data.clone(), pass.clone());
     let own = tokio::task::spawn_blocking(move || super::ceremony::identity(&data, &secret, 1).map(|identity| hex::encode(identity.public().signing))).await;
     let Ok(Ok(own)) = own else { return PairingRefusal::SlotHeld };
-    let roster = async {
+    // The directory has no member cap, so look up the two rows that matter (who holds this
+    // slot, and whether this identity holds any slot) instead of reading the whole roster.
+    let lookup = |field: &'static str, value: String| async move {
         let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(15)).build().ok()?;
-        let mut response = client.get(format!("{origin}/api/members")).send().await.ok()?;
+        let url = reqwest::Url::parse_with_params(&format!("{origin}/api/members"), [(field, value)]).ok()?;
+        let mut response = client.get(url).send().await.ok()?;
         if !response.status().is_success() { return None; }
-        serde_json::from_slice::<Roster>(&read_bounded(&mut response, 32 * 1024).await.ok()?).ok()
-    }.await;
-    let Some(roster) = roster else { return PairingRefusal::SlotHeld };
+        serde_json::from_slice::<Roster>(&read_bounded(&mut response, 8 * 1024).await.ok()?).ok()
+            .filter(|roster| roster.slots.len() <= 1)
+    };
+    let (Some(held), Some(own_rows)) = (lookup("slot", slot.to_string()).await, lookup("signing_pubkey", own.clone()).await) else {
+        return PairingRefusal::SlotHeld;
+    };
     let key = |value: &str| value.len() == 64 && value.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    let rows: Vec<_> = roster.slots.iter().filter(|m| m.slot == slot).collect();
-    let mine = roster.slots.iter().any(|m| m.signing_pubkey.eq_ignore_ascii_case(&own));
+    let rows: Vec<_> = held.slots.iter().filter(|m| m.slot == slot).collect();
+    let mine = held.slots.iter().chain(&own_rows.slots).any(|m| m.signing_pubkey.eq_ignore_ascii_case(&own));
     match rows.as_slice() {
         [row] if !mine && key(&row.signing_pubkey) && key(&row.relay_pubkey) && row.signing_pubkey != own => PairingRefusal::SlotRegistered,
         _ => PairingRefusal::SlotHeld,

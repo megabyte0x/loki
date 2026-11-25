@@ -62,8 +62,8 @@ export async function pairDevice(link: string, expectedSlot?: number, cancel?: A
     if (expectedSlot !== undefined && member.slot !== expectedSlot) {
       throw new Error(`Pairing link belongs to a different member. Use the link for slot ${expectedSlot}.`);
     }
-    const roster = await listSlots(signal);
-    if (!roster.some((m) => m.slot === member.slot && m.signing_pubkey === member.signing_pubkey && m.relay_pubkey === member.relay_pubkey && m.advertise_url === member.advertise_url)) {
+    const listed = await findMember({ slot: member.slot }, signal);
+    if (!listed || listed.signing_pubkey !== member.signing_pubkey || listed.relay_pubkey !== member.relay_pubkey || listed.advertise_url !== member.advertise_url) {
       throw new Error("Device identity does not match the public roster; register the device first");
     }
     const status = await nativeApi<{ phase: string }>(session, "status", undefined, signal);
@@ -97,7 +97,7 @@ export async function connectLokiSigner(slot: number, show: (progress: ConnectPr
   try {
     while (true) {
       discovery.throwIfAborted();
-      const member = (await listSlots(discovery)).find((m) => m.slot === slot);
+      const member = await findMember({ slot }, discovery);
       discovery.throwIfAborted();
       const endpoint = member?.lokisigner_url;
       if (endpoint !== undefined && !isLokiSignerUrl(endpoint)) throw new Error("The coordinator did not give a valid LokiSigner loopback address.");
@@ -188,7 +188,7 @@ function retryIn(header: string | null): string {
 const PAIRING_REFUSALS: [string, (wait: string) => string][] = [
   ["This coordinator has reached its sign-up limit", (wait) => `This coordinator has reached its sign-up limit for this hour. Try again ${wait}.`],
   ["Too many pairing requests", (wait) => `Too many pairing requests from this network. Try again ${wait}.`],
-  ["no free slot", () => "All 16 member slots on this coordinator are taken."],
+  ["no free slot", () => "This coordinator is full: its operator caps the number of members."],
   ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
   ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
   ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
@@ -244,10 +244,14 @@ export async function api<T = unknown>(path: string, body?: unknown): Promise<T>
   }
 }
 
-export async function listSlots(signal?: AbortSignal): Promise<Slot[]> {
-  const res = await fetch("/api/members", { cache: "no-store", signal });
+// The coordinator directory has no member cap, so the wallet looks up the one member it
+// needs instead of reading a listing.
+export async function findMember(query: { slot: number } | { signing_pubkey: string }, signal?: AbortSignal): Promise<Slot | undefined> {
+  const params = new URLSearchParams("slot" in query ? { slot: String(query.slot) } : { signing_pubkey: query.signing_pubkey });
+  const res = await fetch(`/api/members?${params}`, { cache: "no-store", signal });
   if (!res.ok) throw new Error("could not read public roster");
-  return (await res.json()).slots as Slot[];
+  const rows = (await res.json()).slots as Slot[];
+  return rows.find((m) => "slot" in query ? m.slot === query.slot : m.signing_pubkey === query.signing_pubkey);
 }
 
 export function hasSigner(): Promise<boolean> { return signer.hasSigner(); }
@@ -263,7 +267,7 @@ export async function createSigner(opts: CreateSignerOpts): Promise<SignerSessio
 }
 export async function unlock(opts: UnlockOpts): Promise<SignerSession> {
   const s = await signer.unlock(opts);
-  const slot = s.slot ?? (await listSlots(AbortSignal.timeout(15_000)).catch(() => [])).find((m) => m.signing_pubkey === s.profile.id)?.slot;
+  const slot = s.slot ?? (await findMember({ signing_pubkey: s.profile.id }, AbortSignal.timeout(15_000)).catch(() => undefined))?.slot;
   rememberMe({ ...s, slot });
   return s;
 }

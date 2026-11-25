@@ -83,7 +83,7 @@ final class SignerStatusWindow: NSObject, NSWindowDelegate {
         window.center()
 
         values[2].lineBreakMode = .byCharWrapping
-        let labels = ["Profile", "Registration", "Coordinator", "Member slot", "Wallet tabs", "Active vaults", "Last error"]
+        let labels = ["Profile", "Registration", "Coordinator", "Coordinator slot", "Wallet tabs", "Active vaults", "Last error"]
         let grid = NSGridView(views: zip(labels, values + [lastError]).map { title, value in
             let label = NSTextField(labelWithString: title)
             label.textColor = .secondaryLabelColor

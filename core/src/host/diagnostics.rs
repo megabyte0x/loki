@@ -28,9 +28,9 @@ impl PairingRefusal {
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::RateLimited => "The coordinator is limiting new pairings right now. Try again later.",
-            Self::SlotsFull => "The coordinator has no free member slot right now. Try again later, or ask whoever runs it.",
-            Self::SlotHeld => "The coordinator is holding this member slot right now. Wait two minutes for the hold to expire, then try again.",
-            Self::SlotRegistered => "Another member registered this slot. Remove this profile and pair again with the coordinator address.",
+            Self::SlotsFull => "The coordinator is full or has too many pairings waiting right now. Try again in a few minutes, or ask whoever runs it.",
+            Self::SlotHeld => "The coordinator is holding this slot right now. Wait two minutes for the hold to expire, then try again.",
+            Self::SlotRegistered => "Another member registered this coordinator slot. Remove this profile and pair again with the coordinator address.",
             Self::Unreachable => "LokiSigner couldn’t reach the coordinator. Check the address and your connection, then try again.",
             Self::Other => "The coordinator didn’t give this Mac a pairing link. Try again, or ask whoever runs it.",
         }
@@ -111,9 +111,9 @@ impl Event {
             Event::PairingRequested => ("Asked the coordinator for a pairing link.", Kind::Info),
             Event::PairingRefused(reason) => (match reason {
                 PairingRefusal::RateLimited => "Pairing refused: the coordinator is rate limiting new pairings.",
-                PairingRefusal::SlotsFull => "Pairing refused: the coordinator has no free member slot.",
-                PairingRefusal::SlotHeld => "Pairing refused: the coordinator is holding this member slot.",
-                PairingRefusal::SlotRegistered => "Pairing refused: another member registered this slot.",
+                PairingRefusal::SlotsFull => "Pairing refused: the coordinator is full or has too many pairings waiting.",
+                PairingRefusal::SlotHeld => "Pairing refused: the coordinator is holding this slot.",
+                PairingRefusal::SlotRegistered => "Pairing refused: another member registered this coordinator slot.",
                 PairingRefusal::Unreachable => "Pairing failed: LokiSigner couldn’t reach the coordinator.",
                 PairingRefusal::Other => "Pairing refused by the coordinator.",
             }, Kind::Error),

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { api, listSlots, createSigner, unlock, hasSigner, logout, forgetSession } from '../src/lib/api.ts';
+import { api, findMember, createSigner, unlock, hasSigner, logout, forgetSession } from '../src/lib/api.ts';
 
 test('member calls run in the in-browser signer; only the coordinator is fetched', async () => {
   const sess = new Map(), local = new Map(), events = [];
@@ -12,7 +12,7 @@ test('member calls run in the in-browser signer; only the coordinator is fetched
   const fetched = [];
   globalThis.fetch = async (url, init = {}) => {
     fetched.push(url);
-    assert(url === '/api/members', 'the only network call is the public roster');
+    assert(url === '/api/members?slot=1', 'the only network call is a public roster lookup');
     assert(!init.headers, 'coordinator receives no signer capability');
     return Response.json({ slots: [member] });
   };
@@ -31,8 +31,9 @@ test('member calls run in the in-browser signer; only the coordinator is fetched
     await assert.rejects(api('create', { name: 'v', members: 3, threshold: 2 }), /does not serve/);
     await assert.rejects(api('../api/members'), /invalid signer API path/);
 
-    assert.deepEqual(await listSlots(), [member]);
-    assert.deepEqual(fetched, ['/api/members']);
+    assert.deepEqual(await findMember({ slot: 1 }), member);
+    assert.deepEqual(fetched, ['/api/members?slot=1']);
+
 
     assert.equal(await logout(), true);
     await assert.rejects(api('status'), /Unlock your signer/);

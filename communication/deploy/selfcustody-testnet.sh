@@ -64,7 +64,18 @@ done
 
 registered=0
 for _ in {1..75}; do
-  registered=$(curl -sf --max-time 1 "$coordinator/api/members" | python3 -c 'import sys,json;print(len(json.load(sys.stdin)["slots"]))' 2>/dev/null) || registered=0
+  registered=$(python3 - "$coordinator" <<'PY' 2>/dev/null
+import json, sys, urllib.request
+url, total, after = sys.argv[1] + "/api/members", 0, None
+while True:
+    page = json.load(urllib.request.urlopen(url + ("" if after is None else f"?after={after}"), timeout=1))
+    total += len(page["slots"])
+    after = page.get("next")
+    if after is None:
+        break
+print(total)
+PY
+) || registered=0
   [[ $registered == "$members" ]] && break
   sleep 0.4
 done
