@@ -15,7 +15,7 @@ enum SignerStartFailure: Error, Equatable {
     static func renewalRefusal(_ code: Int32) -> String {
         switch code {
         case 15: return "The coordinator is limiting new pairings right now. Try again later."
-        case 16: return "The coordinator has no free member slot right now. Try again later, or ask whoever runs it."
+        case 16: return "The coordinator has too many pairings waiting right now. Try again in a few minutes, or ask whoever runs it."
         case 17: return "Another member registered this slot. Remove this profile and pair again with the coordinator address."
         case 20: return "The coordinator is holding this member slot right now. Wait two minutes for the hold to expire, then pair again with the coordinator address. This profile can still finish."
         case 18: return "LokiSigner couldn’t reach the coordinator to renew this Mac’s reservation. Check your connection, then pair again with the coordinator address."

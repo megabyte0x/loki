@@ -1006,7 +1006,7 @@ class _WalletState extends State<_Wallet> with WidgetsBindingObserver {
                                       ? 'LokiSigner'
                                       : profile['slot'] == null
                                       ? 'Member'
-                                      : 'Member ${profile['slot']}',
+                                      : 'Coordinator slot ${profile['slot']}',
                                   style: lokiSans(12, weight: 600),
                                 ),
                                 Text(

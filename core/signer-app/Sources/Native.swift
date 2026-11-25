@@ -544,7 +544,7 @@ private func nativeConfirmRoster(_ summary: UnsafePointer<CChar>?) -> Int32 {
         let policyNumber = r.column([r.label("\(threshold) of \(members)", size: 26, weight: .semibold, mono: true),
                                      r.label("Approvals required", size: 12, tone: r.muted)], spacing: 4)
         let slotNumber = r.column([r.label(String(format: "%02d", member), size: 26, weight: .semibold, mono: true),
-                                   r.label("Your member slot", size: 12, tone: r.muted)], spacing: 4)
+                                   r.label("Your member number in this vault", size: 12, tone: r.muted)], spacing: 4)
         let facts = NSStackView(views: [policyNumber, slotNumber])
         facts.distribution = .fillEqually
         let policy = r.card("Vault policy", [facts,

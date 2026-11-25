@@ -24,7 +24,9 @@ server ever holds a share.
   rebuilds the transaction hash from the raw transaction and shows the recipient, amount
   and fee it is about to sign, and anything that doesn't match is refused.
 - **The coordinator holds no keys**, it publishes the roster and relays messages, with no
-  share, nonce or spend key, so it cannot sign anything on its own.
+  share, nonce or spend key, so it cannot sign anything on its own. Its member directory has
+  no size cap: a member's coordinator slot is only its number there, and each vault numbers
+  its own members 1 to `n` when it is set up.
 - **Members only dial out for signing**, all signing traffic goes through a
   [`frostd`](https://github.com/ZcashFoundation/frost) relay that every party connects
   to. A native vault creator also needs a reachable HTTPS peer endpoint for setup.
