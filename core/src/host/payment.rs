@@ -869,7 +869,11 @@ fn close_read_sessions(st: &AppState, data: &Path, pass: &str, v: &Vault, vault:
     let mut lease = RelayLease::take(st, &v.identity)?;
     for (attempt, session) in due {
         if st.is_stopping() { return Err("profile is locked".into()); }
-        close_if_present(lease.transport_mut(), session)?;
+        // One session that keeps failing to close must not block the others in this round.
+        if let Err(e) = close_if_present(lease.transport_mut(), session) {
+            eprintln!("payment {attempt}: frostd close of control session {session} failed: {e}");
+            continue;
+        }
         let _guard = st.payment.lock().map_err(|e| e.to_string())?;
         let mut p = read_payment(data, pass, vault, &attempt)?;
         if p.control_session_id == Some(session) && !p.control_closed {
@@ -901,9 +905,11 @@ fn send_seen(st: &AppState, v: &Vault, p: &Payment, notice: &str) -> Result<(), 
 }
 
 /// Matches a member's acknowledgement to the proposer's payment. Discarding clears the
-/// proposer's signing session id after its `cancelled` notice went out.
+/// proposer's signing session id after its `cancelled` notice went out, possibly before the
+/// phase is saved as `cancelled` (e.g. the discard's wallet scan failed). Acks are kept per
+/// notice kind, so matching without the cleared id cannot count toward another outcome.
 fn seen_matches(p: &Payment, incoming: &Payment) -> bool {
-    if p.session_id.is_none() && p.phase == "cancelled" {
+    if p.session_id.is_none() {
         return intent_hash(&Payment { session_id: incoming.session_id, ..p.clone() }) == intent_hash(incoming);
     }
     intent_hash(p) == intent_hash(incoming)
