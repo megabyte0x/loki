@@ -10,11 +10,13 @@ test('unlocking a registered browser signer remembers its roster slot', async ()
   const originalUnlock = signer.unlock, originalFetch = globalThis.fetch;
   signer.unlock = async () => ({ profile: { id, name: 'Browser member' }, persisted: false });
   globalThis.fetch = async (url) => {
-    assert.equal(url, '/api/members');
+    const query = new URL(url, 'http://coordinator.test');
+    assert.equal(query.pathname, '/api/members');
+    const signing = query.searchParams.get('signing_pubkey');
     return Response.json({ slots: [
       { slot: 1, signing_pubkey: 'cd'.repeat(32), relay_pubkey: '11'.repeat(32), advertise_url: 'http://127.0.0.1:3601' },
       { slot: 4, signing_pubkey: id, relay_pubkey: '22'.repeat(32), advertise_url: '' },
-    ] });
+    ].filter((m) => m.signing_pubkey === signing) });
   };
   try {
     await unlock({ method: 'platform' });

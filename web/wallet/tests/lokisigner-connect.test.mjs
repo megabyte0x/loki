@@ -65,7 +65,7 @@ test('duplicating an approved tab copies the slot but needs its own Allow, and a
   const posts = [], progress = [], nativeCalls = [];
   const tab1 = new Map();
   const fixture = tabFixture(t, async (url, options = {}) => {
-    if (url === '/api/members') {
+    if (url === '/api/members?slot=7') {
       const endpoint = launch === 1 ? old : current;
       return Response.json({ slots: [{ ...member, lokisigner_url: endpoint }] });
     }
@@ -126,7 +126,7 @@ test('a stale loopback port retries discovery; a foreign URL or a refused respon
   const tab = new Map();
   let endpoint = old, posts = 0;
   const fixture = tabFixture(t, async (url) => {
-    if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: endpoint }] });
+    if (url === '/api/members?slot=7') return Response.json({ slots: [{ ...member, lokisigner_url: endpoint }] });
     posts++;
     if (url === `${old}/api/connect`) { endpoint = current; throw new TypeError('connection refused'); }
     assert.equal(url, `${current}/api/connect`);
@@ -152,7 +152,7 @@ test('a forbidden or busy connect response is final and displays no comparison c
   let status, posts = 0;
   const tab = new Map();
   tabFixture(t, async (url) => {
-    if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
+    if (url === '/api/members?slot=7') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
     return ++posts === 1 ? new Response(null, { status }) : streamed('{"code":"061274"}\n', `{"token":"${token('a')}"}\n`);
   }).use(tab);
   for (const [reply, message] of [[403, /did not allow/], [429, /another connection request or waiting.*Refuse.*few seconds/]]) {
@@ -173,7 +173,7 @@ test('startup retries stop after one minute and a new attempt can connect', { ti
   const tab = new Map();
   let ready = false, posts = 0;
   tabFixture(t, async (url) => {
-    if (url === '/api/members') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
+    if (url === '/api/members?slot=7') return Response.json({ slots: [{ ...member, lokisigner_url: current }] });
     if (ready) return streamed('{"code":"061274"}\n', `{"token":"${token('b')}"}\n`);
     const status = [undefined, 404, 405, 425][posts++ % 4];
     if (!status) throw new TypeError('network error');
@@ -202,7 +202,7 @@ test('only a code followed by a token in a live request can persist a grant', as
   const code = '{"code":"061274"}\n';
   const grant = `{"token":"${token('c')}"}\n`;
   let frames = [grant, code];
-  tabFixture(t, async (url) => url === '/api/members'
+  tabFixture(t, async (url) => url === '/api/members?slot=7'
     ? Response.json({ slots: [{ ...member, lokisigner_url: current }] })
     : streamed(...frames)).use(tab);
   const request = new AbortController();

@@ -17,7 +17,7 @@ test('a tab paired with a native member routes member calls to it, with its capa
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, init = {}) => {
     calls.push({ url, token: init.headers?.['X-Loki-Token'], body: init.body });
-    if (url === '/api/members') return Response.json({ slots: [member] });
+    if (url === `/api/members?slot=${member.slot}`) return Response.json({ slots: [member] });
     if (url === 'http://127.0.0.1:3602/api/registration') return Response.json(member);
     if (url === 'http://127.0.0.1:3602/api/status') return Response.json({ phase: 'home' });
     if (url === 'http://127.0.0.1:3602/api/payment-approve') return Response.json({ phase: 'signing' });
