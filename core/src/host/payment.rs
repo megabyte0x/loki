@@ -117,6 +117,13 @@ struct Payment {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure_reason: Option<FailureReason>,
+    /// Proposer only: members that acknowledged reading a final notice, keyed by the
+    /// notice class (see `final_notice`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    control_seen: BTreeMap<String, BTreeSet<u16>>,
+    /// Proposer only: the control session was closed after every member read it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    control_closed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -821,6 +828,87 @@ fn send_control_on(tx: &mut FrostdTransport, v: &Vault<impl Sized>, p: &Payment,
     Ok(())
 }
 
+/// Groups the proposer's final notices by what they settle; `broadcast` and `confirmed`
+/// both report the sent transaction.
+fn final_notice(kind: &str) -> Option<&'static str> {
+    match kind {
+        "cancelled" => Some("cancelled"),
+        "failed" => Some("failed"),
+        "broadcast" | "confirmed" => Some("sent"),
+        _ => None,
+    }
+}
+
+/// The final notice class the proposer has sent for good, if it will send nothing else on
+/// the control session. A failed payment that can still be discarded may yet send
+/// `cancelled`, so it stays open.
+fn proposer_final(data: &Path, p: &Payment) -> Option<&'static str> {
+    match p.phase.as_str() {
+        "cancelled" => Some("cancelled"),
+        "failed" if discardable(data, p).is_err() => Some("failed"),
+        "broadcast" | "confirmed" | "replaced" | "expired" if p.tx_verified && p.copies_sent => Some("sent"),
+        _ => None,
+    }
+}
+
+/// Own control sessions every other member has acknowledged reading to the end.
+fn read_control_sessions(data: &Path, v: &Vault, payments: &[Payment]) -> Vec<(String, Uuid)> {
+    payments.iter()
+        .filter(|p| p.proposer == v.slot && !p.control_closed)
+        .filter_map(|p| {
+            let session = p.control_session_id?;
+            let seen = p.control_seen.get(proposer_final(data, p)?)?;
+            v.peers.keys().all(|id| *id == v.slot || seen.contains(id)).then(|| (p.attempt.clone(), session))
+        })
+        .collect()
+}
+
+fn close_read_sessions(st: &AppState, data: &Path, pass: &str, v: &Vault, vault: &str, due: Vec<(String, Uuid)>,
+) -> Result<(), String> {
+    if due.is_empty() { return Ok(()); }
+    let mut lease = RelayLease::take(st, &v.identity)?;
+    for (attempt, session) in due {
+        if st.is_stopping() { return Err("profile is locked".into()); }
+        close_if_present(lease.transport_mut(), session)?;
+        let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+        let mut p = read_payment(data, pass, vault, &attempt)?;
+        if p.control_session_id == Some(session) && !p.control_closed {
+            p.control_closed = true;
+            save_payment(data, pass, &p)?;
+        }
+        eprintln!("payment {attempt}: frostd closed control session {session} after every member read it");
+    }
+    lease.keep();
+    Ok(())
+}
+
+/// Tells the proposer this member has applied its final `notice`, so the proposer can close
+/// the control session once everyone has. Sealed like any other control notice.
+fn send_seen(st: &AppState, v: &Vault, p: &Payment, notice: &str) -> Result<(), String> {
+    let session = p.control_session_id.ok_or("missing payment control session")?;
+    let owner = v.peers.get(&p.proposer).ok_or("unknown control recipient")?;
+    let body = json!({"kind":"seen","notice":notice,"hash":intent_hash(p),"intent":public_intent(p)});
+    let body = serde_json::to_vec(&body).map_err(|e| e.to_string())?;
+    let context = control_context(&p.vault, session, v.slot, p.proposer)?;
+    let sealed = SealedPeer::seal(&v.identity, owner, &context, MessageKind::PeerReply, &body)?;
+    let mut lease = RelayLease::take(st, &v.identity)?;
+    let tx = lease.transport_mut();
+    let ch = tx.join(session).map_err(|e| e.to_string())?;
+    tx.send(&ch, &[Peer(owner.encryption)], &Outbound::Peer(sealed)).map_err(|e| e.to_string())?;
+    lease.keep();
+    eprintln!("payment {}: frostd sent seen {notice} to member {} (control session {session})", p.attempt, p.proposer);
+    Ok(())
+}
+
+/// Matches a member's acknowledgement to the proposer's payment. Discarding clears the
+/// proposer's signing session id after its `cancelled` notice went out.
+fn seen_matches(p: &Payment, incoming: &Payment) -> bool {
+    if p.session_id.is_none() && p.phase == "cancelled" {
+        return intent_hash(&Payment { session_id: incoming.session_id, ..p.clone() }) == intent_hash(incoming);
+    }
+    intent_hash(p) == intent_hash(incoming)
+}
+
 fn sync_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault) -> Result<(), String> {
     sync_control_inner(st, data, pass, vault, v, None).inspect_err(|_| {
         eprintln!("vault {vault}: frostd control receive error");
@@ -837,16 +925,20 @@ fn sync_control_inner(st: &AppState, data: &Path, pass: &str, vault: &str, v: &V
     fetch_error.map_or(Ok(()), Err)
 }
 
-fn final_control_sessions(data: &Path, pass: &str, vault: &str) -> Result<BTreeSet<Uuid>, String> {
-    let payments = all_payments(data, pass, vault)?;
+/// Sessions this member no longer needs to read. The proposer keeps reading its own until it
+/// closes them, to collect the members' acknowledgements.
+fn final_control_sessions(payments: &[Payment], slot: u16) -> BTreeSet<Uuid> {
     let live: BTreeSet<Uuid> = payments.iter()
-        .filter(|p| !(matches!(p.phase.as_str(), "confirmed" | "replaced") && p.tx_verified))
+        .filter(|p| {
+            !(matches!(p.phase.as_str(), "confirmed" | "replaced") && p.tx_verified)
+                || p.proposer == slot && !p.control_closed
+        })
         .filter_map(|p| p.control_session_id)
         .collect();
-    Ok(payments.iter()
+    payments.iter()
         .filter_map(|p| p.control_session_id)
         .filter(|session| !live.contains(session))
-        .collect())
+        .collect()
 }
 
 fn control_owner(v: &Vault, participants: &[[u8; 32]], owner: [u8; 32]) -> Option<u16> {
@@ -985,6 +1077,8 @@ fn fetch_control(st: &AppState, vault: &str, v: &Vault, target: Option<(&FrostdT
 fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault, batches: Vec<ControlBatch>,
     unopened: &mut Vec<(Uuid, Pending)>,
 ) -> Result<(), String> {
+    // Acknowledged only after every notice in this pass is durably applied.
+    let mut acks = BTreeMap::new();
     for ControlBatch { session, proposer, messages } in batches {
         if st.is_stopping() { return Err("profile is locked".into()); }
         for pending in messages {
@@ -1021,11 +1115,26 @@ fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
             {
                 continue;
             }
-            if let Some(kind @ ("intent" | "approval" | "start" | "failed" | "cancelled" | "signed" | "broadcast" | "confirmed")) = body["kind"].as_str() {
+            if let Some(kind @ ("intent" | "approval" | "start" | "failed" | "cancelled" | "signed" | "broadcast" | "confirmed" | "seen")) = body["kind"].as_str() {
                 eprintln!("payment {}: frostd received {kind} from member {}", incoming.attempt, peer.id);
+            }
+            if let Some(notice) = body["kind"].as_str().filter(|kind| final_notice(kind).is_some()) {
+                if peer.id == proposer && v.slot != proposer {
+                    acks.entry((incoming.attempt.clone(), final_notice(notice)))
+                        .or_insert_with(|| (incoming.clone(), notice.to_owned()));
+                }
             }
             match read_payment(data, pass, vault, &incoming.attempt) {
                 Ok(mut p) => {
+                    if body["kind"] == "seen" {
+                        let notice = body["notice"].as_str().and_then(final_notice);
+                        if let Some(notice) = notice.filter(|_| v.slot == p.proposer && seen_matches(&p, &incoming)) {
+                            if p.control_seen.entry(notice.to_owned()).or_default().insert(peer.id) {
+                                save_payment(data, pass, &p)?;
+                            }
+                        }
+                        continue;
+                    }
                     if intent_hash(&p) != intent_hash(&incoming) {
                         continue;
                     }
@@ -1148,6 +1257,8 @@ fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
                     incoming.mined_height = None;
                     incoming.error = None;
                     incoming.failure_reason = None;
+                    incoming.control_seen.clear();
+                    incoming.control_closed = false;
                     if check_replacement(data, pass, v, &incoming).is_err() {
                         eprintln!("payment {}: error checking replacement request", incoming.attempt);
                         continue;
@@ -1167,6 +1278,12 @@ fn apply_control(st: &AppState, data: &Path, pass: &str, vault: &str, v: &Vault,
                 }
                 _ => {}
             }
+        }
+    }
+    for (p, notice) in acks.into_values() {
+        if st.is_stopping() { break; }
+        if send_seen(st, v, &p, &notice).is_err() {
+            eprintln!("payment {}: frostd send seen error", p.attempt);
         }
     }
     Ok(())
@@ -2610,13 +2727,20 @@ fn control_round(st: &Shared, data: &Path, pass: &str, vault: &str) {
         let fetch_error = {
             let lock = control_receiver(st, vault)?;
             let _receiving = lock.lock().map_err(|e| e.to_string())?;
-            let skip = {
+            let (skip, read) = {
                 let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-                final_control_sessions(data, pass, vault)?
+                let payments = all_payments(data, pass, vault)?;
+                (final_control_sessions(&payments, v.slot), read_control_sessions(data, &v, &payments))
             };
             let (batches, fetch_error) = fetch_control(st, vault, &v, None, &skip);
-            let _guard = st.payment.lock().map_err(|e| e.to_string())?;
-            apply_received(st, data, pass, vault, &v, batches)?;
+            {
+                let _guard = st.payment.lock().map_err(|e| e.to_string())?;
+                apply_received(st, data, pass, vault, &v, batches)?;
+            }
+            if let Err(error) = close_read_sessions(st, data, pass, &v, vault, read) {
+                eprintln!("vault {vault}: frostd close read control session error");
+                eprintln!("[verbose] vault {}: close read control session: {error}", &vault[..8.min(vault.len())]);
+            }
             fetch_error
         };
         restore_workers(st, data, pass, vault, v.slot)?;
