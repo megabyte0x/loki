@@ -109,7 +109,7 @@ api() {
   curl "${args[@]}" "http://127.0.0.1:$((base_port+n))$path"
 }
 clip_is_link() { [[ $(pbpaste) == "http://127.0.0.1:$1/#"* ]]; }
-registered() { curl -sf -m 5 "$coord/api/members" | jq -e --argjson s "$1" 'any(.slots[]; .slot == $s)' >/dev/null; }
+registered() { curl -sf -m 5 "$coord/api/members?slot=$1" | jq -e --argjson s "$1" 'any(.slots[]; .slot == $s)' >/dev/null; }
 
 for n in 1 2 3; do
   port=$((base_port+n))
@@ -164,7 +164,9 @@ for n in 1 2; do
   mailbox=$(jq -er --argjson i "$((n-1))" '.[$i].mailbox | map((. / 16 | floor), (. % 16)) |
     map(. as $nibble | "0123456789abcdef"[$nibble:$nibble + 1]) | join("")' "$witnesses")
   for i in 1 2 3; do
-    key=$(api "$i" GET /api/registration | jq -er --argjson slot "$i" 'select(.slot == $slot) | .signing_pubkey')
+    # --slot is the member's number in this vault (the creator is 1, member n joined with invite
+    # n), not its coordinator slot; the witness binds it to the member's signing key.
+    key=$(api "$i" GET /api/registration | jq -er '.signing_pubkey')
     "$relay" enroll-nonce --root "$root/relay-$n" --mailbox "$mailbox" --vault "$vault" \
       --slot "$i" --signing-key "$key" --quota-bytes 1048576 || fail "witness $n enrollment for member $i"
   done

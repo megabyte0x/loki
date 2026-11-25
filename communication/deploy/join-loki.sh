@@ -7,7 +7,7 @@ if [[ $# -lt 1 || $# -gt 2 || $1 != https://* ]]; then
 fi
 coordinator=${1%/}
 slot=${2:-}
-[[ -z $slot || $slot =~ ^([1-9]|1[0-6])$ ]] || { echo "slot must be in 1..16" >&2; exit 2; }
+[[ -z $slot || ( $slot =~ ^[1-9][0-9]{0,9}$ && $slot -le 4294967295 ) ]] || { echo "slot must be a positive coordinator slot number" >&2; exit 2; }
 
 deploy=$(cd "$(dirname "$0")" && pwd -P)
 repo=$(cd "$deploy/../.." && pwd -P)
@@ -43,7 +43,7 @@ try:
         sys.exit(1)
     entry = json.loads(raw)
     slot, challenge = entry["slot"], entry["challenge"]
-    if type(slot) is not int or not 1 <= slot <= 16 or (sys.argv[1] and str(slot) != sys.argv[1]):
+    if type(slot) is not int or not 1 <= slot <= 4294967295 or (sys.argv[1] and str(slot) != sys.argv[1]):
         sys.exit(1)
     if not re.fullmatch(r"[0-9a-f]{64}", challenge):
         sys.exit(1)
