@@ -26,8 +26,11 @@ function setting(name: string, fallback: number): number {
 }
 
 export const signupsPerHour = () => setting("LOKI_SIGNUPS_PER_HOUR", 6);
+// Unset (the default) means no cap on the member directory.
+export const maxMembers = (): number | undefined =>
+  process.env.LOKI_MAX_MEMBERS === undefined || process.env.LOKI_MAX_MEMBERS.trim() === "" ? undefined : setting("LOKI_MAX_MEMBERS", 0);
 
-export function logRefusal(reason: "sign-up limit" | "ip minute limit" | "ip day limit" | "pending slots" | "attempt minute limit" | "resume limit") {
+export function logRefusal(reason: "sign-up limit" | "ip minute limit" | "ip day limit" | "pending slots" | "member cap" | "attempt minute limit" | "resume limit") {
   console.warn(`loki admission: refused (${reason})`);
 }
 

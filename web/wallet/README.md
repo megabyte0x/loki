@@ -159,7 +159,10 @@ A coordinator slot is a member's number in this directory only. It is not the me
 number in any vault: each vault numbers its own members 1 to N (at most 16) when it is set
 up, the creator as 1 and each invite carrying its own number, and the roster code every
 member compares covers each vault number together with that member's signing and relay keys.
-So the directory has no member cap; slots are positive whole numbers up to 4294967295.
+So the directory has no member cap by default; slots are positive whole numbers up to
+4294967295. An operator can set `LOKI_MAX_MEMBERS` to cap it: once registered members plus
+slots held by pending new-identity reservations reach the cap, new identities get "no free
+slot" (registered members can still refresh, replace devices and recover).
 
 A pairing link reserves the lowest free slot (or the slot it names, to finish a pairing that
 never registered) for two minutes, and so does a new identity that enrolls directly (the
@@ -199,6 +202,7 @@ restart it to apply a change.
 
 | Setting | Default | Limits |
 | --- | --- | --- |
+| `LOKI_MAX_MEMBERS` | unset | Members in the directory. Unset means no cap. New identities are refused at the cap, counting slots their pending reservations hold; registered members are unaffected. Bounds the registry file, which every registration rewrites whole. |
 | `LOKI_SIGNUPS_PER_HOUR` | 6 | New identities registered in a rolling hour, across the coordinator. Stored in the registry. Refreshing or replacing a registered member's device and resuming a pending registration don't count. |
 | `LOKI_IP_PAIRING_PER_MINUTE` | 5 | New-identity requests (above) per client address per minute. |
 | `LOKI_IP_PAIRING_PER_DAY` | 30 | The same requests per client address per rolling day. |
@@ -225,7 +229,8 @@ line per refusal reason, never the client address. A value that isn't a whole nu
 admission until it's fixed. These limits slow spam but don't stop it: with the default
 sign-up limit the directory can still grow by up to 6 identities an hour (about 52,000 a
 year). The registry file is read and rewritten whole on every registration, which this rate
-keeps affordable; lower `LOKI_SIGNUPS_PER_HOUR` if the coordinator's disk or memory is small.
+keeps affordable; set `LOKI_MAX_MEMBERS` or lower `LOKI_SIGNUPS_PER_HOUR` if the
+coordinator's disk or memory is small.
 
 To permanently retire a roster identity and release its slot, use the same registry path
 as the coordinator: `LOKI_REGISTRY=/path/to/registry.json node scripts/retire-member.ts <signing_pubkey>`.

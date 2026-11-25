@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# != 2 || $1 != http* || ! $2 =~ ^[0-9]+$ ]]; then
+if [[ $# != 2 || $1 != http* || ! $2 =~ ^[1-9][0-9]{0,9}$ ]] || (( $2 > 4294967295 )); then
   echo 'usage: run-member.sh <coordinator-url> <slot>' >&2
   exit 2
 fi
@@ -18,6 +18,12 @@ fi
 data=${DATA:-$repo/loki-state/member-$slot}
 [[ $data == /* ]] || data=$PWD/$data
 while [[ $data == */ && $data != / ]]; do data=${data%/}; done
+# The default ports (3610 + slot, 4610 + slot) fit and never collide only for slots up to
+# 1000; coordinator slots are unbounded, so a larger slot must name its own ports.
+if (( slot > 1000 )) && [[ -z ${PORT:-} || -z ${PEER_PORT:-} ]]; then
+  echo "slot $slot is above 1000: set PORT and PEER_PORT to free, distinct ports" >&2
+  exit 2
+fi
 port=${PORT:-$((3610 + slot))}
 peer_port=${PEER_PORT:-$((4610 + slot))}
 frostd=${FROSTD_URL:-http://127.0.0.1:2744}

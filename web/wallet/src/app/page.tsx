@@ -524,6 +524,7 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
   const [typed, setTyped] = useState("");
   const [found, setFound] = useState<{ slot: number; member: Slot | null }>();
   const choose = (slot: number) => { setChoice(slot); setTyped(String(slot)); };
+  const typedSlot = (value: string) => /^[1-9][0-9]{0,9}$/.test(value) && Number(value) <= 0xffffffff ? Number(value) : undefined;
   useEffect(() => {
     const last = lastLokiSignerSlot();
     if (last !== undefined) { choose(last); setNativeOpen(true); }
@@ -613,12 +614,12 @@ function Login({ onLoggedIn, notice }: { onLoggedIn: () => void; notice: string 
               onChange={(e) => {
                 const value = e.target.value.trim();
                 setTyped(value);
-                setChoice(/^[1-9][0-9]{0,9}$/.test(value) && Number(value) <= 0xffffffff ? Number(value) : undefined);
+                setChoice(typedSlot(value));
               }}
               className="glass mt-1 w-full rounded-full px-4 py-2.5 font-mono text-[var(--ink)]" />
           </label>}
           <button type="button" className="min-h-11 text-mint" disabled={busy || nativeBusy}
-            onClick={() => setChoice(selected === "paste" ? (/^[1-9][0-9]{0,9}$/.test(typed) ? Number(typed) : undefined) : "paste")}>
+            onClick={() => setChoice(selected === "paste" ? typedSlot(typed) : "paste")}>
             {selected === "paste" ? "Connect LokiSigner by slot instead" : "Headless or older member app"}
           </button>
           {selectedSlot !== undefined && !looked && <p role="status" className="my-2">Looking up slot {selectedSlot}…</p>}

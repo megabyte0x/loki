@@ -153,7 +153,7 @@ final class VaultAddressesWindow: NSObject {
 
             if let slot = vault.slot {
                 let network = vault.network.map { "Network: \($0)    ·    " } ?? ""
-                row.addArrangedSubview(NSTextField(labelWithString: "\(network)Member slot: \(slot)"))
+                row.addArrangedSubview(NSTextField(labelWithString: "\(network)Member \(slot) in this vault"))
             }
             if let id = vault.vault, let address = vault.address, vault.error == nil {
                 row.addArrangedSubview(NSTextField(labelWithString: "Vault ID:"))

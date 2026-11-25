@@ -1340,12 +1340,12 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             let r = SignerReview.self
             let review: SignerReview
             if let slot {
-                review = SignerReview(section: "Signer setup · 03 / 04", title: "Confirm member slot",
-                    intro: "Check which slot this Mac will use.", content: [
+                review = SignerReview(section: "Signer setup · 03 / 04", title: "Confirm coordinator slot",
+                    intro: "Check which coordinator slot this Mac will use. Each vault gives its members their own numbers.", content: [
                         r.origin("Coordinator", origin, "Only continue if this is the origin you intended."),
-                        r.card("Returned slot", [r.label("Member \(slot)", size: 26, weight: .semibold, mono: true),
+                        r.card("Returned coordinator slot", [r.label("Coordinator slot \(slot)", size: 26, weight: .semibold, mono: true),
                             r.label("Continue to fetch the signer configuration. Nothing has been saved.", tone: r.muted)]),
-                    ], hint: "Check the member slot before continuing.", actions: ["Continue", "Cancel"], primary: 0)
+                    ], hint: "Check the coordinator slot before continuing.", actions: ["Continue", "Cancel"], primary: 0)
             } else {
                 review = SignerReview(section: "Recovery · fresh profile", title: "Confirm original coordinator",
                     intro: "Use the same HTTPS coordinator as the profile you are restoring.", content: [
@@ -1357,7 +1357,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             return
         }
         let alert = NSAlert()
-        alert.messageText = slot.map { "Pair this device with slot \($0)?" } ?? "Restore with this coordinator?"
+        alert.messageText = slot.map { "Pair this device with coordinator slot \($0)?" } ?? "Restore with this coordinator?"
         alert.informativeText = "Coordinator: \(origin)\n\nOnly continue if this is the coordinator you intended. LokiSigner then asks it for the signer configuration and shows it to you before anything is saved."
         alert.addButton(withTitle: "Continue")
         alert.addButton(withTitle: "Cancel")
@@ -1578,7 +1578,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             let pairing = link != nil
             let renewal = renewable ? [r.info("If the slot reservation runs out", Self.renewalTouchID)] : []
             let origin = r.origin(pairing ? "Coordinator" : "Paired coordinator", config["coordinator"] as? String ?? "",
-                                  "Member slot \(slot) · Testnet")
+                                  "Coordinator slot \(slot) · Testnet")
             let local = (nameField.map { r.field("Profile name (optional)", $0) } ?? []) + r.field("Local profile passphrase", password)
             let content = pairing
                 ? [r.split(r.card("Signer endpoints", endpointRows(config)), r.card("Local profile",
@@ -1597,7 +1597,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
         } else {
             let alert = NSAlert()
             let endpoints = configurationText(config)
-            alert.messageText = link == nil ? "Unlock your paired signer" : "Pair this device with slot \(slot)?"
+            alert.messageText = link == nil ? "Unlock your paired signer" : "Pair this device with coordinator slot \(slot)?"
             alert.informativeText = link == nil
                 ? "\(endpoints)\nFor a new device, cancel and open a pairing link from the wallet. Your passphrase stays in this app."
                 : "\(endpoints)\nCreate or unlock your local profile below. These values are saved once it unlocks."
@@ -1734,7 +1734,7 @@ final class NativeSigner: NSObject, NSApplicationDelegate, NSMenuItemValidation 
             let r = SignerReview.self
             presentPrompt(SignerReview(section: "Recovery · fresh profile", title: "Review recovery configuration",
                 intro: "Confirm the network and endpoints before choosing the encrypted backup.", content: [
-                    r.origin("Original coordinator", config["coordinator"] as? String ?? "", "Testnet · Member slot is resolved from the backup and roster."),
+                    r.origin("Original coordinator", config["coordinator"] as? String ?? "", "Testnet · Coordinator slot is resolved from the backup and roster."),
                     r.card("Signer endpoints", endpointRows(config)),
                 ] + launchOverrideNotice(config), hint: "Continue opens the macOS file picker.", actions: ["Continue", "Cancel"], primary: 0), completion: next)
             return

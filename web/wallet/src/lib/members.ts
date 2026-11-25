@@ -2,7 +2,7 @@ import { createHmac, createPublicKey, randomBytes, timingSafeEqual, verify } fro
 import { closeSync, fsyncSync, openSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isLokiSignerUrl } from "./lokisigner-url.ts";
-import { admitClient, admitResume, checkSignups, logRefusal } from "./admission-limits.ts";
+import { admitClient, admitResume, checkSignups, logRefusal, maxMembers } from "./admission-limits.ts";
 import { freeSlot, registrationSlot } from "./member-admission.ts";
 import { registrationLock, type RegistrationPool } from "./registration-lock.ts";
 import { newRelayChallenge, verifyRelayProof } from "./relay-registration.ts";
@@ -81,9 +81,10 @@ export function slots(): Member[] {
   return peekRegistry(Date.now()).access;
 }
 
-// The public directory in slot order, one bounded page at a time.
+// The public directory in slot order, one bounded page at a time. It sorts here rather than
+// trusting the roster's order, so a page never skips a slot below its cursor.
 export function memberPage(after: number): { slots: Member[]; next?: number } {
-  const rest = slots().filter((m) => m.slot > after);
+  const rest = slots().filter((m) => m.slot > after).sort((a, b) => a.slot - b.slot);
   const page = rest.slice(0, MEMBER_PAGE);
   return rest.length > page.length ? { slots: page, next: page[page.length - 1].slot } : { slots: page };
 }
@@ -171,6 +172,7 @@ async function changeRegistry<T>(pool: RegistrationPool, change: (state: Registr
     const now = Date.now();
     liveChallenges(state, now);
     const result = change(state, now);
+    state.access.sort((a, b) => a.slot - b.slot);
     if (JSON.stringify(state) !== before) {
       write(file, state);
       cache.lokiRegistrySnapshot = { key: fileKey(file), state: structuredClone(state) };
@@ -273,7 +275,20 @@ function replacementChallengeValid(key: string, challenge: string, e: Enrollment
     && timingSafeEqual(wire.subarray(16), replacementTag(key, wire.subarray(0, 16), e, origin, generation));
 }
 
+// The optional operator cap (LOKI_MAX_MEMBERS). New identities can't push the directory,
+// counting the slots their reservations hold, past it; registered members are unaffected.
+function checkCapacity(state: Registry, reserving: boolean) {
+  const cap = maxMembers();
+  if (cap === undefined) return;
+  const held = reserving ? new Set(state.challenges.flatMap((c) => c.pairing_slot === undefined ? [] : [c.pairing_slot])).size : 0;
+  if (state.access.length + held >= cap) {
+    logRefusal("member cap");
+    throw new Error("no free slot");
+  }
+}
+
 function checkNewcomer(state: Registry, now: number, desired: number | undefined, signing?: string) {
+  checkCapacity(state, true);
   checkPendingSlots(state);
   checkSignups(state.signups, now);
   freeSlot(occupied(state, signing), desired);
@@ -292,6 +307,7 @@ export async function issuePairingChallenge(raw: unknown, origin: string, client
   if (client !== undefined) admitClient(client);
   checkNewcomer(peekRegistry(Date.now()), Date.now(), requested);
   return changeRegistry("newcomer", (state, now) => {
+    checkCapacity(state, true);
     checkPendingSlots(state);
     state.signups = checkSignups(state.signups, now);
     const id = freeSlot(occupied(state), requested);
@@ -378,6 +394,7 @@ export async function issueRegistrationChallenge(raw: unknown, origin: string, c
         reserved = freeSlot(occupied(state, e.signing_pubkey), claimed.pairing_slot);
       } else {
         if (pool === "member") throw new Error("registration changed; request a new challenge");
+        checkCapacity(state, true);
         checkPendingSlots(state);
         state.signups = checkSignups(state.signups, now);
         reserved = freeSlot(occupied(state, e.signing_pubkey), e.slot);
@@ -444,6 +461,7 @@ export async function registerMember(raw: unknown, origin: string): Promise<Memb
         id = freeSlot(occupied(state, e.signing_pubkey), previous.slot);
       } else {
         if (!issued || issued.pairing_slot === undefined) throw new Error("unknown, expired or changed registration challenge");
+        checkCapacity(state, false);
         state.signups = checkSignups(state.signups, now);
         id = freeSlot(occupied(state, e.signing_pubkey), issued.pairing_slot);
         state.signups.push(now);

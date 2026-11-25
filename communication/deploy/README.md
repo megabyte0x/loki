@@ -257,7 +257,9 @@ For first enrollment, use `join-loki.sh <https-coordinator-url> [slot]` to reser
 slot before launch (no operator grant is needed), or let `run-member.sh` ask for that slot
 directly. Existing members restart with `run-member.sh`.
 The wrapper advertises an HTTPS tunnel to the ceremony-only listener on
-`127.0.0.1:$PEER_PORT` (default `4610 + slot`). Only enrollment, roster, agreement
+`127.0.0.1:$PEER_PORT` (default `4610 + slot`; the private `PORT` defaults to `3610 + slot`).
+Coordinator slots have no upper bound, so for a slot above 1000 set both `PORT` and
+`PEER_PORT` to free, distinct ports yourself. Only enrollment, roster, agreement
 and session peer requests reach that listener; the full member API on `PORT` stays private.
 To use your own local TLS proxy instead, set `ADVERTISE_URL` to its public HTTPS origin and
 forward it only to `127.0.0.1:$PEER_PORT`. Choose an unused port distinct from `PORT`.

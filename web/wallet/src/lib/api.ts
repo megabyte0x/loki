@@ -188,7 +188,7 @@ function retryIn(header: string | null): string {
 const PAIRING_REFUSALS: [string, (wait: string) => string][] = [
   ["This coordinator has reached its sign-up limit", (wait) => `This coordinator has reached its sign-up limit for this hour. Try again ${wait}.`],
   ["Too many pairing requests", (wait) => `Too many pairing requests from this network. Try again ${wait}.`],
-  ["no free slot", () => "This coordinator has no free slot numbers left."],
+  ["no free slot", () => "This coordinator is full: its operator caps the number of members."],
   ["too many pending registrations", () => "The coordinator has too many pairing links waiting. Try again in two minutes."],
   ["registration is busy", () => "The coordinator is busy registering another member. Try again in a moment."],
   ["expected an HTTPS origin", () => "This coordinator issues pairing links only over HTTPS. Open the wallet at its HTTPS address and try again."],
@@ -244,14 +244,8 @@ export async function api<T = unknown>(path: string, body?: unknown): Promise<T>
   }
 }
 
-// The first page of the coordinator's public directory. The directory has no member cap, so
-// code that needs one member looks it up with `findMember` instead of scanning a listing.
-export async function listSlots(signal?: AbortSignal): Promise<Slot[]> {
-  const res = await fetch("/api/members", { cache: "no-store", signal });
-  if (!res.ok) throw new Error("could not read public roster");
-  return (await res.json()).slots as Slot[];
-}
-
+// The coordinator directory has no member cap, so the wallet looks up the one member it
+// needs instead of reading a listing.
 export async function findMember(query: { slot: number } | { signing_pubkey: string }, signal?: AbortSignal): Promise<Slot | undefined> {
   const params = new URLSearchParams("slot" in query ? { slot: String(query.slot) } : { signing_pubkey: query.signing_pubkey });
   const res = await fetch(`/api/members?${params}`, { cache: "no-store", signal });
